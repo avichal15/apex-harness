@@ -1,0 +1,2 @@
+# Empty placeholder so runtime data directory exists on fresh checkouts.
+# All runtime JSONs, OAuth tokens, sessions, checkpoints, and spills are gitignored.
