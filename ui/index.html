@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Apex</title>
+  <title>Apex Harness Studio</title>
   <link rel="stylesheet" href="/styles.css" />
   <script src="/agent-office.js"></script>
 </head>
@@ -17,7 +17,8 @@
       </div>
       <nav class="titlebar-menu">
         <button class="brutal-tab-btn active" data-top-tab="egm" onclick="switchInspectorTab('egm')">Boardroom</button>
-        <button class="brutal-tab-btn" data-top-tab="router" onclick="switchInspectorTab('router')">Router</button>
+        <button class="brutal-tab-btn" data-top-tab="ide" onclick="switchInspectorTab('ide')">IDE Workbench</button>
+        <button class="brutal-tab-btn" data-top-tab="router" onclick="switchInspectorTab('router')">Providers & Router</button>
         <button class="brutal-tab-btn" data-top-tab="skills" onclick="switchInspectorTab('skills')">Skills</button>
         <button class="brutal-tab-btn" data-top-tab="harness2" onclick="switchInspectorTab('harness2')">Harness²</button>
         <button class="brutal-tab-btn" data-top-tab="scoreboard" onclick="switchInspectorTab('scoreboard')">Scores</button>
@@ -31,9 +32,9 @@
     </div>
 
     <div class="titlebar-right">
-      <div class="status-pill" title="Standalone runtime · EGM 3-Desk Boardroom · Carbon Clean-Room active">
+      <div class="status-pill" title="Unified Multi-Agent IDE · 10-Role DAG Router · Canonical Workspace Security">
         <span class="status-dot"></span>
-        <span id="fleet-pill-text">19 models · 110 skills</span>
+        <span id="fleet-pill-text">19 models · 112 skills</span>
       </div>
       <button class="brutal-tab-btn" id="toggle-inspector-btn" onclick="toggleInspector()" title="Toggle Inspector">
         Inspector
@@ -58,9 +59,17 @@
           <span>AI Agent Office</span>
           <span class="nav-badge">6 agents</span>
         </button>
+        <button class="nav-item" onclick="switchInspectorTab('ide')">
+          <span>IDE Files, Git & Terminal</span>
+          <span class="nav-badge">Workbench</span>
+        </button>
         <button class="nav-item" onclick="switchInspectorTab('egm')">
           <span>Specialist Boardroom</span>
           <span class="nav-badge">4 lenses</span>
+        </button>
+        <button class="nav-item" onclick="switchInspectorTab('router')">
+          <span>10-Role Router & Providers</span>
+          <span class="nav-badge" id="nav-providers-badge">8</span>
         </button>
         <button class="nav-item" onclick="switchInspectorTab('harness2')">
           <span>Harness² surfaces</span>
@@ -86,8 +95,17 @@
 
     <!-- Center Conversation Stage -->
     <main class="center-stage">
-      <!-- Live AI Agent Office & Multi-Agent Orchestration Simulation -->
+      <!-- Live AI Agent Office & Multi-Agent DAG Visualization -->
       <div id="agent-office-mount"></div>
+
+      <!-- Approval Banner when waiting_for_approval -->
+      <div id="approval-banner" style="display:none;padding:8px 18px;background:rgba(234,179,8,0.14);border-bottom:1px solid rgba(234,179,8,0.4);align-items:center;justify-content:space-between;gap:12px">
+        <div style="font-size:12px;color:#fef08a" id="approval-banner-text">Command requires approval</div>
+        <div style="display:flex;gap:6px">
+          <button class="btn-ghost" onclick="resolveActiveApproval(true)">Approve & Continue</button>
+          <button class="btn-danger-sm" onclick="resolveActiveApproval(false)">Deny</button>
+        </div>
+      </div>
 
       <div class="chat-scroll" id="chat-scroll">
         <div class="chat-container" id="chat-messages"></div>
@@ -100,6 +118,7 @@
           <button class="quick-chip" onclick="insertPrompt('Inspect the files in this project and complete all remaining features end-to-end.')">Complete project</button>
           <button class="quick-chip" onclick="insertPrompt('Audit this codebase for bugs, edge cases, and security boundaries.')">Codebase review</button>
           <button class="quick-chip" onclick="insertPrompt('Verify build and test commands across this repository.')">Verify tests</button>
+          <button class="quick-chip" onclick="switchInspectorTab('ide')">Open IDE Files & Terminal</button>
         </div>
 
         <div class="composer-box">
@@ -114,7 +133,7 @@
             <div class="composer-left-controls">
               <button class="brutal-tab-btn" onclick="promptAddProject()" title="Add workspace folder">+ Folder</button>
               <select id="model-picker" class="picker-select" title="Select model or Auto-Orchestrate">
-                <option value="auto">Auto-Orchestrate (EMA + EGM)</option>
+                <option value="auto">Auto-Orchestrate (10-Role DAG + EMA)</option>
               </select>
               <select id="effort-picker" class="picker-select" title="Reasoning effort">
                 <option value="high">Effort: High</option>
@@ -129,6 +148,9 @@
                 <option value="auto_edit">Mode: Auto-edit</option>
                 <option value="ask">Mode: Ask first</option>
               </select>
+              <button class="btn-danger-sm" id="stop-btn" style="display:none" onclick="cancelActiveExecution()" title="Stop & cancel active execution">
+                Stop
+              </button>
               <button class="send-btn" id="send-btn" onclick="sendChatTurn()" title="Send message (Enter)">
                 <span>Send</span>
               </button>
@@ -138,10 +160,11 @@
       </div>
     </main>
 
-    <!-- Right Inspector Panel -->
+    <!-- Right Inspector & IDE Workbench Panel -->
     <aside class="inspector" id="inspector-drawer">
       <div class="inspector-tabs">
         <button class="inspector-tab active" data-tab="egm" onclick="switchInspectorTab('egm')">Boardroom</button>
+        <button class="inspector-tab" data-tab="ide" onclick="switchInspectorTab('ide')">IDE</button>
         <button class="inspector-tab" data-tab="router" onclick="switchInspectorTab('router')">Router</button>
         <button class="inspector-tab" data-tab="skills" onclick="switchInspectorTab('skills')">Skills</button>
         <button class="inspector-tab" data-tab="harness2" onclick="switchInspectorTab('harness2')">c1..c8</button>
@@ -154,14 +177,21 @@
 
   <script>
     const state = {
+      sessionToken: "",
       projects: [],
       conversations: [],
+      providers: [],
+      roleRouting: [],
+      executions: [],
+      skillManagement: { disabledSkillIds: [] },
+      skillConflicts: [],
       models: [],
       skills: [],
       mcpServers: [],
       harness2: null,
       activeProjectId: null,
       activeConversationId: null,
+      activeExecutionId: null,
       inspectorTab: "egm",
       lastPlan: null,
       lastEgmBrief: null,
@@ -170,6 +200,18 @@
       transpiledPreview: "",
       activeSurfaceFile: "systemprompt.md",
       streaming: false,
+      // IDE Workbench State
+      ideSubDir: ".",
+      ideFiles: [],
+      ideOpenFile: null,
+      ideOpenContent: "",
+      ideSearchQuery: "",
+      ideSearchHits: [],
+      ideGitSummary: "",
+      ideGitDiff: "",
+      ideTermCmd: "node --version",
+      ideTermOutput: "",
+      providerTestStatus: {},
     };
 
     function escapeHtml(str) {
@@ -178,6 +220,17 @@
         .replace(/</g, "&lt;")
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;");
+    }
+
+    async function apiFetch(url, options = {}) {
+      const headers = Object.assign({}, options.headers || {});
+      if (state.sessionToken) {
+        headers["X-Apex-Token"] = state.sessionToken;
+      }
+      if (options.body && !headers["Content-Type"]) {
+        headers["Content-Type"] = "application/json";
+      }
+      return fetch(url, Object.assign({}, options, { headers }));
     }
 
     function renderMarkdown(md) {
@@ -208,10 +261,16 @@
     }
 
     async function loadBootstrap() {
-      const res = await fetch("/api/bootstrap");
+      const res = await apiFetch("/api/bootstrap");
       const data = await res.json();
+      if (data.sessionToken) state.sessionToken = data.sessionToken;
       state.projects = data.projects || [];
       state.conversations = data.conversations || [];
+      state.providers = data.providers || [];
+      state.roleRouting = data.roleRouting || [];
+      state.executions = data.executions || [];
+      state.skillManagement = data.skillManagement || { disabledSkillIds: [] };
+      state.skillConflicts = data.skillConflicts || [];
       state.models = data.models || [];
       state.skills = data.skills || [];
       state.mcpServers = data.mcpServers || [];
@@ -229,6 +288,8 @@
         `${state.models.length} models · ${state.skills.length} skills`;
       document.getElementById("nav-skills-badge").textContent = String(state.skills.length);
       document.getElementById("nav-models-badge").textContent = String(state.models.length);
+      const provBadge = document.getElementById("nav-providers-badge");
+      if (provBadge) provBadge.textContent = String(state.providers.length);
 
       populateModelPicker();
       renderSidebar();
@@ -242,7 +303,7 @@
     function populateModelPicker() {
       const picker = document.getElementById("model-picker");
       const currentVal = picker.value || "auto";
-      picker.innerHTML = `<option value="auto">Auto-Orchestrate (EMA + EGM)</option>`;
+      picker.innerHTML = `<option value="auto">Auto-Orchestrate (10-Role DAG + EMA)</option>`;
       for (const m of state.models) {
         const opt = document.createElement("option");
         opt.value = m.id;
@@ -350,6 +411,36 @@
       `;
     }
 
+    function renderEvidenceReportHtml(report) {
+      if (!report) return "";
+      const filesCount = (report.filesCreated?.length || 0) + (report.filesModified?.length || 0);
+      const cmdsCount = report.commandsExecuted?.length || 0;
+      const egmOutcome = report.egmReview?.outcome || "n/a";
+      return `
+        <div class="evidence-report-box">
+          <div style="display:flex;justify-content:space-between;align-items:center;cursor:pointer" onclick="this.nextElementSibling.style.display = this.nextElementSibling.style.display === 'none' ? 'block' : 'none'">
+            <span><strong>Completion Evidence Report</strong> · Status: <code>${escapeHtml(report.status)}</code> · EGM Review: <code>${escapeHtml(egmOutcome)}</code></span>
+            <span style="font-family:var(--font-mono);font-size:10.5px;color:var(--text-muted)">Toggle Evidence ▾</span>
+          </div>
+          <div style="display:none;margin-top:8px;border-top:1px solid var(--border-subtle);padding-top:8px">
+            <div class="evidence-grid">
+              <div>Execution ID: <code>${escapeHtml(report.executionId)}</code></div>
+              <div>Agents Involved: <code>${escapeHtml((report.agentsInvolved || []).join(", "))}</code></div>
+              <div>Files Inspected: <code>${(report.filesInspected || []).length}</code></div>
+              <div>Files Changed: <code>${filesCount}</code></div>
+              <div>Commands Executed: <code>${cmdsCount}</code></div>
+              <div>Verification Ran: <code>${report.verificationResults?.ranVerificationCommands ? "Yes" : "No"}</code></div>
+            </div>
+            ${
+              report.remainingIssues && report.remainingIssues.length > 0
+                ? `<div style="margin-top:6px;color:#fbbf24">Remaining Notices: ${escapeHtml(report.remainingIssues.join(" | "))}</div>`
+                : ""
+            }
+          </div>
+        </div>
+      `;
+    }
+
     function renderChat() {
       const conv = getActiveConversation();
       const proj = state.projects.find((p) => p.id === (conv?.projectId || state.activeProjectId));
@@ -379,23 +470,29 @@
         } else {
           const row = document.createElement("div");
           row.className = "msg-row assistant";
-          const judgeBadge = msg.judgeVerdict
-            ? `<span class="meta-tag ${msg.judgeVerdict.passed ? "pass" : "warn"}">verified: ${msg.judgeVerdict.passed ? "pass" : "review"} (${(msg.judgeVerdict.score * 100).toFixed(0)}%)</span>`
-            : "";
+          const statusLabel = msg.completionStatus || (msg.judgeVerdict?.passed ? "implemented_and_verified" : "review");
+          const isPass =
+            statusLabel === "implemented_and_verified" ||
+            statusLabel === "implemented_not_verified" ||
+            msg.judgeVerdict?.passed;
+          const judgeBadge = `<span class="meta-tag ${isPass ? "pass" : "warn"}">${escapeHtml(statusLabel.replace(/_/g, " "))}</span>`;
           const revertBtn = msg.checkpointId
             ? msg.reverted
               ? `<span class="meta-tag warn">edits reverted</span>`
               : `<button class="btn-ghost" style="height:20px;padding:0 7px;font-size:11px" onclick="revertTurnEdits('${escapeHtml(msg.checkpointId)}','${escapeHtml(msg.id)}')">Undo edits</button>`
             : "";
+          const retryBtn = `<button class="btn-ghost" style="height:20px;padding:0 7px;font-size:11px" onclick="retryLastTurn()">Re-run</button>`;
           row.innerHTML = `
             <div class="msg-assistant-card">
               ${renderStepsHtml(msg.steps, msg.durationMs)}
               <div class="msg-content">${renderMarkdown(msg.content)}</div>
+              ${renderEvidenceReportHtml(msg.completionReport)}
               <div class="msg-meta-bar">
                 ${msg.modelDisplayName ? `<span class="meta-tag">${escapeHtml(msg.modelDisplayName)}</span>` : ""}
                 ${msg.domain ? `<span class="meta-tag">${escapeHtml(msg.domain.replace(/_/g, " "))}</span>` : ""}
                 ${judgeBadge}
                 ${revertBtn}
+                ${retryBtn}
               </div>
             </div>
           `;
@@ -409,9 +506,8 @@
 
     async function createNewConversation(projectId, forceNew) {
       const targetProjId = projectId || state.activeProjectId || "independent";
-      const res = await fetch("/api/conversations", {
+      const res = await apiFetch("/api/conversations", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           projectId: targetProjId,
           forceNew: Boolean(forceNew),
@@ -436,7 +532,7 @@
 
     async function deleteConversation(convId, event) {
       if (event) event.stopPropagation();
-      const res = await fetch(`/api/conversations/${encodeURIComponent(convId)}`, {
+      const res = await apiFetch(`/api/conversations/${encodeURIComponent(convId)}`, {
         method: "DELETE",
       });
       const data = await res.json();
@@ -446,7 +542,9 @@
         state.conversations = state.conversations.filter((c) => c.id !== convId);
       }
       if (state.activeConversationId === convId) {
-        const next = state.conversations.find((c) => c.projectId === state.activeProjectId) || state.conversations[0];
+        const next =
+          state.conversations.find((c) => c.projectId === state.activeProjectId) ||
+          state.conversations[0];
         state.activeConversationId = next ? next.id : null;
         if (next) state.activeProjectId = next.projectId;
       }
@@ -455,11 +553,16 @@
     }
 
     async function promptAddProject() {
-      const folderPath = prompt("Enter the full folder path of the project workspace:", "./my-project");
+      let folderPath = null;
+      if (window.apexDesktopBridge && typeof window.apexDesktopBridge.pickDirectory === "function") {
+        folderPath = await window.apexDesktopBridge.pickDirectory();
+      }
+      if (!folderPath) {
+        folderPath = prompt("Enter the full folder path of the project workspace:", "./my-project");
+      }
       if (!folderPath) return;
-      const res = await fetch("/api/projects", {
+      const res = await apiFetch("/api/projects", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ path: folderPath }),
       });
       const data = await res.json();
@@ -468,7 +571,7 @@
         return;
       }
       state.projects = data.projects;
-      await createNewConversation(data.project.id);
+      await createNewConversation(data.project.id, true);
     }
 
     function insertPrompt(text) {
@@ -479,9 +582,8 @@
 
     async function revertTurnEdits(checkpointId, messageId) {
       const conv = getActiveConversation();
-      const res = await fetch("/api/turn/revert", {
+      const res = await apiFetch("/api/turn/revert", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           checkpointId,
           conversationId: conv?.id,
@@ -498,12 +600,60 @@
       }
     }
 
+    async function cancelActiveExecution() {
+      if (!state.activeExecutionId) return;
+      await apiFetch(`/api/executions/${encodeURIComponent(state.activeExecutionId)}/cancel`, {
+        method: "POST",
+        body: JSON.stringify({ reason: "Stopped by operator from UI" }),
+      });
+    }
+    window.cancelActiveExecution = cancelActiveExecution;
+
+    async function pauseActiveExecution() {
+      if (!state.activeExecutionId) return;
+      await apiFetch(`/api/executions/${encodeURIComponent(state.activeExecutionId)}/pause`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    }
+    window.pauseActiveExecution = pauseActiveExecution;
+
+    async function resumeActiveExecution() {
+      if (!state.activeExecutionId) return;
+      await apiFetch(`/api/executions/${encodeURIComponent(state.activeExecutionId)}/resume`, {
+        method: "POST",
+        body: JSON.stringify({}),
+      });
+    }
+    window.resumeActiveExecution = resumeActiveExecution;
+
+    async function resolveActiveApproval(approved) {
+      if (!state.activeExecutionId) return;
+      document.getElementById("approval-banner").style.display = "none";
+      await apiFetch(`/api/executions/${encodeURIComponent(state.activeExecutionId)}/approve`, {
+        method: "POST",
+        body: JSON.stringify({ approved: Boolean(approved) }),
+      });
+    }
+    window.resolveActiveApproval = resolveActiveApproval;
+
+    function retryLastTurn() {
+      const conv = getActiveConversation();
+      if (!conv || !conv.messages) return;
+      for (let i = conv.messages.length - 1; i >= 0; i--) {
+        if (conv.messages[i].role === "user") {
+          document.getElementById("prompt-input").value = conv.messages[i].content;
+          sendChatTurn();
+          return;
+        }
+      }
+    }
+
     async function runStandaloneEgmShootdown() {
       const conv = getActiveConversation();
       const projId = conv?.projectId || state.activeProjectId;
-      const res = await fetch("/api/egm/boardroom", {
+      const res = await apiFetch("/api/egm/boardroom", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           prompt: "Perform a full Desk 1 + Desk 2 + Desk 3 Elephant-Goldfish Boardroom audit on this workspace",
           projectId: projId,
@@ -531,8 +681,9 @@
 
       input.value = "";
       state.streaming = true;
+      document.getElementById("stop-btn").style.display = "inline-flex";
       if (window.ApexAgentOffice) {
-        window.ApexAgentOffice.resetForTurn(promptText);
+        window.ApexAgentOffice.resetForTurn(promptText, false);
       }
 
       conv.messages.push({
@@ -554,9 +705,8 @@
       renderChat();
 
       try {
-        const response = await fetch("/api/chat/stream", {
+        const response = await apiFetch("/api/chat/stream", {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             conversationId: conv.id,
             prompt: promptText,
@@ -584,7 +734,20 @@
             const eventName = eventMatch[1].trim();
             const payload = JSON.parse(dataMatch[1]);
 
-            if (eventName === "plan") {
+            if (eventName === "execution") {
+              state.activeExecutionId = payload.executionId;
+              if (window.ApexAgentOffice) {
+                window.ApexAgentOffice.syncExecutionDag(payload);
+              }
+              const banner = document.getElementById("approval-banner");
+              if (payload.pendingApproval) {
+                banner.style.display = "flex";
+                document.getElementById("approval-banner-text").textContent =
+                  `Approval Required (${payload.pendingApproval.tool}): ${payload.pendingApproval.commandOrPath} — ${payload.pendingApproval.reason}`;
+              } else {
+                banner.style.display = "none";
+              }
+            } else if (eventName === "plan") {
               state.lastPlan = payload;
               liveAssistantMsg.modelDisplayName = payload.primaryModel?.displayName;
               liveAssistantMsg.domain = payload.classification?.primaryDomain;
@@ -602,6 +765,7 @@
               else liveAssistantMsg.steps.push(payload);
               if (window.ApexAgentOffice && payload.agentRole) {
                 window.ApexAgentOffice.notifyEvent({
+                  mode: "live",
                   activeRole: payload.agentRole,
                   statusText: payload.plainSummary || payload.label,
                   detail: payload.detail || "",
@@ -614,11 +778,14 @@
               renderChat();
             } else if (eventName === "done") {
               Object.assign(liveAssistantMsg, payload.message);
+              if (payload.completionReport) {
+                liveAssistantMsg.completionReport = payload.completionReport;
+              }
               if (payload.threadTitle) conv.title = payload.threadTitle;
               renderSidebar();
               renderChat();
             } else if (eventName === "error") {
-              liveAssistantMsg.content += `\n\nError: ${payload.message}`;
+              liveAssistantMsg.content += `\n\n${payload.cancelled ? "[Execution Cancelled]" : "Error:"} ${payload.message}`;
               renderChat();
             }
           }
@@ -628,6 +795,7 @@
         renderChat();
       } finally {
         state.streaming = false;
+        document.getElementById("stop-btn").style.display = "none";
       }
     }
 
@@ -636,7 +804,7 @@
       drawer.classList.toggle("hidden");
     }
 
-    function switchInspectorTab(tab) {
+    async function switchInspectorTab(tab) {
       state.inspectorTab = tab;
       const drawer = document.getElementById("inspector-drawer");
       drawer.classList.remove("hidden");
@@ -646,14 +814,233 @@
       document.querySelectorAll("[data-top-tab]").forEach((btn) => {
         btn.classList.toggle("active", btn.getAttribute("data-top-tab") === tab);
       });
+      if (tab === "ide") {
+        await refreshIdeFiles(state.ideSubDir);
+        await refreshIdeGit();
+      }
       renderInspector();
+    }
+
+    // ========================================================================
+    // IDE WORKBENCH FUNCTIONS (Files, Editor, Search, Git, Terminal)
+    // ========================================================================
+
+    function getActiveIdeProjectId() {
+      const conv = getActiveConversation();
+      const pid = conv?.projectId || state.activeProjectId || "proj-apex-harness";
+      return pid === "independent" ? "proj-apex-harness" : pid;
+    }
+
+    async function refreshIdeFiles(subDir = ".") {
+      state.ideSubDir = subDir;
+      const projId = getActiveIdeProjectId();
+      const res = await apiFetch(
+        `/api/ide/files?projectId=${encodeURIComponent(projId)}&subDir=${encodeURIComponent(subDir)}`,
+      );
+      const data = await res.json();
+      if (data.ok) {
+        state.ideFiles = data.entries || [];
+        renderInspector();
+      }
+    }
+
+    async function openIdeFile(relPath) {
+      const projId = getActiveIdeProjectId();
+      const res = await apiFetch(
+        `/api/ide/file?projectId=${encodeURIComponent(projId)}&path=${encodeURIComponent(relPath)}`,
+      );
+      const data = await res.json();
+      if (data.ok) {
+        state.ideOpenFile = data.path;
+        state.ideOpenContent = data.content;
+        renderInspector();
+      } else {
+        alert(data.error || "Unable to open file");
+      }
+    }
+
+    async function saveIdeFile() {
+      const el = document.getElementById("ide-file-editor");
+      if (!el || !state.ideOpenFile) return;
+      const projId = getActiveIdeProjectId();
+      const res = await apiFetch("/api/ide/file", {
+        method: "POST",
+        body: JSON.stringify({
+          projectId: projId,
+          path: state.ideOpenFile,
+          content: el.value,
+        }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        state.ideOpenContent = el.value;
+        await refreshIdeGit();
+        renderInspector();
+      } else {
+        alert(data.error || "Failed to save file");
+      }
+    }
+
+    async function runIdeSearch() {
+      const el = document.getElementById("ide-search-input");
+      if (!el) return;
+      state.ideSearchQuery = el.value.trim();
+      const projId = getActiveIdeProjectId();
+      const res = await apiFetch(
+        `/api/ide/search?projectId=${encodeURIComponent(projId)}&q=${encodeURIComponent(state.ideSearchQuery)}`,
+      );
+      const data = await res.json();
+      if (data.ok) {
+        state.ideSearchHits = data.hits || [];
+        renderInspector();
+      }
+    }
+
+    async function refreshIdeGit() {
+      const projId = getActiveIdeProjectId();
+      const res = await apiFetch(`/api/ide/git?projectId=${encodeURIComponent(projId)}`);
+      const data = await res.json();
+      if (data.ok) {
+        state.ideGitSummary = data.summary || "";
+        state.ideGitDiff = data.diffOutput || "";
+        renderInspector();
+      }
+    }
+
+    async function runIdeTerminalCommand(cmdOverride) {
+      const el = document.getElementById("ide-term-input");
+      const cmd = cmdOverride || (el ? el.value.trim() : state.ideTermCmd);
+      if (!cmd) return;
+      state.ideTermCmd = cmd;
+      state.ideTermOutput = `Running: $ ${cmd} ...`;
+      renderInspector();
+      const projId = getActiveIdeProjectId();
+      const res = await apiFetch("/api/ide/exec", {
+        method: "POST",
+        body: JSON.stringify({
+          projectId: projId,
+          command: cmd,
+          mode: document.getElementById("mode-picker").value,
+        }),
+      });
+      const data = await res.json();
+      state.ideTermOutput = `$ ${cmd}\n[exit=${data.exitCode ?? "null"}, ${data.durationMs || 0}ms]\n${data.combinedOutput || data.error || ""}`;
+      renderInspector();
+    }
+
+    // ========================================================================
+    // PROVIDER & 10-ROLE ROUTING FUNCTIONS
+    // ========================================================================
+
+    async function testProvider(providerId) {
+      state.providerTestStatus[providerId] = "Testing...";
+      renderInspector();
+      const res = await apiFetch("/api/providers/test", {
+        method: "POST",
+        body: JSON.stringify({ providerId }),
+      });
+      const data = await res.json();
+      state.providerTestStatus[providerId] = `${data.ok ? "OK" : "OFFLINE"}: ${data.message} (${data.latencyMs}ms)`;
+      renderInspector();
+    }
+
+    async function saveCustomProvider() {
+      const id = document.getElementById("prov-id")?.value.trim();
+      const name = document.getElementById("prov-name")?.value.trim();
+      const protocol = document.getElementById("prov-protocol")?.value;
+      const baseUrl = document.getElementById("prov-url")?.value.trim();
+      const apiKey = document.getElementById("prov-key")?.value.trim();
+      if (!id || !baseUrl) {
+        alert("Provider ID and Base URL are required");
+        return;
+      }
+      const res = await apiFetch("/api/providers", {
+        method: "POST",
+        body: JSON.stringify({ id, name: name || id, protocol, baseUrl, apiKey }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        state.providers = data.providers || [];
+        renderInspector();
+      }
+    }
+
+    async function updateRoleModelAssignment(role, preferredModelId) {
+      const res = await apiFetch("/api/routing/roles", {
+        method: "POST",
+        body: JSON.stringify({
+          assignments: [{ role, preferredModelId }],
+        }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        state.roleRouting = data.roles || [];
+        renderInspector();
+      }
+    }
+
+    async function toggleSkillEnabled(skillId) {
+      const disabled = new Set(state.skillManagement?.disabledSkillIds || []);
+      if (disabled.has(skillId)) disabled.delete(skillId);
+      else disabled.add(skillId);
+      const res = await apiFetch("/api/skills/config", {
+        method: "POST",
+        body: JSON.stringify({ disabledSkillIds: [...disabled] }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        state.skillManagement = data.config;
+        renderInspector();
+      }
+    }
+
+    async function proposeAndPromoteLesson() {
+      const titleEl = document.getElementById("h2-prop-title");
+      const bodyEl = document.getElementById("h2-prop-body");
+      if (!titleEl || !bodyEl || !bodyEl.value.trim()) return;
+      const resProp = await apiFetch("/api/harness2/proposals", {
+        method: "POST",
+        body: JSON.stringify({
+          targetSurfaceRelPath: "LongTermMEMORY.md",
+          title: titleEl.value.trim() || "Operational Lesson",
+          proposedAddition: bodyEl.value.trim(),
+        }),
+      });
+      const propData = await resProp.json();
+      if (propData.proposal && propData.proposal.status === "validated") {
+        const resProm = await apiFetch("/api/harness2/promote", {
+          method: "POST",
+          body: JSON.stringify({ proposalId: propData.proposal.proposalId }),
+        });
+        const promData = await resProm.json();
+        if (promData.ok) {
+          await loadBootstrap();
+          switchInspectorTab("harness2");
+        }
+      } else {
+        alert(
+          propData.proposal?.validationReport?.issues?.join(" | ") ||
+            "Proposal rejected by validation gate",
+        );
+      }
+    }
+
+    async function rollbackSnapshot(snapshotId) {
+      const res = await apiFetch("/api/harness2/rollback", {
+        method: "POST",
+        body: JSON.stringify({ snapshotId }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        await loadBootstrap();
+        switchInspectorTab("harness2");
+      }
     }
 
     async function previewSkillTranspilation(skillName) {
       const driver = state.selectedTranspileDriver || "antigravity";
-      const res = await fetch("/api/skills/transpile", {
+      const res = await apiFetch("/api/skills/transpile", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ skillName, driver, args: "src/app.ts" }),
       });
       const data = await res.json();
@@ -667,9 +1054,8 @@
       const textarea = document.getElementById("surface-textarea");
       if (!textarea) return;
       const content = textarea.value;
-      const res = await fetch("/api/harness2/surface", {
+      const res = await apiFetch("/api/harness2/surface", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ relPath: state.activeSurfaceFile, content }),
       });
       const data = await res.json();
@@ -693,7 +1079,7 @@
               <span class="insp-badge ok">${egm ? `score ${egm.desk3Auditor.score}` : "EGM v5.1"}</span>
             </div>
             <p class="insp-desc">
-              Separates the deep-context CEO (Elephant) from 4 stateless specialist lenses (Goldfish) governed by <code>PROPOSE_FIX | CONTEST | ESCALATE | DECLINE</code>.
+              Separates the deep-context CEO (Elephant) from 4 stateless specialist lenses (Goldfish) + independent Post-Implementation Reviewer governed by <code>PROPOSE_FIX | CONTEST | ESCALATE | DECLINE</code>.
             </p>
             <button class="insp-action-btn" onclick="runStandaloneEgmShootdown()">
               Run 4-lens workspace audit
@@ -744,10 +1130,85 @@
                 <span class="insp-card-title">Execution Pipeline</span>
                 <span class="insp-badge ok">Ready</span>
               </div>
-              <p class="insp-desc">Every prompt runs Desk 1 AST symbol extraction, Desk 2 stateless lenses, and Desk 3 comprehension verification before code generation.</p>
+              <p class="insp-desc">Every prompt runs Desk 1 AST symbol extraction, Desk 2 stateless lenses, Desk 3 comprehension check, and Post-Implementation Independent EGM review.</p>
             </div>
           `
           }
+        `;
+        return;
+      }
+
+      if (state.inspectorTab === "ide") {
+        container.innerHTML = `
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Workspace File Explorer</span>
+              <button class="btn-ghost" onclick="refreshIdeFiles('.')">Root (.)</button>
+            </div>
+            <div class="insp-list" style="max-height:165px">
+              ${state.ideFiles
+                .map((f) =>
+                  f.kind === "directory"
+                    ? `<div class="insp-row" onclick="refreshIdeFiles('${escapeHtml(f.relPath)}')"><span>📁 ${escapeHtml(f.name)}/</span><span class="insp-badge">dir</span></div>`
+                    : `<div class="insp-row" onclick="openIdeFile('${escapeHtml(f.relPath)}')"><span>📄 ${escapeHtml(f.name)}</span><span class="insp-badge">${f.sizeBytes}B</span></div>`,
+                )
+                .join("")}
+            </div>
+          </div>
+
+          ${
+            state.ideOpenFile
+              ? `
+            <div class="insp-card">
+              <div class="insp-card-header">
+                <span class="insp-card-title">${escapeHtml(state.ideOpenFile)}</span>
+                <button class="btn-ghost" onclick="saveIdeFile()">Save & Checkpoint</button>
+              </div>
+              <textarea id="ide-file-editor" class="surface-editor" style="min-height:170px">${escapeHtml(state.ideOpenContent)}</textarea>
+            </div>
+          `
+              : ""
+          }
+
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Project Search</span>
+              <button class="btn-ghost" onclick="runIdeSearch()">Search</button>
+            </div>
+            <input id="ide-search-input" class="ide-panel-input" placeholder="Search symbol or text across workspace..." value="${escapeHtml(state.ideSearchQuery)}" />
+            ${
+              state.ideSearchHits.length > 0
+                ? `<div class="insp-mono" style="max-height:110px;overflow-y:auto">${state.ideSearchHits
+                    .slice(0, 15)
+                    .map((h) => `${escapeHtml(h.file)}:${h.line} · ${escapeHtml(h.snippet)}`)
+                    .join("\n")}</div>`
+                : ""
+            }
+          </div>
+
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Terminal & Test Runner</span>
+              <div style="display:flex;gap:4px">
+                <button class="btn-ghost" onclick="runIdeTerminalCommand('node --test server/apex-harness.node-test.mjs')">Run Tests</button>
+                <button class="btn-ghost" onclick="runIdeTerminalCommand()">Exec</button>
+              </div>
+            </div>
+            <input id="ide-term-input" class="ide-panel-input" value="${escapeHtml(state.ideTermCmd)}" placeholder="Enter command (e.g. git status, npm test)..." />
+            ${
+              state.ideTermOutput
+                ? `<div class="insp-mono" style="max-height:140px;overflow-y:auto">${escapeHtml(state.ideTermOutput)}</div>`
+                : ""
+            }
+          </div>
+
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Git Status & Diff</span>
+              <button class="btn-ghost" onclick="refreshIdeGit()">Refresh</button>
+            </div>
+            <div class="insp-mono" style="max-height:130px;overflow-y:auto">${escapeHtml(state.ideGitSummary || "Clean working tree")}</div>
+          </div>
         `;
         return;
       }
@@ -757,39 +1218,79 @@
         container.innerHTML = `
           <div class="insp-card">
             <div class="insp-card-header">
-              <span class="insp-card-title">Orchestration Router</span>
-              <span class="insp-badge">EMA Decider</span>
+              <span class="insp-card-title">10-Role Model Routing Table</span>
+              <span class="insp-badge">${state.roleRouting.length} roles</span>
             </div>
-            <p class="insp-desc">
-              ${
-                plan
-                  ? `Routed to <strong>${escapeHtml(plan.primaryModel.displayName)}</strong> (${escapeHtml(plan.classification.primaryDomain)} · ${escapeHtml(plan.classification.complexity)}).`
-                  : "Classifies each prompt across 10 engineering domains and routes to the highest-scoring model."
-              }
-            </p>
-            ${
-              plan
-                ? `
-              <div class="insp-mono">Fallback: ${escapeHtml(plan.fallbackModels.map((m) => m.id).join(" → "))}\nCouncil: ${escapeHtml(plan.councilReviewers.map((m) => m.id).join(", "))}\nClean-room: ${plan.strictSanitized ? `active (${plan.redactionsCount} redactions)` : "standby"}</div>
-            `
-                : ""
-            }
+            <p class="insp-desc">Assign specialized models to each of the 10 software engineering roles.</p>
+            <div class="insp-list" style="max-height:220px">
+              ${state.roleRouting
+                .map(
+                  (r) => `
+                <div class="insp-row" style="flex-direction:column;align-items:stretch;gap:4px">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <strong style="color:var(--text-primary);font-size:11.5px">${escapeHtml(r.role)} (${escapeHtml(r.officeRole)})</strong>
+                  </div>
+                  <select class="ide-panel-select" onchange="updateRoleModelAssignment('${escapeHtml(r.role)}', this.value)">
+                    ${state.models
+                      .map(
+                        (m) =>
+                          `<option value="${escapeHtml(m.id)}" ${m.id === r.preferredModelId ? "selected" : ""}>${escapeHtml(m.displayName)} (${escapeHtml(m.id)})</option>`,
+                      )
+                      .join("")}
+                  </select>
+                </div>
+              `,
+                )
+                .join("")}
+            </div>
           </div>
 
           <div class="insp-card">
             <div class="insp-card-header">
-              <span class="insp-card-title">DeepSeek-Harness Subsystems</span>
-              <span class="insp-badge ok">${state.deepseekRuntime?.capabilities?.length || 5} active</span>
+              <span class="insp-card-title">Provider Registry & Vault</span>
+              <span class="insp-badge ok">${state.providers.length} configured</span>
             </div>
-            <div class="insp-mono">${(state.deepseekRuntime?.capabilities || [])
-              .map((c) => `${escapeHtml(c.seam)}: ${escapeHtml(c.provider)}`)
-              .join("\n")}</div>
+            <div class="insp-list" style="max-height:190px">
+              ${state.providers
+                .map(
+                  (p) => `
+                <div class="insp-row" style="flex-direction:column;align-items:stretch;gap:3px">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="color:var(--text-primary);font-weight:500">${escapeHtml(p.name)}</span>
+                    <button class="btn-ghost" style="padding:1px 6px;font-size:10.5px" onclick="testProvider('${escapeHtml(p.id)}')">Test</button>
+                  </div>
+                  <div style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">${escapeHtml(p.protocol)} · ${escapeHtml(p.baseUrl)} · key: ${p.hasStoredSecret ? "encrypted/set" : "none"}</div>
+                  ${
+                    state.providerTestStatus[p.id]
+                      ? `<div style="font-family:var(--font-mono);font-size:10px;color:#60a5fa">${escapeHtml(state.providerTestStatus[p.id])}</div>`
+                      : ""
+                  }
+                </div>
+              `,
+                )
+                .join("")}
+            </div>
+            <div style="display:flex;flex-direction:column;gap:5px;margin-top:6px;padding-top:6px;border-top:1px solid var(--border-subtle)">
+              <input id="prov-id" class="ide-panel-input" placeholder="Provider ID (e.g. custom-openai)" />
+              <select id="prov-protocol" class="ide-panel-select">
+                <option value="openai-compat">OpenAI-Compatible</option>
+                <option value="anthropic-compat">Anthropic Messages</option>
+                <option value="gemini">Google Gemini</option>
+                <option value="openrouter">OpenRouter</option>
+                <option value="local-ollama">Local Ollama</option>
+                <option value="omniroute">OmniRoute</option>
+                <option value="freellmapi">FreeLLMAPI</option>
+              </select>
+              <input id="prov-url" class="ide-panel-input" placeholder="Base URL (https://api.openai.com/v1)" />
+              <input id="prov-key" type="password" class="ide-panel-input" placeholder="API Key (stored in AES-256-GCM vault)" />
+              <button class="insp-action-btn" onclick="saveCustomProvider()">Save Provider to Encrypted Vault</button>
+            </div>
           </div>
 
           <div class="insp-card">
             <div class="insp-card-header">
-              <span class="insp-card-title">Connected MCP Servers</span>
-              <span class="insp-badge">${state.mcpServers.length}</span>
+              <span class="insp-card-title">DeepSeek-Harness & MCP</span>
+              <span class="insp-badge ok">${state.mcpServers.length} MCP</span>
             </div>
             <div style="display:flex;flex-wrap:wrap;gap:5px">
               ${state.mcpServers
@@ -803,13 +1304,18 @@
 
       if (state.inspectorTab === "skills") {
         const q = (state.skillSearchQuery || "").toLowerCase();
+        const disabledSet = new Set(state.skillManagement?.disabledSkillIds || []);
         const filtered = state.skills.filter(
-          (s) => !q || s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q) || s.ecosystem.includes(q),
+          (s) =>
+            !q ||
+            s.name.toLowerCase().includes(q) ||
+            s.description.toLowerCase().includes(q) ||
+            s.ecosystem.includes(q),
         );
         container.innerHTML = `
           <div class="insp-card">
             <div class="insp-card-header">
-              <span class="insp-card-title">Universal Skill Transpiler</span>
+              <span class="insp-card-title">Context-Budget Skill Manager</span>
               <span class="insp-badge">${state.skills.length}</span>
             </div>
             <input
@@ -838,14 +1344,18 @@
                   (s) => `
                 <div class="insp-row" onclick="previewSkillTranspilation('${escapeHtml(s.name)}')">
                   <div style="display:flex;flex-direction:column;gap:2px;overflow:hidden">
-                    <span style="color:var(--text-primary)">${escapeHtml(s.name)}</span>
+                    <span style="color:var(--text-primary)">${escapeHtml(s.name)} <code style="font-size:9.5px;color:var(--text-muted)">~${s.estimatedTokens || 240}t</code></span>
                     ${
                       s.mergedFrom && s.mergedFrom.length > 0
                         ? `<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">fused: ${escapeHtml(s.mergedFrom.join(", "))}</span>`
                         : ""
                     }
                   </div>
-                  <span class="insp-badge">${escapeHtml(s.capabilityCluster || s.ecosystem)}</span>
+                  <div style="display:flex;align-items:center;gap:4px">
+                    <button class="btn-ghost" style="padding:1px 6px;font-size:10px" onclick="event.stopPropagation(); toggleSkillEnabled('${escapeHtml(s.id)}')">
+                      ${disabledSet.has(s.id) ? "Disabled" : "Enabled"}
+                    </button>
+                  </div>
                 </div>
               `,
                 )
@@ -872,6 +1382,7 @@
       if (state.inspectorTab === "harness2") {
         const files = state.harness2?.surfaceFiles || {};
         const val = state.harness2?.validation;
+        const snapshots = state.harness2?.snapshots || [];
         container.innerHTML = `
           <div class="insp-card">
             <div class="insp-card-header">
@@ -891,6 +1402,33 @@
             </select>
             <textarea id="surface-textarea" class="surface-editor">${escapeHtml(files[state.activeSurfaceFile] || "")}</textarea>
             <button class="insp-action-btn" onclick="saveSurfaceFile()">Save & validate c1..c8 tree</button>
+          </div>
+
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Controlled Improvement Pipeline</span>
+              <span class="insp-badge">${snapshots.length} snapshots</span>
+            </div>
+            <input id="h2-prop-title" class="ide-panel-input" placeholder="Lesson title (e.g. Enforce canonical paths)" />
+            <textarea id="h2-prop-body" class="surface-editor" style="min-height:60px" placeholder="- Always validate paths with realpathSync before file writes."></textarea>
+            <button class="insp-action-btn" onclick="proposeAndPromoteLesson()">Validate & Promote with Snapshot</button>
+            ${
+              snapshots.length > 0
+                ? `<div class="insp-list" style="max-height:110px;margin-top:6px">
+                    ${snapshots
+                      .slice(0, 5)
+                      .map(
+                        (s) => `
+                      <div class="insp-row">
+                        <span style="font-family:var(--font-mono);font-size:10.5px">${escapeHtml(s.snapshotId)}</span>
+                        <button class="btn-ghost" style="padding:1px 6px;font-size:10px" onclick="rollbackSnapshot('${escapeHtml(s.snapshotId)}')">Rollback</button>
+                      </div>
+                    `,
+                      )
+                      .join("")}
+                  </div>`
+                : ""
+            }
           </div>
         `;
         return;
@@ -915,7 +1453,7 @@
                   </div>
                   <div style="font-family:var(--font-mono);font-size:10.5px;color:var(--text-muted)">${escapeHtml(m.id)}</div>
                   <div class="score-bar-track">
-                    <div class="score-bar-fill" style="width:${Math.min(100, Math.max(15, m.emaScore || 80))}%"></div>
+                    <div class="score-bar-fill" style="width:${Math.min(100, Math.max(15, (m.emaScore || 0.8) * 100))}%"></div>
                   </div>
                 </div>
               `,
