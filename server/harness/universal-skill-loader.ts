@@ -1,13 +1,12 @@
-// Phase 2: Universal Multi-IDE Skill, Command, Rule, Hook & MCP Transpiler.
-// Auto-discovers skills, slash commands, subagent definitions, rules (.mdc, CLAUDE.md, AGENTS.md),
-// and MCP servers across Antigravity, Claude Code, Codex, Cursor, Gemini CLI, Hermes, and OpenMausBot.
-// Transpiles tool names and placeholders at runtime for whichever engine driver executes the turn,
-// and performs Top-K semantic skill selection so context never bloats.
+// Phase 2 & Part 9: Universal Multi-IDE Skill, Command, Rule, Hook & MCP Transpiler
+// with Context-Budget-Aware Dynamic Selection, Conflict Detection, Compatibility Validation,
+// and Per-Project / Per-Agent Role Assignment.
 
 import { createHash } from "node:crypto";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, extname, join, resolve } from "node:path";
+import type { AgentOfficeRole } from "../../shared/apex-contracts.ts";
 import type { DriverBackend } from "./apex-fleet-sync.ts";
 
 export type SkillEcosystem =
@@ -22,9 +21,12 @@ export type SkillEcosystem =
 
 export type UniversalArtifactKind = "skill" | "command" | "subagent" | "rule" | "mcp";
 
+export type SkillSecurityClassification = "standard" | "elevated_shell" | "dual_use_restricted";
+
 export interface UniversalSkillItem {
   id: string;
   name: string;
+  version: string;
   description: string;
   ecosystem: SkillEcosystem;
   kind: UniversalArtifactKind;
@@ -32,10 +34,13 @@ export interface UniversalSkillItem {
   capabilityCluster?: string;
   mergedFrom?: string[];
   allowedTools?: string[];
+  assignedRoles?: AgentOfficeRole[];
   globs?: string[];
   alwaysApply?: boolean;
   preferredModel?: string;
   sensitiveDualUse: boolean;
+  securityClass: SkillSecurityClassification;
+  estimatedTokens: number;
   sha256: string;
   rawBody: string;
 }
@@ -48,6 +53,12 @@ export interface UniversalMcpServerEntry {
   url?: string;
   env?: Record<string, string>;
   sourcePath: string;
+}
+
+export interface SkillManagementConfig {
+  disabledSkillIds: string[];
+  projectSkillOverrides: Record<string, string[]>;
+  roleSkillAssignments: Partial<Record<AgentOfficeRole, string[]>>;
 }
 
 const TOOL_ALIAS_TABLE: Record<DriverBackend, Record<string, string>> = {
@@ -119,10 +130,6 @@ const DUAL_USE_SENSITIVE_SKILL_NAMES = new Set([
   "obscura",
 ]);
 
-/**
- * Repo-locked internal maintenance skills that only apply to upstream monorepo CI
- * and should be excluded from the universal general-purpose skill registry.
- */
 const REPO_LOCKED_EXCLUDED_SKILLS = new Set([
   "dsh-archive-agent-notes",
   "dsh-create-upgrade-guide",
@@ -136,22 +143,18 @@ const REPO_LOCKED_EXCLUDED_SKILLS = new Set([
   "dsh-doc-writing",
 ]);
 
-/**
- * Maps overlapping cross-IDE skills into canonical capability clusters.
- * Each cluster has a single Best-of-Breed `winner`; runner-up skills (`suppressed`)
- * have their unique high-value rules fused into the winner so only ONE authoritative
- * skill per capability domain is ever loaded.
- */
 const CANONICAL_CAPABILITY_CLUSTERS: ReadonlyArray<{
   cluster: string;
   winner: string;
   suppressed: readonly string[];
+  assignedRoles: AgentOfficeRole[];
   fusedAddendum: string;
 }> = [
   {
     cluster: "anti-slop-prose",
     winner: "no-ai-slop",
     suppressed: ["dsh-prose-standard", "dsh-trim-cot-leakage"],
+    assignedRoles: ["Builder", "Verifier"],
     fusedAddendum: [
       "",
       "## Fused DeepSeek-Harness CoT Leakage & Proposition Rules (from `dsh-trim-cot-leakage` + `dsh-prose-standard`)",
@@ -163,6 +166,7 @@ const CANONICAL_CAPABILITY_CLUSTERS: ReadonlyArray<{
     cluster: "ui-ux-craft",
     winner: "frontend-craft",
     suppressed: ["dsh-client-ui-ux", "dsh-responsive-ui", "taste-design"],
+    assignedRoles: ["Architect", "Builder"],
     fusedAddendum: [
       "",
       "## Fused DeepSeek-Harness Precision UI Geometry & Anti-Slop Rules (from `dsh-client-ui-ux` + `dsh-responsive-ui`)",
@@ -176,6 +180,7 @@ const CANONICAL_CAPABILITY_CLUSTERS: ReadonlyArray<{
     cluster: "code-review",
     winner: "adversarial-review",
     suppressed: ["dsh-code-review", "reviewer"],
+    assignedRoles: ["Critic", "Verifier"],
     fusedAddendum: [
       "",
       "## Fused DeepSeek-Harness Lifecycle & Error-Containment Audit Rules (from `dsh-code-review`)",
@@ -187,6 +192,7 @@ const CANONICAL_CAPABILITY_CLUSTERS: ReadonlyArray<{
     cluster: "code-simplification",
     winner: "karpathy-guidelines",
     suppressed: ["dsh-find-simplifications"],
+    assignedRoles: ["Architect", "Builder"],
     fusedAddendum: [
       "",
       "## Fused DeepSeek-Harness Simplification & Reachability Rules (from `dsh-find-simplifications`)",
@@ -198,6 +204,7 @@ const CANONICAL_CAPABILITY_CLUSTERS: ReadonlyArray<{
     cluster: "testing-verification",
     winner: "exhaustive-testing-architecture",
     suppressed: ["evidence-and-claims", "dsh-ci-test-reliability"],
+    assignedRoles: ["Verifier", "Builder"],
     fusedAddendum: [
       "",
       "## Fused DeepSeek-Harness Test Reliability & Negative Control Rules (from `dsh-ci-test-reliability` + `evidence-and-claims`)",
@@ -206,6 +213,10 @@ const CANONICAL_CAPABILITY_CLUSTERS: ReadonlyArray<{
     ].join("\n"),
   },
 ];
+
+export function estimateSkillTokens(text: string): number {
+  return Math.max(1, Math.ceil(Buffer.byteLength(text || "", "utf8") / 4));
+}
 
 function parseFrontmatter(markdown: string): {
   frontmatter: Record<string, string>;
@@ -228,9 +239,37 @@ function parseFrontmatter(markdown: string): {
   return { frontmatter, body };
 }
 
-function isSensitiveSkill(name: string, body: string): boolean {
-  if (DUAL_USE_SENSITIVE_SKILL_NAMES.has(name.toLowerCase())) return true;
-  return /\b(aircrack-ng|reaver|pentagi|red-teaming|parseltongue|l1b3rt4s|exploit)\b/i.test(body.slice(0, 4000));
+function classifySkillSecurity(name: string, body: string): {
+  sensitiveDualUse: boolean;
+  securityClass: SkillSecurityClassification;
+} {
+  const lower = name.toLowerCase();
+  if (
+    DUAL_USE_SENSITIVE_SKILL_NAMES.has(lower) ||
+    /\b(aircrack-ng|reaver|pentagi|red-teaming|parseltongue|l1b3rt4s|exploit)\b/i.test(body.slice(0, 4000))
+  ) {
+    return { sensitiveDualUse: true, securityClass: "dual_use_restricted" };
+  }
+  if (/\b(run_command|exec_command|Bash|sudo|systemctl|docker)\b/.test(body.slice(0, 4000))) {
+    return { sensitiveDualUse: false, securityClass: "elevated_shell" };
+  }
+  return { sensitiveDualUse: false, securityClass: "standard" };
+}
+
+function inferSkillRoles(name: string, description: string): AgentOfficeRole[] {
+  const text = `${name} ${description}`.toLowerCase();
+  const roles = new Set<AgentOfficeRole>();
+  if (/\b(review|audit|critic|adversarial|security)\b/.test(text)) roles.add("Critic");
+  if (/\b(test|verify|check|evidence|qa)\b/.test(text)) roles.add("Verifier");
+  if (/\b(search|discover|research|explore|graphify|scout)\b/.test(text)) roles.add("Scout");
+  if (/\b(architect|plan|design|orchestrat|boardroom)\b/.test(text)) {
+    roles.add("Coordinator");
+    roles.add("Architect");
+  }
+  if (roles.size === 0 || /\b(build|implement|code|frontend|react|ui)\b/.test(text)) {
+    roles.add("Builder");
+  }
+  return [...roles];
 }
 
 function scanSkillFolder(
@@ -250,20 +289,22 @@ function scanSkillFolder(
 
   for (const entry of entries) {
     const fullPath = join(folderPath, entry);
-    let st;
+    let lst;
     try {
-      st = statSync(fullPath);
+      lst = lstatSync(fullPath);
+      if (lst.isSymbolicLink()) continue; // Guard against symlink loops
     } catch {
       continue;
     }
 
-    if (st.isDirectory()) {
+    if (lst.isDirectory()) {
       const skillMd = join(fullPath, "SKILL.md");
       if (existsSync(skillMd)) {
         try {
           const raw = readFileSync(skillMd, "utf8");
           const { frontmatter, body } = parseFrontmatter(raw);
           const name = frontmatter.name || entry;
+          const version = frontmatter.version || "1.0.0";
           const description =
             frontmatter.description ||
             body.split(/\r?\n/).find((l) => l.trim() && !l.startsWith("#"))?.trim() ||
@@ -271,16 +312,21 @@ function scanSkillFolder(
           const allowedTools = frontmatter["allowed-tools"]
             ? frontmatter["allowed-tools"].split(/[,\s]+/).filter(Boolean)
             : undefined;
+          const sec = classifySkillSecurity(name, raw);
           items.push({
             id: `${ecosystem}:${kind}:${name}`,
             name,
+            version,
             description,
             ecosystem,
             kind,
             sourcePath: skillMd,
             allowedTools,
+            assignedRoles: inferSkillRoles(name, description),
             preferredModel: frontmatter.model,
-            sensitiveDualUse: isSensitiveSkill(name, raw),
+            sensitiveDualUse: sec.sensitiveDualUse,
+            securityClass: sec.securityClass,
+            estimatedTokens: estimateSkillTokens(body),
             sha256: createHash("sha256").update(raw).digest("hex"),
             rawBody: body,
           });
@@ -288,13 +334,14 @@ function scanSkillFolder(
           // Ignore unreadable skill files
         }
       }
-    } else if (st.isFile() && (entry.endsWith(".md") || entry.endsWith(".mdc") || entry.endsWith(".toml"))) {
+    } else if (lst.isFile() && (entry.endsWith(".md") || entry.endsWith(".mdc") || entry.endsWith(".toml"))) {
       try {
         const raw = readFileSync(fullPath, "utf8");
         const ext = extname(entry).toLowerCase();
         const base = basename(entry, ext);
         const { frontmatter, body } = parseFrontmatter(raw);
         const name = frontmatter.name || base;
+        const version = frontmatter.version || "1.0.0";
         const description =
           frontmatter.description ||
           body.split(/\r?\n/).find((l) => l.trim() && !l.startsWith("#"))?.trim() ||
@@ -302,17 +349,22 @@ function scanSkillFolder(
         const globs = frontmatter.globs
           ? frontmatter.globs.split(",").map((g) => g.trim()).filter(Boolean)
           : undefined;
+        const sec = classifySkillSecurity(name, raw);
         items.push({
           id: `${ecosystem}:${kind}:${name}`,
           name,
+          version,
           description,
           ecosystem,
           kind,
           sourcePath: fullPath,
           globs,
+          assignedRoles: inferSkillRoles(name, description),
           alwaysApply: frontmatter.alwaysapply === "true",
           preferredModel: frontmatter.model,
-          sensitiveDualUse: isSensitiveSkill(name, raw),
+          sensitiveDualUse: sec.sensitiveDualUse,
+          securityClass: sec.securityClass,
+          estimatedTokens: estimateSkillTokens(body),
           sha256: createHash("sha256").update(raw).digest("hex"),
           rawBody: body,
         });
@@ -326,7 +378,7 @@ function scanSkillFolder(
 }
 
 /**
- * Discovers all skills, slash commands, subagents, and rules across all 7 IDE/CLI ecosystems on the machine.
+ * Discovers all skills, slash commands, subagents, and rules across all 8 IDE/CLI ecosystems.
  */
 export function discoverAllUniversalSkills(options: {
   userHome?: string;
@@ -336,27 +388,21 @@ export function discoverAllUniversalSkills(options: {
   const workspace = options.workspaceRoot ? resolve(options.workspaceRoot) : undefined;
 
   const searchRoots: Array<{ path: string; ecosystem: SkillEcosystem; kind: UniversalArtifactKind }> = [
-    // 1. Antigravity Global & Builtin Skills
     { path: join(home, ".gemini", "config", "skills"), ecosystem: "antigravity", kind: "skill" },
     { path: join(home, ".gemini", "antigravity", "builtin", "skills"), ecosystem: "antigravity", kind: "skill" },
     { path: join(home, ".gemini", "config", "plugins", "gemini-api", "skills"), ecosystem: "antigravity", kind: "skill" },
     { path: join(home, ".gemini", "config", "plugins", "modern-web-guidance-plugin", "skills"), ecosystem: "antigravity", kind: "skill" },
     { path: join(home, ".gemini", "config", "plugins", "google-antigravity-sdk", "skills"), ecosystem: "antigravity", kind: "skill" },
     { path: join(home, ".gemini", "config", "plugins", "google-developer-knowledge", "skills"), ecosystem: "antigravity", kind: "skill" },
-    // 2. Claude Code Skills, Commands & Subagents
     { path: join(home, ".claude", "skills"), ecosystem: "claude-code", kind: "skill" },
     { path: join(home, ".claude", "commands"), ecosystem: "claude-code", kind: "command" },
     { path: join(home, ".claude", "agents"), ecosystem: "claude-code", kind: "subagent" },
-    // 3. Codex & .agents Skills
     { path: join(home, ".codex", "skills"), ecosystem: "codex", kind: "skill" },
     { path: join(home, ".agents", "skills"), ecosystem: "codex", kind: "skill" },
-    // 4. Cursor Skills & Rules
     { path: join(home, ".cursor", "skills"), ecosystem: "cursor", kind: "skill" },
     { path: join(home, ".cursor", "rules"), ecosystem: "cursor", kind: "rule" },
-    // 5. Gemini CLI Skills & Commands
     { path: join(home, ".gemini", "skills"), ecosystem: "gemini-cli", kind: "skill" },
     { path: join(home, ".gemini", "commands"), ecosystem: "gemini-cli", kind: "command" },
-    // 6. Hermes / OpenCode Skills
     { path: join(home, ".config", "opencode", "skills"), ecosystem: "hermes", kind: "skill" },
   ];
 
@@ -397,11 +443,14 @@ export function discoverAllUniversalSkills(options: {
       if (!deduplicated.has(key)) {
         const winnerCluster = winnerToCluster.get(nameLower);
         if (winnerCluster) {
+          const fusedBody = `${item.rawBody.trim()}\n${winnerCluster.fusedAddendum}\n`;
           deduplicated.set(key, {
             ...item,
             capabilityCluster: winnerCluster.cluster,
             mergedFrom: [...winnerCluster.suppressed],
-            rawBody: `${item.rawBody.trim()}\n${winnerCluster.fusedAddendum}\n`,
+            assignedRoles: winnerCluster.assignedRoles,
+            rawBody: fusedBody,
+            estimatedTokens: estimateSkillTokens(fusedBody),
           });
         } else {
           const autoCluster = nameLower.startsWith("stitch")
@@ -419,6 +468,78 @@ export function discoverAllUniversalSkills(options: {
   }
 
   return [...deduplicated.values()];
+}
+
+export function detectSkillConflicts(skills: readonly UniversalSkillItem[]): Array<{
+  clusterOrName: string;
+  conflictingSkillIds: string[];
+  resolution: string;
+}> {
+  const byCluster = new Map<string, UniversalSkillItem[]>();
+  for (const s of skills) {
+    if (s.capabilityCluster) {
+      const list = byCluster.get(s.capabilityCluster) ?? [];
+      list.push(s);
+      byCluster.set(s.capabilityCluster, list);
+    }
+  }
+  const conflicts: Array<{ clusterOrName: string; conflictingSkillIds: string[]; resolution: string }> = [];
+  for (const [cluster, members] of byCluster.entries()) {
+    if (members.length > 1) {
+      conflicts.push({
+        clusterOrName: cluster,
+        conflictingSkillIds: members.map((m) => m.id),
+        resolution: `Retain highest-scoring skill in cluster '${cluster}' per turn`,
+      });
+    }
+  }
+  return conflicts;
+}
+
+export function validateSkillCompatibility(
+  skill: UniversalSkillItem,
+  targetDriver: DriverBackend,
+  strictFirewall = false,
+): { compatible: boolean; reason?: string } {
+  if (strictFirewall && (skill.sensitiveDualUse || skill.securityClass === "dual_use_restricted")) {
+    return {
+      compatible: false,
+      reason: `Skill '${skill.name}' is restricted on strict-firewall models`,
+    };
+  }
+  if (!TOOL_ALIAS_TABLE[targetDriver]) {
+    return {
+      compatible: false,
+      reason: `Unsupported target driver '${targetDriver}'`,
+    };
+  }
+  return { compatible: true };
+}
+
+export function loadSkillManagementConfig(dataDir: string): SkillManagementConfig {
+  const p = join(resolve(dataDir), "apex-skills-config.json");
+  if (!existsSync(p)) {
+    return {
+      disabledSkillIds: [],
+      projectSkillOverrides: {},
+      roleSkillAssignments: {},
+    };
+  }
+  try {
+    return JSON.parse(readFileSync(p, "utf8")) as SkillManagementConfig;
+  } catch {
+    return {
+      disabledSkillIds: [],
+      projectSkillOverrides: {},
+      roleSkillAssignments: {},
+    };
+  }
+}
+
+export function saveSkillManagementConfig(dataDir: string, config: SkillManagementConfig): void {
+  const p = join(resolve(dataDir), "apex-skills-config.json");
+  mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
+  writeFileSync(p, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
 
 /**
@@ -465,8 +586,7 @@ export function discoverAllUniversalMcpServers(userHome: string = homedir()): Un
 }
 
 /**
- * Transpiles a skill/command/subagent from ANY IDE (Claude Code, Codex, Cursor, Antigravity, Gemini CLI, Hermes)
- * into the target execution driver's native tool names and argument conventions.
+ * Transpiles a skill/command/subagent from ANY IDE into the target execution driver's native tool names.
  */
 export function transpileSkillForDriver(
   skill: UniversalSkillItem,
@@ -476,21 +596,19 @@ export function transpileSkillForDriver(
   const aliasMap = TOOL_ALIAS_TABLE[targetDriver] ?? {};
   let transpiled = skill.rawBody;
 
-  // Replace $ARGUMENTS and {{args}} placeholders used by Claude Code & Gemini CLI commands
   if (argsText) {
     transpiled = transpiled.replace(/\$ARGUMENTS\b/g, argsText).replace(/\{\{\s*args\s*\}\}/g, argsText);
     const positional = argsText.split(/\s+/);
     transpiled = transpiled.replace(/\$(\d)\b/g, (_m, idx) => positional[Number(idx) - 1] ?? "");
   }
 
-  // Rewrite inline tool references in backticks (e.g. `Bash` -> `run_command` or `exec_command`)
   for (const [fromTool, toTool] of Object.entries(aliasMap)) {
     const backtickPattern = new RegExp(`\`${fromTool}\``, "g");
     transpiled = transpiled.replace(backtickPattern, `\`${toTool}\``);
   }
 
   const header = [
-    `### [Universal ${skill.kind.toUpperCase()}: ${skill.name}] (Source: ${skill.ecosystem} | Path: ${dirname(skill.sourcePath)})`,
+    `### [Universal ${(skill.kind || "skill").toUpperCase()}: ${skill.name}] (Source: ${skill.ecosystem} | Path: ${dirname(skill.sourcePath)})`,
     skill.description ? `> ${skill.description}` : "",
   ]
     .filter(Boolean)
@@ -508,34 +626,57 @@ function tokenize(text: string): string[] {
 }
 
 /**
- * Top-K Semantic & Lexical Skill Router:
- * Scores all discovered skills against the user's prompt and returns only the Top-K relevant skills.
- * When `strictFirewall` is true (e.g., Gemini 4 Carbon), sensitive dual-use skills are automatically excluded.
+ * Context-Budget-Aware Dynamic Skill Selector (Part 9):
+ * Selects relevant skills ranked by semantic/lexical score and agent-role affinity while
+ * strictly enforcing `maxContextBudgetTokens` (and optional `topK` ceiling) so skill loading
+ * never overflows the model's context budget.
  */
 export function selectTopKSkillsForTurn(
   prompt: string,
   skills: readonly UniversalSkillItem[],
   options: {
     topK?: number;
+    maxContextBudgetTokens?: number;
+    modelContextWindow?: number;
     strictFirewall?: boolean;
     targetDriver?: DriverBackend;
+    agentRole?: AgentOfficeRole;
+    disabledSkillIds?: ReadonlySet<string>;
   } = {},
-): Array<{ skill: UniversalSkillItem; score: number; transpiledPromptBlock: string }> {
-  const topK = options.topK ?? 4;
+): Array<{
+  skill: UniversalSkillItem;
+  score: number;
+  estimatedTokens: number;
+  transpiledPromptBlock: string;
+}> {
   const strictFirewall = options.strictFirewall ?? false;
   const targetDriver = options.targetDriver ?? "antigravity";
+  const maxContextBudgetTokens =
+    options.maxContextBudgetTokens ??
+    Math.min(6000, Math.max(800, Math.floor((options.modelContextWindow ?? 128_000) * 0.04)));
+  const maxCount = options.topK ?? 8;
+
   const promptTokens = new Set(tokenize(prompt));
   const promptLower = prompt.toLowerCase();
 
   const scored: Array<{ skill: UniversalSkillItem; score: number }> = [];
 
   for (const skill of skills) {
-    if (strictFirewall && skill.sensitiveDualUse) {
+    if (options.disabledSkillIds?.has(skill.id) || options.disabledSkillIds?.has(skill.name)) {
       continue;
     }
+    const compat = validateSkillCompatibility(skill, targetDriver, strictFirewall);
+    if (!compat.compatible) {
+      continue;
+    }
+
     let score = 0;
     const nameLower = skill.name.toLowerCase();
-    if (promptLower.includes(nameLower) || promptLower.includes(`/${nameLower}`) || promptLower.includes(`$${nameLower}`)) {
+    if (
+      promptLower.includes(nameLower) ||
+      promptLower.includes(`/${nameLower}`) ||
+      promptLower.includes(`$${nameLower}`)
+    ) {
       score += 10.0;
     }
     const descTokens = tokenize(`${skill.name} ${skill.description}`);
@@ -549,27 +690,65 @@ export function selectTopKSkillsForTurn(
     if (skill.alwaysApply) {
       score += 2.5;
     }
+    if (options.agentRole && skill.assignedRoles?.includes(options.agentRole)) {
+      score += 1.2;
+    }
     if (score >= 1.2) {
       scored.push({ skill, score: Number(score.toFixed(3)) });
     }
   }
 
   scored.sort((a, b) => b.score - a.score);
-  const selected: Array<{ skill: UniversalSkillItem; score: number; transpiledPromptBlock: string }> = [];
+
+  const selected: Array<{
+    skill: UniversalSkillItem;
+    score: number;
+    estimatedTokens: number;
+    transpiledPromptBlock: string;
+  }> = [];
   const usedClusters = new Set<string>();
+  let consumedTokens = 0;
 
   for (const { skill, score } of scored) {
-    if (selected.length >= topK) break;
+    if (selected.length >= maxCount) break;
     if (skill.capabilityCluster) {
       if (usedClusters.has(skill.capabilityCluster)) {
         continue;
       }
+    }
+
+    const transpiledPromptBlock = transpileSkillForDriver(skill, targetDriver, prompt);
+    const tokenCost = skill.estimatedTokens || estimateSkillTokens(transpiledPromptBlock);
+
+    // Enforce dynamic context budget: if adding this skill exceeds maxContextBudgetTokens,
+    // either truncate its body to fit (if selected.length === 0) or skip to a smaller skill
+    if (consumedTokens + tokenCost > maxContextBudgetTokens) {
+      if (selected.length === 0 && maxContextBudgetTokens >= 150) {
+        const suffix = `\n...[truncated to fit ${maxContextBudgetTokens}-token skill budget]`;
+        const maxBytes = Math.max(64, maxContextBudgetTokens * 4 - suffix.length - 16);
+        const truncatedBlock = `${transpiledPromptBlock.slice(0, maxBytes)}${suffix}`;
+        const truncTokens = Math.min(maxContextBudgetTokens, estimateSkillTokens(truncatedBlock));
+        selected.push({
+          skill,
+          score,
+          estimatedTokens: truncTokens,
+          transpiledPromptBlock: truncatedBlock,
+        });
+        consumedTokens += truncTokens;
+        break;
+      }
+      continue;
+    }
+
+    if (skill.capabilityCluster) {
       usedClusters.add(skill.capabilityCluster);
     }
+    consumedTokens += tokenCost;
     selected.push({
       skill,
       score,
-      transpiledPromptBlock: transpileSkillForDriver(skill, targetDriver, prompt),
+      estimatedTokens: tokenCost,
+      transpiledPromptBlock,
     });
   }
 
