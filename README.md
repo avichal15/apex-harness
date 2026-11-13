@@ -4,9 +4,9 @@
 
 **A Unified Multi-Agent AI Engineering Studio, Live Agent Office, and Cross-IDE Harness Substrate**
 
-[![Tests](https://img.shields.io/badge/verification-9%2F9%20phases%20passing-10b981)](#verification)
+[![Tests](https://img.shields.io/badge/verification-29%2F29%20tests%20passing-10b981)](#verification)
 [![Runtime](https://img.shields.io/badge/Node.js-%E2%89%A524-339933?logo=node.js&logoColor=white)](#prerequisites)
-[![UI](https://img.shields.io/badge/UI-Agent%20Office%20%2B%20Electron-3b82f6)](#live-ai-agent-office--orchestration-visualization)
+[![UI](https://img.shields.io/badge/UI-Agent%20Office%20%2B%20IDE%20Workbench-3b82f6)](#live-ai-agent-office--orchestration-visualization)
 [![License](https://img.shields.io/badge/License-Apache--2.0-6b7280)](./LICENSE)
 
 [Quick Start](./SETUP.md) &nbsp;&middot;&nbsp; [Architecture](#architecture-overview) &nbsp;&middot;&nbsp; [Agent Office UI](#live-ai-agent-office--orchestration-visualization) &nbsp;&middot;&nbsp; [Full Setup Guide](./SETUP.md)
@@ -59,13 +59,18 @@ Cross-IDE tool names (`Read`, `Edit`, `Write`, `Grep`, `Glob`, `Bash`, `TodoWrit
 
 | Subsystem | Module(s) | What It Does |
 | :--- | :--- | :--- |
-| **App Server & SSE Stream** | [`server/apex-app-server.ts`](./server/apex-app-server.ts) | Serves the UI, manages workspace/independent conversations (`POST`, `PATCH`, `DELETE`), and streams live `office` + `step` SSE events. |
-| **Multi-Step Tool Engine** | [`server/apex-llm-engine.ts`](./server/apex-llm-engine.ts) | Executes ReAct tool rounds, captures pre-edit file snapshots for 1-click undo (`revertTurnCheckpoint`), and runs failover across gateways/CLIs. |
-| **EMA Task-to-Model Router** | [`server/decider/apex-orchestrator-router.ts`](./server/decider/apex-orchestrator-router.ts) | Classifies prompts across 10 engineering domains and selects top-scoring models using live Exponential Moving Average (EMA) weights. |
-| **EGM v5.1 Boardroom** | [`server/harness/egm-boardroom.ts`](./server/harness/egm-boardroom.ts) | Separates deep-context CEO execution from 4 stateless zero-context Goldfish audit lenses governed by `PROPOSE_FIX \| CONTEST \| ESCALATE \| DECLINE`. |
-| **DeepSeek-Harness Subsystems** | [`server/harness/deepseek-subsystems.ts`](./server/harness/deepseek-subsystems.ts) | Provides sandboxed Node `vm` Programmatic Tool Calling (`executePtcProgram`), UTF-16 head/tail spill files (`applySpillPolicyToText`), repeat-call/timeout guards (`RepeatToolReminderGuard`), Cordis host plugins, and FTS session queries. |
-| **Universal Skill & MCP Bridge** | [`server/harness/universal-skill-loader.ts`](./server/harness/universal-skill-loader.ts), [`mcp-client-bridge.ts`](./server/harness/mcp-client-bridge.ts) | Auto-discovers, deduplicates, and transpiles skills across ecosystems and connects to JSON-RPC 2.0 stdio MCP servers. |
-| **Harness² `c1..c8` Substrate** | [`server/harness/harness2-bridge.ts`](./server/harness/harness2-bridge.ts), [`harness2/`](./harness2) | Initializes and validates the 8 canonical self-evolving harness surfaces (`systemprompt.md`, `guardrails.md`, `LongTermMEMORY.md`, `tool_guidance.md`, sub-agents, skills, scripts, plugins). |
+| **Shared Typed Contracts** | [`shared/apex-contracts.ts`](./shared/apex-contracts.ts) | Defines canonical execution states, 10 engineering roles, 6 agent office roles, provider configs, and completion evidence schemas. |
+| **Workspace & Local API Security** | [`server/harness/workspace-security.ts`](./server/harness/workspace-security.ts) | Enforces `realpathSync`/`lstatSync` canonical path containment (blocking `../`, external paths, sibling-prefix confusion, and symlink escapes), loopback Origin/CSRF checks, per-session tokens, and 1 MiB body caps. |
+| **Async Process Manager** | [`server/harness/process-manager.ts`](./server/harness/process-manager.ts) | Replaces synchronous `execSync` with `AbortSignal`-aware async child process execution, process-tree termination (`taskkill /T /F`), 256 KiB output ceilings, secret env stripping, and `turbo`/`auto_edit`/`ask` permission policies. |
+| **Unified Execution Lifecycle** | [`server/harness/execution-manager.ts`](./server/harness/execution-manager.ts) | Tracks persistent `executionId` state transitions (`queued -> planning -> running -> paused -> cancelling -> cancelled / completed / failed`), hierarchical `AbortController` propagation, and crash recovery (`apex-executions.json`). |
+| **6-Agent DAG & 10-Role Router** | [`server/harness/agent-dag-orchestrator.ts`](./server/harness/agent-dag-orchestrator.ts) | Decomposes tasks into a 6-agent DAG (`Coordinator` -> parallel `[Scout \|\| Architect]` -> `Critic` -> `Builder` -> `Verifier`), manages 10-role model routing, and stores provider API keys in an AES-256-GCM encrypted vault (`apex-provider-secrets.enc.json`). |
+| **Completion Evidence Builder** | [`server/harness/completion-evidence.ts`](./server/harness/completion-evidence.ts) | Produces structured `CompletionEvidenceReport` ledgers from actual modified files, git diffs, executed test exit codes, and post-implementation review verdicts. |
+| **App Server, IDE Workbench & SSE** | [`server/apex-app-server.ts`](./server/apex-app-server.ts), [`ui/index.html`](./ui/index.html) | Serves the Agent Office, IDE Workbench (File Explorer, Code Editor, Search, Terminal, Git Diff), 10-Role Router UI, and live `execution` + `office` SSE streams. |
+| **Multi-Step Tool Engine** | [`server/apex-llm-engine.ts`](./server/apex-llm-engine.ts) | Executes ReAct tool rounds, captures pre-edit file snapshots for 1-click undo (`revertTurnCheckpoint`), and runs multi-protocol failover across gateways/CLIs. |
+| **EGM v5.1 & Post-Impl Review** | [`server/harness/egm-boardroom.ts`](./server/harness/egm-boardroom.ts) | Runs pre-execution Desk 1–3 grounding and independent post-implementation diff/test review (`runPostImplementationEgmReview`), never defaulting to approval when unavailable. |
+| **DeepSeek-Harness Subsystems** | [`server/harness/deepseek-subsystems.ts`](./server/harness/deepseek-subsystems.ts) | Isolates Programmatic Tool Calling (`executePtcProgram`) and HMAC-SHA256 signed Cordis plugins inside Node `--permission` child processes, plus UTF-16 spill files, repeat-call guards, and FTS session queries. |
+| **Universal Skill & MCP Bridge** | [`server/harness/universal-skill-loader.ts`](./server/harness/universal-skill-loader.ts), [`mcp-client-bridge.ts`](./server/harness/mcp-client-bridge.ts) | Enforces dynamic token budgets (`maxContextBudgetTokens`), conflict detection, driver compatibility checks, and `AbortSignal`-propagating JSON-RPC 2.0 MCP calls. |
+| **Harness² `c1..c8` Controlled Evolution** | [`server/harness/harness2-bridge.ts`](./server/harness/harness2-bridge.ts), [`harness2/`](./harness2) | Enforces proposal validation gates (`proposeHarnessImprovement` -> `validateHarnessProposal` -> `promoteHarnessProposal`) and snapshot rollback (`rollbackHarnessSnapshot`) across `c1..c8`. |
 | **Fleet Registry & Clean-Room Sanitizer** | [`server/harness/apex-fleet-sync.ts`](./server/harness/apex-fleet-sync.ts) | Loads configured gateway/CLI models without persisting raw API keys to disk and maintains an isolated clean-room environment for strict-firewall models. |
 
 ---
@@ -73,17 +78,19 @@ Cross-IDE tool names (`Read`, `Edit`, `Write`, `Grep`, `Glob`, `Bash`, `TodoWrit
 ## Independent & Project Workspaces
 
 - **Independent Chats (`General Chats`)**: Brainstorm architectures, run research, or compare models without binding the session to any local codebase.
-- **Project Workspaces**: Auto-discovers registered git repositories or folders added via `+ Folder` / `APEX_EXTRA_WORKSPACE_ROOTS`, keeping threads grouped cleanly without duplicate entries.
-- **1-Click Thread Management & Safety Checkpoints**: Delete individual threads cleanly (`×`), inspect any tool step output inline, and revert file modifications from any assistant turn.
+- **Project Workspaces & Integrated IDE Workbench**: Browse files, edit & save with automatic checkpoints, run project-wide text search, inspect `git status`/`git diff`, and execute terminal/test commands directly inside the **IDE Workbench** tab.
+- **1-Click Thread Management & Safety Checkpoints**: Delete individual threads cleanly (`×`), pause/resume/cancel running DAG executions, inspect any tool step output inline, and revert file modifications from any assistant turn.
 
 ---
 
 ## Verification
 
-Run the 9-phase automated verification suite (covering Drive/virtual filesystem compatibility, key-redacted fleet syncing, skill transpilation, EMA routing & self-judge gates, Python `harness2` validation, EGM boardroom conferencing, DeepSeek subsystems, surgical `edit_file` checkpoints, JSON-RPC 2.0 MCP client bridge, and multi-protocol XML/JSON tool parsing):
+Run the complete **29-test automated verification suite** (9 core architecture phases + 20 master security, orchestration, cancellation, and completion-evidence scenarios):
 
 ```bash
-node --test --experimental-strip-types server/apex-harness.node-test.mjs
+npm run test:apex
+# or directly via Node 24:
+node --experimental-strip-types --test server/apex-harness.node-test.mjs server/apex-master-verification.node-test.mjs
 ```
 
 ---

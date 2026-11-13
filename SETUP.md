@@ -135,24 +135,31 @@ Skills from Claude Code, Codex, Cursor, and Antigravity are automatically dedupl
 
 ---
 
-## 6. Running the Verification Suite
+## 6. Running the 29-Test Verification Suite
 
-Run all 9 automated verification phases before committing or deploying:
+Run all 29 automated verification tests (9 core architecture phases + 20 master engineering, security, DAG orchestration, and completion-evidence scenarios) before committing or deploying:
 
 ```bash
-node --test --experimental-strip-types server/apex-harness.node-test.mjs
+npm run test:apex
+# or directly via Node 24:
+node --experimental-strip-types --test server/apex-harness.node-test.mjs server/apex-master-verification.node-test.mjs
 ```
 
 Expected output covers:
 1. **Virtual / Drive Filesystem Compatibility**: `safeSymlinkOrCopySync` & `safeLinkOrCopySync`
-2. **Phase 1**: Unified Model Fleet + on-disk `apiKey` redaction + Carbon clean-room home
-3. **Phase 2**: Cross-IDE Skill & MCP Loader + tool alias transpilation
-4. **Phase 3**: Task Classifier, EMA Orchestration Planner & Self-Judging Gate
-5. **Phase 4**: Harness² `c1..c8` tree initialization & Python validation
-6. **Phase 5**: Elephant-Goldfish Model (EGM v5.1) 3-Desk Boardroom conference
-7. **Phase 6**: DeepSeek-Harness subsystems (PTC `vm` runtime, UTF-16 spill files, repeat-call/timeout guard, Cordis plugins, generational session search)
-8. **Phase 7**: Surgical `edit_file`, pre-edit checkpoint undo (`revertTurnCheckpoint`), multi-step ReAct observations & JSON-RPC 2.0 MCP client bridge
-9. **Phase 8**: Universal Multi-Protocol Tool Parser (`<tool_call><arg_key>`, JSON-in-XML, Claude `<invoke>`, `<think>` scrubber), `TodoWrite`, `RepoMap`, and Agent Office UI presence.
+2. **Phases 1–8 (`server/apex-harness.node-test.mjs`)**: Unified Model Fleet + `apiKey` redaction, Cross-IDE Skill & MCP Loader, EMA Router, Harness² `c1..c8` Python validation, EGM v5.1 Boardroom, DeepSeek-Harness 5 Subsystems, Pre-Edit Checkpoints, and Universal Multi-Protocol Tool Parser.
+3. **Scenarios 1–20 (`server/apex-master-verification.node-test.mjs`)**:
+   - AES-256-GCM encrypted provider vault & live connection testing
+   - 10-role engineering model routing & custom role overrides
+   - 6-agent DAG decomposition, cycle detection, and parallel `[Scout || Architect]` execution
+   - In-flight execution cancellation (`AbortSignal` propagation) & child process-tree termination (`taskkill /T /F`)
+   - Byte-for-byte pre-edit checkpoint creation and restoration
+   - Canonical workspace containment blocking `../` traversal, external absolute paths, sibling-prefix (`/workspace-evil`) confusion, and symlink escapes
+   - Node `--permission` OS child-process isolation for Programmatic Tool Calling (PTC) & HMAC-SHA256 signed Cordis plugins
+   - Local HTTP API security rejecting cross-origin requests, CSRF form content-types, invalid session tokens, and >1 MiB bodies
+   - Post-implementation independent EGM code review catching defects, running bounded correction cycles, and never defaulting to approval when unavailable
+   - Context-budget-aware skill mounting, conflict resolution, and driver compatibility
+   - Crash-safe execution persistence, unreachable provider handling, Harness² proposal validation/rollback, and `implemented_and_verified` `CompletionEvidenceReport` generation.
 
 ---
 
