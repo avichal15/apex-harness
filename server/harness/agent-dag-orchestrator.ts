@@ -54,6 +54,7 @@ import type { TaskExecutionManager } from "./execution-manager.ts";
 import { runManagedCommand } from "./process-manager.ts";
 import { parseAndScrubModelResponse } from "./universal-tool-parser.ts";
 import { estimateSkillTokens, discoverAllUniversalSkills } from "./universal-skill-loader.ts";
+import { condenseConversationTrajectory } from "./workspace-runtime.ts";
 
 // ============================================================================
 // PART 7: CONFIGURABLE PROVIDER MANAGER & ENCRYPTED SECRET VAULT
@@ -1155,10 +1156,14 @@ async function runBuilderCodingPass(input: {
     .filter(Boolean)
     .join("\n\n");
 
-  const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+  const rawMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
     { role: "system", content: systemContent },
     ...input.conversationHistory,
     { role: "user", content: input.prompt },
+  ];
+  const condensedInit = condenseConversationTrajectory({ messages: rawMessages });
+  const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
+    ...condensedInit.messages,
   ];
 
   const narrativeSegments: string[] = [];

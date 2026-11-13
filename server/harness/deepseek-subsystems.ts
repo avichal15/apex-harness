@@ -46,6 +46,8 @@ export interface RepeatGuardConfig {
 export interface RepeatCheckOutcome {
   repeated: boolean;
   consecutiveCount: number;
+  alternatingCycleDetected?: boolean;
+  failureCount?: number;
   escalatedTier: "none" | "gentle" | "detailed";
   reminderMessage?: string;
 }
@@ -105,7 +107,10 @@ export class RepeatToolReminderGuard {
   private readonly includeMatchers: RegExp[];
   private readonly excludeMatchers: RegExp[];
   private readonly argumentsPreviewChars: number;
-  private readonly chains = new Map<string, { key: string; count: number }>();
+  private readonly chains = new Map<
+    string,
+    { key: string; count: number; history: string[]; failures: number }
+  >();
 
   constructor(config: RepeatGuardConfig = {}) {
     const rawThresholds = config.thresholds ?? [3, 5, 8];
@@ -129,21 +134,89 @@ export class RepeatToolReminderGuard {
     return this.includeMatchers.some((rx) => rx.test(toolName));
   }
 
-  public recordToolCall(sessionId: string, toolName: string, args: unknown): RepeatCheckOutcome {
+  /**
+   * Invalidates cached read/search fingerprints referencing `relPath` whenever a mutating tool
+   * (`edit_file`, `write_file`) updates that file so re-reading the file after editing is never
+   * falsely flagged as a repeat loop.
+   */
+  public invalidatePathOnMutation(sessionId: string, relPath: string): void {
+    const prev = this.chains.get(sessionId);
+    if (!prev) return;
+    const norm = relPath.replace(/\\/g, "/");
+    if (prev.key.includes(norm) || prev.key.includes(relPath)) {
+      prev.key = "";
+      prev.count = 0;
+    }
+    prev.history = prev.history.filter((k) => !k.includes(norm) && !k.includes(relPath));
+  }
+
+  public recordToolCall(
+    sessionId: string,
+    toolName: string,
+    args: unknown,
+    options?: { failed?: boolean },
+  ): RepeatCheckOutcome {
     if (!this.isTracked(toolName)) {
       return { repeated: false, consecutiveCount: 0, escalatedTier: "none" };
     }
+
+    // Automatically invalidate prior read_file history when edit_file or write_file mutates a path
+    if (
+      (toolName === "edit_file" || toolName === "write_file") &&
+      args &&
+      typeof args === "object" &&
+      typeof (args as Record<string, unknown>).path === "string" &&
+      !options?.failed
+    ) {
+      this.invalidatePathOnMutation(sessionId, String((args as Record<string, unknown>).path));
+    }
+
     const canonical = canonicalizeToolArgs(args);
     const callKey = `${toolName}:${canonical}`;
-    const prev = this.chains.get(sessionId);
+    const prev = this.chains.get(sessionId) ?? {
+      key: "",
+      count: 0,
+      history: [],
+      failures: 0,
+    };
 
-    const nextCount = prev && prev.key === callKey ? prev.count + 1 : 1;
-    this.chains.set(sessionId, { key: callKey, count: nextCount });
+    const nextCount = prev.key === callKey ? prev.count + 1 : 1;
+    const nextHistory = [...prev.history.slice(-7), callKey];
+    const nextFailures = options?.failed ? prev.failures + 1 : prev.failures;
+
+    // Detect 2-step alternating cycle: A -> B -> A -> B
+    const hLen = nextHistory.length;
+    const alternatingCycleDetected =
+      hLen >= 4 &&
+      nextHistory[hLen - 1] === nextHistory[hLen - 3] &&
+      nextHistory[hLen - 2] === nextHistory[hLen - 4] &&
+      nextHistory[hLen - 1] !== nextHistory[hLen - 2];
+
+    this.chains.set(sessionId, {
+      key: callKey,
+      count: nextCount,
+      history: nextHistory,
+      failures: nextFailures,
+    });
+
+    if (alternatingCycleDetected && nextCount < this.thresholds[0]!) {
+      return {
+        repeated: true,
+        consecutiveCount: nextCount,
+        alternatingCycleDetected: true,
+        failureCount: nextFailures,
+        escalatedTier: "gentle",
+        reminderMessage:
+          "Alternating 2-step tool cycle (A -> B -> A -> B) detected. Stop repeating this cycle and synthesize a different approach.",
+      };
+    }
 
     if (!this.thresholds.includes(nextCount)) {
       return {
         repeated: nextCount > 1,
         consecutiveCount: nextCount,
+        alternatingCycleDetected,
+        failureCount: nextFailures,
         escalatedTier: "none",
       };
     }
@@ -152,6 +225,8 @@ export class RepeatToolReminderGuard {
       return {
         repeated: true,
         consecutiveCount: nextCount,
+        alternatingCycleDetected,
+        failureCount: nextFailures,
         escalatedTier: "gentle",
         reminderMessage: GENTLE_REMINDER,
       };
@@ -160,6 +235,8 @@ export class RepeatToolReminderGuard {
     return {
       repeated: true,
       consecutiveCount: nextCount,
+      alternatingCycleDetected,
+      failureCount: nextFailures,
       escalatedTier: "detailed",
       reminderMessage: detailedReminder(
         toolName,
@@ -379,6 +456,89 @@ export function applySpillPolicyToText(options: {
   };
 }
 
+/**
+ * Reads a bounded line range (`startLine`..`endLine`) from a spilled file inside `<dataDir>/spills`
+ * so the model or caller can inspect specific sections of spilled tool output without loading the entire file.
+ */
+export function readSpillRange(
+  dataDir: string,
+  spillIdOrLocator: string,
+  startLine = 1,
+  endLine = 150,
+): {
+  ok: boolean;
+  spillId: string;
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  content: string;
+  error?: string;
+} {
+  const spillsRoot = resolve(dataDir, "spills");
+  mkdirSync(spillsRoot, { recursive: true, mode: 0o700 });
+  const candidate = spillIdOrLocator.includes(spillsRoot)
+    ? resolve(spillIdOrLocator)
+    : resolve(spillsRoot, spillIdOrLocator.replace(/^[/\\]+/, ""));
+  const normRoot = process.platform === "win32" ? spillsRoot.toLowerCase() : spillsRoot;
+  const normCand = process.platform === "win32" ? candidate.toLowerCase() : candidate;
+  if (!normCand.startsWith(normRoot + sep) || !existsSync(candidate)) {
+    return {
+      ok: false,
+      spillId: spillIdOrLocator,
+      startLine,
+      endLine,
+      totalLines: 0,
+      content: "",
+      error: `Spill artifact '${spillIdOrLocator}' not found inside spills directory.`,
+    };
+  }
+  const raw = readFileSync(candidate, "utf8");
+  const lines = raw.split(/\r?\n/);
+  const s = Math.max(1, startLine);
+  const e = Math.min(lines.length, Math.max(s, endLine));
+  return {
+    ok: true,
+    spillId: relative(spillsRoot, candidate).replace(/\\/g, "/"),
+    startLine: s,
+    endLine: e,
+    totalLines: lines.length,
+    content: lines
+      .slice(s - 1, e)
+      .map((l, idx) => `${s + idx}: ${l}`)
+      .join("\n"),
+  };
+}
+
+/**
+ * Cleans up expired spill files older than `maxAgeMs` (default 24 hours).
+ */
+export function cleanupExpiredSpills(
+  dataDir: string,
+  maxAgeMs = 24 * 60 * 60 * 1000,
+): { removedCount: number } {
+  const spillsRoot = resolve(dataDir, "spills");
+  if (!existsSync(spillsRoot)) return { removedCount: 0 };
+  let removedCount = 0;
+  const now = Date.now();
+  for (const sessionFolder of readdirSync(spillsRoot)) {
+    const dir = join(spillsRoot, sessionFolder);
+    try {
+      if (!statSync(dir).isDirectory()) continue;
+      for (const file of readdirSync(dir)) {
+        const fp = join(dir, file);
+        const st = statSync(fp);
+        if (now - st.mtimeMs >= maxAgeMs) {
+          writeFileSync(fp, "", "utf8");
+          removedCount++;
+        }
+      }
+    } catch {
+      // Ignore cleanup race
+    }
+  }
+  return { removedCount };
+}
+
 // ============================================================================
 // 3. OS-ISOLATED PTC-RUNTIME SUBSYSTEM (`ptc-runtime` with Node `--permission`)
 // ============================================================================
@@ -414,8 +574,8 @@ export interface PtcExecutionResult {
  * 1. The OS/Node permission model blocks all child_process, worker_threads, native addons,
  *    and filesystem access outside `canonicalRoot`.
  * 2. Inside the worker, `globalThis.fetch`, `XMLHttpRequest`, `WebSocket`, `process`, and `require`
- *    are removed from the untrusted function scope, and every `host.*` call validates canonical
- *    symlink containment before touching disk.
+ *    are removed from the untrusted function scope, and every `host.*` / `tools.*` call validates
+ *    canonical symlink containment before touching disk.
  */
 function buildIsolatedPtcRunnerScript(): string {
   return `
@@ -506,6 +666,20 @@ const hostBindings = Object.freeze({
     fs.writeFileSync(full, String(content), "utf8");
     return { writtenBytes: Buffer.byteLength(String(content), "utf8") };
   },
+  editFile: async (targetPath, target, replacement) => {
+    toolCallsCount++;
+    if (!allowWrite) {
+      throw new Error("PTC editFile is disabled by current execution permission policy");
+    }
+    const full = assertWorkspacePath(targetPath);
+    const raw = fs.readFileSync(full, "utf8");
+    if (!raw.includes(String(target))) {
+      throw new Error("PTC editFile target snippet not found in " + targetPath);
+    }
+    const next = raw.replace(String(target), String(replacement));
+    fs.writeFileSync(full, next, "utf8");
+    return { edited: true, bytes: Buffer.byteLength(next, "utf8") };
+  },
   listFiles: async (subDir = ".") => {
     toolCallsCount++;
     const full = assertWorkspacePath(subDir);
@@ -517,7 +691,7 @@ const hostBindings = Object.freeze({
     const full = assertWorkspacePath(targetPath);
     if (!fs.existsSync(full)) return { exists: false, size: 0, isDirectory: false };
     const st = fs.statSync(full);
-    return { exists: true, size: st.size, isDirectory: st.isDirectory() };
+    return { exists: true, size: st.size, isDirectory: st.isDirectory(), mtimeMs: st.mtimeMs };
   },
   grep: async (pattern, subDir = ".") => {
     toolCallsCount++;
@@ -567,6 +741,7 @@ const sandboxConsole = Object.freeze({
     const context = vm.createContext(
       Object.freeze({
         host: hostBindings,
+        tools: hostBindings,
         console: sandboxConsole,
         JSON,
         Math,
@@ -588,7 +763,7 @@ const sandboxConsole = Object.freeze({
       }),
       { codeGeneration: { strings: false, wasm: false } }
     );
-    const wrapped = \`(async (host, console) => {\\n"use strict";\\n\${userCode}\\n})(host, console)\`;
+    const wrapped = \`(async (host, tools, console) => {\\n"use strict";\\n\${userCode}\\n})(host, tools, console)\`;
     const script = new vm.Script(wrapped, { filename: "ptc-isolated.js" });
     const returnValue = await script.runInContext(context, { timeout: timeoutMs });
     process.stdout.write(JSON.stringify({ ok: true, returnValue: returnValue ?? null, logs, toolCallsCount }) + "\\n");
@@ -946,6 +1121,65 @@ export function loadDynamicPlugins(dataDir: string): DynamicCordisPlugin[] {
   }
 }
 
+export interface PluginAuditEvent {
+  timestamp: string;
+  action: "mount" | "execute" | "uninstall" | "integrity_violation";
+  pluginId: string;
+  version?: string;
+  ok: boolean;
+  detail?: string;
+}
+
+function pluginAuditLogPath(dataDir: string): string {
+  return join(dataDir, "apex-plugin-audit.jsonl");
+}
+
+export function appendPluginAuditEvent(
+  dataDir: string,
+  event: Omit<PluginAuditEvent, "timestamp">,
+): void {
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  const record: PluginAuditEvent = {
+    timestamp: new Date().toISOString(),
+    ...event,
+  };
+  appendFileSync(pluginAuditLogPath(dataDir), `${JSON.stringify(record)}\n`, "utf8");
+}
+
+export function readPluginAuditLog(dataDir: string): PluginAuditEvent[] {
+  const fp = pluginAuditLogPath(dataDir);
+  if (!existsSync(fp)) return [];
+  return readFileSync(fp, "utf8")
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => {
+      try {
+        return JSON.parse(line) as PluginAuditEvent;
+      } catch {
+        return null;
+      }
+    })
+    .filter((x): x is PluginAuditEvent => x !== null);
+}
+
+export function uninstallDynamicPlugin(
+  dataDir: string,
+  pluginId: string,
+): { ok: boolean; removed: boolean } {
+  const existing = loadDynamicPlugins(dataDir);
+  const filtered = existing.filter((p) => p.id !== pluginId);
+  const removed = filtered.length !== existing.length;
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  writeFileSync(dynamicPluginsPath(dataDir), `${JSON.stringify(filtered, null, 2)}\n`, "utf8");
+  appendPluginAuditEvent(dataDir, {
+    action: "uninstall",
+    pluginId,
+    ok: removed,
+    detail: removed ? "Plugin uninstalled" : "Plugin not found",
+  });
+  return { ok: true, removed };
+}
+
 export function mountDynamicPlugin(
   dataDir: string,
   plugin: {
@@ -992,6 +1226,13 @@ export function mountDynamicPlugin(
   existing.push(entry);
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
   writeFileSync(dynamicPluginsPath(dataDir), `${JSON.stringify(existing, null, 2)}\n`, "utf8");
+  appendPluginAuditEvent(dataDir, {
+    action: "mount",
+    pluginId: entry.id,
+    version: entry.version,
+    ok: true,
+    detail: `sha256=${entry.sha256.slice(0, 12)}`,
+  });
   return entry;
 }
 
@@ -1012,11 +1253,24 @@ export async function runDynamicPlugin(
 
   const integrity = verifyDynamicPluginIntegrity(dataDir, target);
   if (!integrity.valid) {
+    appendPluginAuditEvent(dataDir, {
+      action: "integrity_violation",
+      pluginId,
+      version: target.version,
+      ok: false,
+      detail: integrity.reason,
+    });
     return {
       ok: false,
       error: `Plugin integrity check failed for '${pluginId}': ${integrity.reason}`,
     };
   }
+  appendPluginAuditEvent(dataDir, {
+    action: "execute",
+    pluginId,
+    version: target.version,
+    ok: true,
+  });
 
   const timeoutMs = options.timeoutMs ?? 3000;
   const workerScript = `
