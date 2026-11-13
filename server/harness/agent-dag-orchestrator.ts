@@ -5,9 +5,8 @@
 //    with parallel independent subtask execution, pause/cancel/approval propagation, bounded EGM correction cycles,
 //    and structured CompletionEvidenceReport generation.
 
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { hostname, userInfo } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type {
   AgentExecutionNode,
@@ -52,6 +51,11 @@ import {
 } from "./egm-boardroom.ts";
 import type { TaskExecutionManager } from "./execution-manager.ts";
 import { runManagedCommand } from "./process-manager.ts";
+import {
+  decryptSecretWithMasterKey,
+  encryptSecretWithMasterKey,
+  type EncryptedVaultRecord,
+} from "./secret-store.ts";
 import { parseAndScrubModelResponse } from "./universal-tool-parser.ts";
 import { estimateSkillTokens, discoverAllUniversalSkills } from "./universal-skill-loader.ts";
 import { condenseConversationTrajectory } from "./workspace-runtime.ts";
@@ -173,18 +177,6 @@ const DEFAULT_PROVIDERS: ReadonlyArray<ProviderConfigEntry> = [
   },
 ];
 
-function deriveVaultKey(dataDir: string): Buffer {
-  const user = (() => {
-    try {
-      return userInfo().username;
-    } catch {
-      return "apex-operator";
-    }
-  })();
-  const seed = `apex-vault-v1:${hostname()}:${user}:${resolve(dataDir)}`;
-  return createHash("sha256").update(seed).digest();
-}
-
 function secretsVaultPath(dataDir: string): string {
   return join(resolve(dataDir), "apex-provider-secrets.enc.json");
 }
@@ -193,12 +185,7 @@ function providersConfigPath(dataDir: string): string {
   return join(resolve(dataDir), "apex-providers.json");
 }
 
-interface EncryptedSecretRecord {
-  iv: string;
-  tag: string;
-  ciphertext: string;
-  updatedAt: string;
-}
+type EncryptedSecretRecord = EncryptedVaultRecord;
 
 function loadSecretVault(dataDir: string): Record<string, EncryptedSecretRecord> {
   const path = secretsVaultPath(dataDir);
@@ -216,17 +203,7 @@ export function storeEncryptedProviderSecret(
   rawSecret: string,
 ): void {
   const vault = loadSecretVault(dataDir);
-  const key = deriveVaultKey(dataDir);
-  const iv = randomBytes(12);
-  const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const encrypted = Buffer.concat([cipher.update(rawSecret, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  vault[providerId] = {
-    iv: iv.toString("hex"),
-    tag: tag.toString("hex"),
-    ciphertext: encrypted.toString("hex"),
-    updatedAt: new Date().toISOString(),
-  };
+  vault[providerId] = encryptSecretWithMasterKey(dataDir, rawSecret);
   const path = secretsVaultPath(dataDir);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   writeFileSync(path, `${JSON.stringify(vault, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
@@ -236,17 +213,16 @@ export function resolveProviderSecret(dataDir: string, provider: ProviderConfigE
   const vault = loadSecretVault(dataDir);
   const rec = vault[provider.id];
   if (rec) {
-    try {
-      const key = deriveVaultKey(dataDir);
-      const decipher = createDecipheriv("aes-256-gcm", key, Buffer.from(rec.iv, "hex"));
-      decipher.setAuthTag(Buffer.from(rec.tag, "hex"));
-      const decrypted = Buffer.concat([
-        decipher.update(Buffer.from(rec.ciphertext, "hex")),
-        decipher.final(),
-      ]);
-      return decrypted.toString("utf8");
-    } catch {
-      // Fallback to env variable if vault decryption fails
+    const res = decryptSecretWithMasterKey(dataDir, rec);
+    if (res) {
+      if (res.migratedFromLegacy) {
+        try {
+          storeEncryptedProviderSecret(dataDir, provider.id, res.plaintext);
+        } catch {
+          // Best-effort re-encryption to CSPRNG master key
+        }
+      }
+      return res.plaintext;
     }
   }
   if (provider.apiKeyEnv && process.env[provider.apiKeyEnv]) {

@@ -42,9 +42,10 @@ export interface ManagedCommandResult {
 }
 
 const NEVER_ALLOWED_PATTERNS: ReadonlyArray<{ label: string; regex: RegExp }> = [
-  { label: "Root filesystem recursive deletion", regex: /\brm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+\/(?:\s|$)/i },
+  { label: "Root filesystem recursive deletion", regex: /\brm\s+(?:-[a-zA-Z]+\s+)*-[a-zA-Z]*r[a-zA-Z]*\s+(?:-[a-zA-Z]+\s+)*(?:\/|\/\*|~|\$HOME)(?:\s|$)/i },
+  { label: "Root filesystem recursive deletion (rf)", regex: /\brm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+\/(?:\*|\s|$)/i },
   { label: "Disk format command", regex: /\b(?:format\s+[a-zA-Z]:|mkfs\.[a-z0-9]+)\b/i },
-  { label: "Windows drive root wipe", regex: /\b(?:del|rd|rmdir)\s+\/[sq]+\s+[a-zA-Z]:\\\s*$/i },
+  { label: "Windows drive root wipe", regex: /\b(?:del|rd|rmdir|Remove-Item)\s+.*(?:\/[sq]+|-Recurse).*[a-zA-Z]:\\(?:\s|$)/i },
   { label: "Fork bomb", regex: /:\(\)\s*\{\s*:\|:&\s*\};:/ },
 ];
 
@@ -53,7 +54,135 @@ const SENSITIVE_COMMAND_PATTERNS: ReadonlyArray<{ label: string; regex: RegExp }
   { label: "Git history or remote mutation", regex: /\bgit\s+(?:push|reset|clean|rebase|checkout\s+--|branch\s+-D)\b/i },
   { label: "Package installation or script execution", regex: /\b(?:npm|pnpm|yarn|pip|cargo)\s+(?:install|add|remove|publish)\b/i },
   { label: "Network transfer or external process", regex: /\b(?:curl|wget|Invoke-WebRequest|Invoke-RestMethod|ssh|scp|powershell|pwsh)\b/i },
+  { label: "File mutation or write utility", regex: /\b(?:write_file|edit_file|Set-Content|Add-Content|Out-File|tee|dd|chmod|chown|icacls)\b/i },
 ];
+
+const READ_ONLY_SAFE_PREFIX_PATTERNS: ReadonlyArray<RegExp> = [
+  /^echo\b/i,
+  /^pwd\b/i,
+  /^(?:ls|dir|Get-ChildItem)\b/i,
+  /^(?:cat|type|Get-Content|head|tail)\b/i,
+  /^git\s+(?:status|diff|log|branch|show|rev-parse)\b/i,
+  /^(?:rg|grep|find|where|which)\b/i,
+  /^(?:node|npm|python|python3|git)\s+(?:--version|-v|-V)\b/i,
+];
+
+export interface ParsedShellCommandChain {
+  segments: string[];
+  subshellSegments: string[];
+  hasSubshellExpansion: boolean;
+  hasRedirection: boolean;
+}
+
+/**
+ * Splits a shell command line into individual pipelined/chained segments outside quotes
+ * (`&&`, `||`, `;`, `|`, `&`, `\n`) and extracts `$(...)` / backtick subshell expressions
+ * and file redirection operators (`>`, `>>`) so no mutating or destructive command can hide
+ * behind a benign prefix such as `echo hello && rm -rf /`.
+ */
+export function splitShellCommandChain(command: string): ParsedShellCommandChain {
+  const segments: string[] = [];
+  const subshellSegments: string[] = [];
+  let current = "";
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  let hasSubshellExpansion = false;
+  let hasRedirection = false;
+
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    const next = command[i + 1] ?? "";
+
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\" && !inSingle) {
+      current += ch;
+      escaped = true;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      current += ch;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      current += ch;
+      continue;
+    }
+
+    if (!inSingle) {
+      if (ch === "$" && next === "(") {
+        hasSubshellExpansion = true;
+        let depth = 1;
+        let j = i + 2;
+        let inner = "";
+        while (j < command.length && depth > 0) {
+          if (command[j] === "(") depth++;
+          else if (command[j] === ")") depth--;
+          if (depth > 0) inner += command[j];
+          j++;
+        }
+        if (inner.trim()) {
+          subshellSegments.push(inner.trim());
+        }
+      } else if (ch === "`") {
+        hasSubshellExpansion = true;
+        let j = i + 1;
+        let inner = "";
+        while (j < command.length && command[j] !== "`") {
+          inner += command[j];
+          j++;
+        }
+        if (inner.trim()) {
+          subshellSegments.push(inner.trim());
+        }
+        current += command.slice(i, Math.min(command.length, j + 1));
+        i = j;
+        continue;
+      }
+    }
+
+    if (!inSingle && !inDouble) {
+      if ((ch === "&" && next === "&") || (ch === "|" && next === "|")) {
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        i++;
+        continue;
+      }
+      if (ch === ";" || ch === "|" || ch === "\n" || ch === "\r") {
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        continue;
+      }
+      if (ch === "&" && next !== ">") {
+        if (current.trim()) segments.push(current.trim());
+        current = "";
+        continue;
+      }
+      if (ch === ">") {
+        hasRedirection = true;
+      }
+    }
+
+    current += ch;
+  }
+
+  if (current.trim()) {
+    segments.push(current.trim());
+  }
+
+  return {
+    segments,
+    subshellSegments,
+    hasSubshellExpansion,
+    hasRedirection,
+  };
+}
 
 const SECRET_ENV_KEY_PATTERNS = [
   /API_KEY$/i,
@@ -122,41 +251,98 @@ export function classifyCommandPolicy(
   mode: "turbo" | "auto_edit" | "ask" = "turbo",
 ): {
   decision: "allow" | "require_approval" | "deny";
+  tier: "readonly" | "sensitive_mutating" | "blocked";
+  segments: string[];
   reason?: string;
 } {
   const trimmed = command.trim();
   if (!trimmed) {
-    return { decision: "deny", reason: "Empty command" };
-  }
-
-  for (const rule of NEVER_ALLOWED_PATTERNS) {
-    if (rule.regex.test(trimmed)) {
-      return {
-        decision: "deny",
-        reason: `Blocked by safety floor: ${rule.label}`,
-      };
-    }
-  }
-
-  if (mode === "ask") {
     return {
-      decision: "require_approval",
-      reason: "Execution mode is set to 'ask' (requires explicit approval before running commands).",
+      decision: "deny",
+      tier: "blocked",
+      segments: [],
+      reason: "Empty command",
     };
   }
 
-  if (mode === "auto_edit") {
-    for (const sens of SENSITIVE_COMMAND_PATTERNS) {
-      if (sens.regex.test(trimmed)) {
+  const parsed = splitShellCommandChain(trimmed);
+  const allCandidates = [
+    trimmed,
+    ...parsed.segments,
+    ...parsed.subshellSegments,
+  ];
+
+  for (const candidate of allCandidates) {
+    for (const rule of NEVER_ALLOWED_PATTERNS) {
+      if (rule.regex.test(candidate)) {
         return {
-          decision: "require_approval",
-          reason: `Command matches sensitive operation policy (${sens.label}) in 'auto_edit' mode.`,
+          decision: "deny",
+          tier: "blocked",
+          segments: parsed.segments,
+          reason: `Blocked by safety floor: ${rule.label} (in segment '${candidate}')`,
         };
       }
     }
   }
 
-  return { decision: "allow" };
+  const everySegmentReadOnly =
+    parsed.segments.length > 0 &&
+    !parsed.hasSubshellExpansion &&
+    !parsed.hasRedirection &&
+    parsed.segments.every((seg) =>
+      READ_ONLY_SAFE_PREFIX_PATTERNS.some((rx) => rx.test(seg.trim())) &&
+      !SENSITIVE_COMMAND_PATTERNS.some((sens) => sens.regex.test(seg.trim())),
+    );
+
+  const tier: "readonly" | "sensitive_mutating" = everySegmentReadOnly
+    ? "readonly"
+    : "sensitive_mutating";
+
+  if (mode === "ask") {
+    return {
+      decision: "require_approval",
+      tier,
+      segments: parsed.segments,
+      reason: "Execution mode is set to 'ask' (requires explicit approval before running commands).",
+    };
+  }
+
+  if (mode === "auto_edit") {
+    for (const candidate of [...parsed.segments, ...parsed.subshellSegments]) {
+      for (const sens of SENSITIVE_COMMAND_PATTERNS) {
+        if (sens.regex.test(candidate)) {
+          return {
+            decision: "require_approval",
+            tier: "sensitive_mutating",
+            segments: parsed.segments,
+            reason: `Command segment '${candidate}' matches sensitive operation policy (${sens.label}) in 'auto_edit' mode.`,
+          };
+        }
+      }
+    }
+    if (parsed.hasSubshellExpansion || parsed.hasRedirection) {
+      return {
+        decision: "require_approval",
+        tier: "sensitive_mutating",
+        segments: parsed.segments,
+        reason: "Command uses subshell expansion or file output redirection in 'auto_edit' mode.",
+      };
+    }
+    if (parsed.segments.length > 1 && !everySegmentReadOnly) {
+      return {
+        decision: "require_approval",
+        tier: "sensitive_mutating",
+        segments: parsed.segments,
+        reason: "Chained multi-segment shell command contains non-readonly operations in 'auto_edit' mode.",
+      };
+    }
+  }
+
+  return {
+    decision: "allow",
+    tier,
+    segments: parsed.segments,
+  };
 }
 
 /**
