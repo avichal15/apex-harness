@@ -1175,6 +1175,10 @@ async function runBuilderCodingPass(input: {
       preferredModelId: input.preferredModelId,
       messages,
       signal: input.signal,
+      hasWorkspaceMutatedInTurn:
+        filesCreated.size + filesModified.size > 0 || commandsExecuted.length > 0,
+      checkpointId,
+      dataDir: input.dataDir,
     });
 
     if (llmRes.ok) {

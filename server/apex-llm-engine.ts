@@ -12,6 +12,14 @@ import { dirname, join, relative, resolve } from "node:path";
 import type { AgentOfficeRole, ExecutedCommandEvidence } from "../shared/apex-contracts.ts";
 import { callMcpServerTool } from "./harness/mcp-client-bridge.ts";
 import { killProcessTree, runManagedCommand } from "./harness/process-manager.ts";
+import {
+  AnthropicMessagesProtocolAdapter,
+  GeminiProtocolAdapter,
+  OpenAiChatProtocolAdapter,
+  OpenAiResponsesProtocolAdapter,
+  renderProtocolToolCallsAsApexActionBlocks,
+  type NormalizedProtocolTurn,
+} from "./harness/protocol-adapters.ts";
 import { parseAndScrubModelResponse } from "./harness/universal-tool-parser.ts";
 import { assertCanonicalWorkspacePath, resolveCanonicalWorkspaceRoot } from "./harness/workspace-security.ts";
 
@@ -224,22 +232,45 @@ export async function callProviderEndpoint(options: {
       };
     }
 
-    const data = JSON.parse(rawText) as {
-      choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
-      content?: Array<{ type?: string; text?: string }>;
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-    };
-
-    let rawContent = "";
-    if (Array.isArray(data.choices) && data.choices[0]?.message) {
-      rawContent = (data.choices[0].message.content || data.choices[0].message.reasoning_content || "").trim();
-    } else if (Array.isArray(data.content)) {
-      rawContent = data.content.map((c) => c.text || "").join("\n").trim();
-    } else if (Array.isArray(data.candidates)) {
-      rawContent = (data.candidates[0]?.content?.parts?.map((p) => p.text || "").join("\n") || "").trim();
+    let normalized: NormalizedProtocolTurn;
+    if (rawText.trim().startsWith("data:") || rawText.includes("\ndata:")) {
+      normalized =
+        proto === "anthropic-compat"
+          ? AnthropicMessagesProtocolAdapter.parseSseStream([rawText])
+          : OpenAiChatProtocolAdapter.parseSseStream([rawText]);
+    } else {
+      const data = JSON.parse(rawText) as Record<string, unknown>;
+      if (proto === "anthropic-compat" || Array.isArray(data.content)) {
+        normalized = AnthropicMessagesProtocolAdapter.parseResponse(data);
+      } else if (proto === "gemini" || Array.isArray(data.candidates)) {
+        normalized = GeminiProtocolAdapter.parseResponse(data);
+      } else if (Array.isArray(data.output)) {
+        normalized = OpenAiResponsesProtocolAdapter.parseResponse(data);
+      } else {
+        normalized = OpenAiChatProtocolAdapter.parseResponse(data);
+      }
     }
 
-    const cleaned = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() || rawContent;
+    if (normalized.hasIncompleteToolCall) {
+      return {
+        ok: false,
+        text: "",
+        usedModel: options.model,
+        usedGateway: options.gatewayName,
+        latencyMs,
+        error: `Incomplete tool call blocked: ${normalized.incompleteToolCalls.map((c) => c.reason).join("; ")}`,
+      };
+    }
+
+    let combinedText = normalized.visibleText || normalized.reasoningText;
+    if (normalized.toolCalls.length > 0) {
+      const rendered = renderProtocolToolCallsAsApexActionBlocks(normalized.toolCalls);
+      if (rendered.actionBlocksText) {
+        combinedText = [combinedText, rendered.actionBlocksText].filter(Boolean).join("\n\n");
+      }
+    }
+
+    const cleaned = combinedText.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() || combinedText;
 
     if (!cleaned) {
       return {
@@ -279,7 +310,8 @@ export async function callProviderEndpoint(options: {
 
 /**
  * Calls the requested model first, and if its local proxy is asleep, rate-limited, or returns 5xx,
- * automatically fails over across configured providers and live gateways while respecting `AbortSignal`.
+ * automatically fails over across configured providers and live gateways while respecting `AbortSignal`
+ * and idempotency rules (blocking blind retry after workspace mutation without checkpoint rollback).
  */
 export async function callUnifiedFleetWithFailover(options: {
   preferredModelId: string;
@@ -287,6 +319,10 @@ export async function callUnifiedFleetWithFailover(options: {
   preferredApiKey?: string;
   messages: Array<{ role: string; content: string }>;
   signal?: AbortSignal;
+  hasWorkspaceMutatedInTurn?: boolean;
+  checkpointId?: string;
+  dataDir?: string;
+  autoRollbackOnFailover?: boolean;
   extraCandidates?: Array<{
     gatewayName: string;
     baseUrl: string;
@@ -391,7 +427,8 @@ export async function callUnifiedFleetWithFailover(options: {
   const failoverAttempts: Array<{ gateway: string; model: string; error?: string }> = [];
   let lastError = "No gateways configured";
 
-  for (const attempt of attempts.slice(0, 6)) {
+  for (let attemptIdx = 0; attemptIdx < Math.min(attempts.length, 6); attemptIdx++) {
+    const attempt = attempts[attemptIdx]!;
     if (options.signal?.aborted) {
       return {
         ok: false,
@@ -403,6 +440,23 @@ export async function callUnifiedFleetWithFailover(options: {
         failoverAttempts,
         error: "Cancelled during provider failover",
       };
+    }
+
+    // Idempotency guard: if the first model already failed after a workspace mutation occurred in this turn,
+    // only allow failover if a pre-edit checkpoint is rolled back first.
+    if (attemptIdx > 0 && options.hasWorkspaceMutatedInTurn) {
+      if (options.autoRollbackOnFailover && options.checkpointId && options.dataDir) {
+        revertTurnCheckpoint(options.dataDir, options.checkpointId);
+      } else {
+        failoverAttempts.push({
+          gateway: attempt.gatewayName,
+          model: attempt.model,
+          error: "Blocked by idempotency guard: workspace mutated without checkpoint rollback",
+        });
+        lastError =
+          "Idempotency guard blocked blind failover after workspace mutation without checkpoint rollback";
+        break;
+      }
     }
 
     const res = await callProviderEndpoint({
