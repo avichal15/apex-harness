@@ -11,8 +11,8 @@
 // - Honest completion status (`implemented_and_verified`, `implemented_not_verified`, `partially_completed`, `blocked`, `failed`, `skipped`)
 
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type {
   AgentExecutionNode,
   AgentOfficeRole,
@@ -20,7 +20,63 @@ import type {
   CompletionStatus,
   ExecutedCommandEvidence,
   PostImplReviewReport,
+  RequirementEvidenceItem,
 } from "../../shared/apex-contracts.ts";
+
+/**
+ * Inspects project manifest files (`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`)
+ * in `workspaceRoot` and discovers the repository's native verification commands.
+ */
+export function detectProjectVerificationCommands(workspaceRoot: string): {
+  testCommands: string[];
+  lintCommands: string[];
+  typecheckCommands: string[];
+  buildCommands: string[];
+} {
+  const root = resolve(workspaceRoot);
+  const testCommands: string[] = [];
+  const lintCommands: string[] = [];
+  const typecheckCommands: string[] = [];
+  const buildCommands: string[] = [];
+
+  const pkgPath = join(root, "package.json");
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as {
+        scripts?: Record<string, string>;
+      };
+      const scripts = pkg.scripts ?? {};
+      if (scripts["test:apex"]) testCommands.push("npm run test:apex");
+      else if (scripts.test) testCommands.push("npm test");
+      if (scripts.lint) lintCommands.push("npm run lint");
+      if (scripts.typecheck) typecheckCommands.push("npm run typecheck");
+      if (scripts.build) buildCommands.push("npm run build");
+    } catch {
+      // Ignore malformed package.json
+    }
+  }
+
+  if (existsSync(join(root, "pyproject.toml")) || existsSync(join(root, "pytest.ini"))) {
+    testCommands.push("pytest");
+    lintCommands.push("ruff check .");
+    typecheckCommands.push("pyright");
+  }
+  if (existsSync(join(root, "Cargo.toml"))) {
+    testCommands.push("cargo test");
+    buildCommands.push("cargo check");
+  }
+  if (existsSync(join(root, "go.mod"))) {
+    testCommands.push("go test ./...");
+    buildCommands.push("go build ./...");
+  }
+
+  return {
+    testCommands,
+    lintCommands,
+    typecheckCommands,
+    buildCommands,
+  };
+}
 
 const STUB_PATTERNS: ReadonlyArray<{ label: string; regex: RegExp }> = [
   { label: "Unfinished TODO placeholder", regex: /\/\/\s*TODO\b|#\s*TODO\b/i },
@@ -209,11 +265,31 @@ export function buildCompletionEvidenceReport(input: {
     }
   }
 
+  const requirementClauses = input.originalRequirement
+    .split(/(?:\r?\n|;\s+|\.\s+)/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 6)
+    .slice(0, 8);
+
+  const requirementMatrix: RequirementEvidenceItem[] = (
+    requirementClauses.length > 0 ? requirementClauses : [input.originalRequirement]
+  ).map((clause) => ({
+    requirement: clause,
+    status,
+    evidence:
+      input.filesCreated.length + input.filesModified.length > 0
+        ? `Files changed: ${[...input.filesCreated, ...input.filesModified].join(", ")}`
+        : input.filesInspected.length > 0
+          ? `Files inspected: ${input.filesInspected.slice(0, 5).join(", ")}`
+          : `EGM outcome: ${input.egmReview.outcome}`,
+  }));
+
   return {
     executionId: input.executionId,
     status,
     originalRequirement: input.originalRequirement,
     executionPlanSummary: input.executionPlanSummary,
+    requirementMatrix,
     subtasks: input.subtasks.map((s) => ({
       id: s.id,
       role: s.role,

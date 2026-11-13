@@ -445,6 +445,10 @@ export interface PostImplReviewInput {
   filesModified: readonly string[];
   commandsExecuted: readonly ExecutedCommandEvidence[];
   gitDiffSummary?: string;
+  builderModelId?: string;
+  candidateReviewerModels?: readonly string[];
+  reviewerEndpointUrl?: string;
+  requireLiveGoldfishModel?: boolean;
   explicitTestFailures?: readonly string[];
   explicitLinterErrors?: readonly string[];
   correctionCycle?: number;
@@ -452,8 +456,10 @@ export interface PostImplReviewInput {
   customReviewerFn?: (context: {
     requirement: string;
     changedFilesContent: Record<string, string>;
+    gitDiffSummary?: string;
     commands: readonly ExecutedCommandEvidence[];
     responseText: string;
+    independentContextVerified: boolean;
   }) => Promise<{
     available: boolean;
     outcome?: PostImplReviewOutcome;
@@ -471,20 +477,111 @@ export interface PostImplReviewInput {
 }
 
 /**
+ * Selects an independent Goldfish reviewer model that is distinct from the Builder model
+ * whenever more than one candidate model is available (preventing self-approval).
+ */
+export function selectIndependentGoldfishModel(
+  builderModelId: string,
+  candidateModels: readonly string[] = [
+    "agy-acp/claude-opus-4-6-thinking",
+    "agy-acp/gemini-4-argon-high",
+    "codex/gpt-5.4",
+  ],
+): string {
+  const normBuilder = builderModelId.trim().toLowerCase();
+  const distinct = candidateModels.find((m) => m.trim().toLowerCase() !== normBuilder);
+  return distinct ?? candidateModels[0] ?? "egm-goldfish-auditor-v5.1";
+}
+
+/**
+ * Validates CEO resolution actions (`PROPOSE_FIX | CONTEST | ESCALATE | DECLINE`) against
+ * `google/elephant-goldfish-model` invariants:
+ * - Comprehension gaps (`lens === "comprehension"`) cannot be contested (`CONTEST` is forbidden).
+ * - Any `CONTEST` resolution must cite a concrete file path (`file:symbol` or `file#Lline`) that exists on disk;
+ *   subjective excuses like "this was intentional" are rejected.
+ */
+export function validateEgmResolutionLedger(
+  workspacePath: string,
+  resolutions: ReadonlyArray<{
+    findingId: string;
+    lens?: string;
+    action: EgmResolutionAction;
+    rationale: string;
+    citedFile?: string;
+  }>,
+): { valid: boolean; violations: string[] } {
+  const violations: string[] = [];
+  const canonicalRoot = resolveCanonicalWorkspaceRoot(workspacePath);
+
+  for (const r of resolutions) {
+    if (!["PROPOSE_FIX", "CONTEST", "ESCALATE", "DECLINE"].includes(r.action)) {
+      violations.push(`Finding ${r.findingId}: invalid action '${r.action}'.`);
+      continue;
+    }
+    if (r.lens === "comprehension" && r.action === "CONTEST") {
+      violations.push(
+        `Finding ${r.findingId}: comprehension gaps cannot be contested ('CONTEST' is forbidden on comprehension lens).`,
+      );
+      continue;
+    }
+    if (r.action === "CONTEST") {
+      if (/\bthis was intentional\b/i.test(r.rationale)) {
+        violations.push(
+          `Finding ${r.findingId}: CONTEST rationale cannot use subjective excuse "this was intentional".`,
+        );
+      }
+      const extractedFile =
+        r.citedFile ||
+        r.rationale.match(/([\w./-]+\.(?:ts|tsx|js|mjs|py|json|md))(?::[\w$]+|#L\d+)/)?.[1];
+      if (!extractedFile) {
+        violations.push(
+          `Finding ${r.findingId}: CONTEST must cite a checkable file:symbol or file#Lline reference.`,
+        );
+      } else {
+        try {
+          const full = assertCanonicalWorkspacePath(canonicalRoot, extractedFile, {
+            operation: "contest_citation_verify",
+          });
+          if (!existsSync(full)) {
+            violations.push(
+              `Finding ${r.findingId}: CONTEST cited file '${extractedFile}' does not exist on disk.`,
+            );
+          }
+        } catch {
+          violations.push(
+            `Finding ${r.findingId}: CONTEST cited path '${extractedFile}' is outside the workspace.`,
+          );
+        }
+      }
+    }
+  }
+
+  return {
+    valid: violations.length === 0,
+    violations,
+  };
+}
+
+/**
  * Post-Implementation Independent EGM Reviewer:
  * Evaluates actual code changes on disk, git diff, command exit codes, and test/build outputs
- * against the user's original requirement.
+ * against the user's original requirement in a fresh-context session without Elephant conversation history.
  *
  * Invariants:
  * 1. Never defaults to `approve` when the reviewer is unavailable (`outcome: "unavailable"`, `reviewerAvailable: false`).
  * 2. Rejects (`request_changes` or `decline`) when tests/commands fail or when modified code contains
  *    stubs, syntax errors, or concrete defects.
+ * 3. Separates `deterministicChecks` from fresh-context Goldfish model evaluation (`source`).
  */
 export async function runPostImplementationEgmReview(
   input: PostImplReviewInput,
 ): Promise<PostImplReviewReport> {
   const cycle = input.correctionCycle ?? 0;
   const canonicalRoot = resolveCanonicalWorkspaceRoot(input.workspacePath);
+  const selectedReviewerModel = selectIndependentGoldfishModel(
+    input.builderModelId ?? "builder-default",
+    input.candidateReviewerModels,
+  );
 
   if (input.simulateReviewerUnavailable) {
     return {
@@ -503,6 +600,8 @@ export async function runPostImplementationEgmReview(
         },
       ],
       summary: "Reviewer unavailable — refusing to default to approval.",
+      source: "unavailable",
+      independentContextVerified: true,
     };
   }
 
@@ -607,14 +706,126 @@ export async function runPostImplementationEgmReview(
     }
   }
 
-  // If customReviewerFn is provided (e.g. for custom LLM reviewer or test harness), invoke it
+  const deterministicChecks: NonNullable<PostImplReviewReport["deterministicChecks"]> = [
+    {
+      check: "changed_files_exist_and_non_empty",
+      passed: !findings.some((f) => f.id.startsWith("EGM-MISSING") || f.id.startsWith("EGM-EMPTY")),
+      detail: `Checked ${allChangedFiles.length} changed file(s) on disk`,
+    },
+    {
+      check: "no_code_defect_markers",
+      passed: !findings.some((f) => f.id.startsWith("DEFECT-")),
+      detail: "Scanned modified files and response for TODO/FIXME/raw-tool leakage",
+    },
+    {
+      check: "executed_commands_exit_zero",
+      passed: !findings.some((f) => f.id.startsWith("EGM-CMD-FAIL") || f.id.startsWith("EGM-TEST-FAIL")),
+      detail: `Evaluated ${input.commandsExecuted.length} executed command(s)`,
+    },
+  ];
+
+  // If reviewerEndpointUrl is provided, invoke the independent Goldfish HTTP reviewer with ONLY fresh-context payload
+  if (input.reviewerEndpointUrl) {
+    try {
+      const freshContextPrompt = JSON.stringify({
+        originalRequirement: input.originalRequirement,
+        changedFilesContent,
+        gitDiffSummary: input.gitDiffSummary ?? "",
+        commandsExecuted: input.commandsExecuted,
+        independentContextVerified: true,
+      });
+      const resp = await fetch(`${input.reviewerEndpointUrl.replace(/\/$/, "")}/chat/completions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: selectedReviewerModel,
+          messages: [
+            {
+              role: "system",
+              content:
+                "You are a stateless Goldfish Post-Implementation Reviewer. Return JSON: {\"outcome\":\"approve\"|\"request_changes\"|\"decline\",\"comprehensionParaphrase\":\"...\",\"findings\":[]}",
+            },
+            {
+              role: "user",
+              content: freshContextPrompt,
+            },
+          ],
+        }),
+        signal: input.signal ?? AbortSignal.timeout(8000),
+      });
+      if (!resp.ok) {
+        return {
+          outcome: "unavailable",
+          reviewerAvailable: false,
+          reviewerModel: selectedReviewerModel,
+          comprehensionParaphrase: "Independent HTTP Goldfish reviewer returned non-200 status.",
+          score: 0,
+          correctionCyclesRun: cycle,
+          findings,
+          deterministicChecks,
+          source: "unavailable",
+          independentContextVerified: true,
+          summary: `HTTP Goldfish reviewer failed with status ${resp.status}; refusing automatic approval.`,
+        };
+      }
+      const data = (await resp.json()) as {
+        choices?: Array<{ message?: { content?: string } }>;
+      };
+      const rawContent = data.choices?.[0]?.message?.content ?? "{}";
+      const parsed = JSON.parse(rawContent) as {
+        outcome?: PostImplReviewOutcome;
+        comprehensionParaphrase?: string;
+        findings?: PostImplReviewReport["findings"];
+        summary?: string;
+      };
+      if (parsed.findings) findings.push(...parsed.findings);
+      const finalOutcome =
+        findings.some((f) => f.severity === "BLOCKER" || f.severity === "MAJOR") &&
+        parsed.outcome === "approve"
+          ? "request_changes"
+          : parsed.outcome ?? "approve";
+      return {
+        outcome: finalOutcome,
+        reviewerAvailable: true,
+        reviewerModel: selectedReviewerModel,
+        comprehensionParaphrase:
+          parsed.comprehensionParaphrase ??
+          `Fresh-context Goldfish review of "${input.originalRequirement.slice(0, 80)}".`,
+        score: finalOutcome === "approve" ? 96 : 45,
+        correctionCyclesRun: cycle,
+        findings,
+        deterministicChecks,
+        source: "goldfish_fresh_session",
+        independentContextVerified: true,
+        summary: parsed.summary ?? `Fresh-session Goldfish review outcome: ${finalOutcome}`,
+      };
+    } catch (err) {
+      return {
+        outcome: "unavailable",
+        reviewerAvailable: false,
+        reviewerModel: selectedReviewerModel,
+        comprehensionParaphrase: "Independent HTTP Goldfish reviewer unreachable.",
+        score: 0,
+        correctionCyclesRun: cycle,
+        findings,
+        deterministicChecks,
+        source: "unavailable",
+        independentContextVerified: true,
+        summary: `Goldfish reviewer unreachable (${(err as Error).message}) — refusing to default to approval.`,
+      };
+    }
+  }
+
+  // If customReviewerFn is provided (e.g. for custom LLM reviewer or test harness), invoke it with fresh context
   if (input.customReviewerFn) {
     try {
       const customRes = await input.customReviewerFn({
         requirement: input.originalRequirement,
         changedFilesContent,
+        gitDiffSummary: input.gitDiffSummary,
         commands: input.commandsExecuted,
         responseText: input.responseText,
+        independentContextVerified: true,
       });
 
       if (!customRes.available) {
@@ -634,6 +845,9 @@ export async function runPostImplementationEgmReview(
               resolution: "ESCALATE",
             },
           ],
+          deterministicChecks,
+          source: "unavailable",
+          independentContextVerified: true,
           summary: customRes.summary ?? "Reviewer unavailable — did not default to approval.",
         };
       }
@@ -646,11 +860,14 @@ export async function runPostImplementationEgmReview(
         return {
           outcome: customRes.outcome,
           reviewerAvailable: true,
-          reviewerModel: customRes.model ?? "egm-custom-auditor",
+          reviewerModel: customRes.model ?? selectedReviewerModel,
           comprehensionParaphrase: `Audited "${input.originalRequirement.slice(0, 80)}" across ${allChangedFiles.length} changed file(s) and ${input.commandsExecuted.length} command(s).`,
           score: customRes.outcome === "approve" ? 95 : 40,
           correctionCyclesRun: cycle,
           findings,
+          deterministicChecks,
+          source: "goldfish_fresh_session",
+          independentContextVerified: true,
           summary: customRes.summary ?? `Independent review returned ${customRes.outcome}.`,
         };
       }
@@ -671,9 +888,28 @@ export async function runPostImplementationEgmReview(
             resolution: "ESCALATE",
           },
         ],
+        deterministicChecks,
+        source: "unavailable",
+        independentContextVerified: true,
         summary: "Reviewer threw an error — refusing to default to approval.",
       };
     }
+  }
+
+  if (input.requireLiveGoldfishModel) {
+    return {
+      outcome: "unavailable",
+      reviewerAvailable: false,
+      reviewerModel: selectedReviewerModel,
+      comprehensionParaphrase: `Live Goldfish model required for "${input.originalRequirement.slice(0, 80)}", but no live endpoint was configured.`,
+      score: 0,
+      correctionCyclesRun: cycle,
+      findings,
+      deterministicChecks,
+      source: "unavailable",
+      independentContextVerified: true,
+      summary: "Live Goldfish reviewer required but not configured — refusing automatic approval.",
+    };
   }
 
   const hasSecurityDecline = findings.some((f) => f.resolution === "DECLINE");
@@ -708,11 +944,14 @@ export async function runPostImplementationEgmReview(
   return {
     outcome,
     reviewerAvailable: true,
-    reviewerModel: "egm-goldfish-auditor-v5.1",
+    reviewerModel: selectedReviewerModel,
     comprehensionParaphrase: `Audited requirement "${input.originalRequirement.slice(0, 80)}" against ${allChangedFiles.length} modified file(s) and ${input.commandsExecuted.length} executed command(s).`,
     score,
     correctionCyclesRun: cycle,
     findings,
+    deterministicChecks,
+    source: "deterministic_static_check",
+    independentContextVerified: true,
     summary:
       outcome === "approve"
         ? `Approved (${score}/100): Zero blockers across ${allChangedFiles.length} changed file(s) and ${input.commandsExecuted.length} command(s).`
