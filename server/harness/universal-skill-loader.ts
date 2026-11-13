@@ -383,11 +383,15 @@ function scanSkillFolder(
 export function discoverAllUniversalSkills(options: {
   userHome?: string;
   workspaceRoot?: string;
+  dataDir?: string;
 } = {}): UniversalSkillItem[] {
   const home = options.userHome ?? homedir();
   const workspace = options.workspaceRoot ? resolve(options.workspaceRoot) : undefined;
 
   const searchRoots: Array<{ path: string; ecosystem: SkillEcosystem; kind: UniversalArtifactKind }> = [
+    ...(options.dataDir
+      ? [{ path: join(resolve(options.dataDir), "learned-skills"), ecosystem: "hermes" as const, kind: "skill" as const }]
+      : []),
     { path: join(home, ".gemini", "config", "skills"), ecosystem: "antigravity", kind: "skill" },
     { path: join(home, ".gemini", "antigravity", "builtin", "skills"), ecosystem: "antigravity", kind: "skill" },
     { path: join(home, ".gemini", "config", "plugins", "gemini-api", "skills"), ecosystem: "antigravity", kind: "skill" },

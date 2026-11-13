@@ -103,6 +103,19 @@ import {
   callMcpServerTool,
   listMcpServerTools,
 } from "./harness/mcp-client-bridge.ts";
+import { ApexDriverRegistry } from "./harness/driver-registry.ts";
+import {
+  buildGroundedMemoryPromptSnippet,
+  delegateSubagentTask,
+  deleteMemoryEntry,
+  loadLearnedSkillProposals,
+  promoteLearnedSkillProposal,
+  proposeLearnedSkill,
+  queryMemoryEntries,
+  rollbackLearnedSkillSnapshot,
+  saveMemoryEntry,
+  validateLearnedSkillProposal,
+} from "./harness/hermes-memory-learning.ts";
 import { runManagedCommand } from "./harness/process-manager.ts";
 import {
   detectSkillConflicts,
@@ -1335,6 +1348,126 @@ export function createApexAppServer() {
       }
 
       // ======================================================================
+      // HERMES PERSISTENT MEMORY, LEARNED SKILLS, SUBAGENTS & DRIVERS API
+      // ======================================================================
+      if (req.method === "GET" && url.pathname === "/api/memory") {
+        const query = url.searchParams.get("q") ?? undefined;
+        const projectId = url.searchParams.get("projectId") ?? undefined;
+        const entries = queryMemoryEntries(APEX_DATA_DIR, { query, projectId });
+        sendJson(res, 200, { entries }, allowedOrigin);
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/memory") {
+        const body = await readBoundedJsonBody<{
+          scope?: "project" | "global";
+          projectId?: string;
+          workspaceRoot?: string;
+          category?: "architecture" | "preference" | "lesson_learned" | "convention";
+          title: string;
+          content: string;
+          tags?: string[];
+        }>(req);
+        const saved = saveMemoryEntry(APEX_DATA_DIR, {
+          scope: body.scope ?? "project",
+          projectId: body.projectId,
+          workspaceRoot: body.workspaceRoot,
+          category: body.category,
+          title: body.title || "Untitled Memory",
+          content: body.content || "",
+          tags: body.tags,
+        });
+        sendJson(res, 200, { ok: true, ...saved }, allowedOrigin);
+        return;
+      }
+
+      if (req.method === "DELETE" && url.pathname === "/api/memory") {
+        const memoryId = url.searchParams.get("id") ?? "";
+        const del = deleteMemoryEntry(APEX_DATA_DIR, memoryId);
+        sendJson(res, 200, del, allowedOrigin);
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/skills/learned") {
+        const proposals = loadLearnedSkillProposals(APEX_DATA_DIR);
+        sendJson(res, 200, { proposals }, allowedOrigin);
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/skills/learned") {
+        const body = await readBoundedJsonBody<{
+          action: "propose" | "validate" | "promote" | "rollback";
+          skillName?: string;
+          description?: string;
+          triggers?: string[];
+          instructions?: string;
+          proposalId?: string;
+          snapshotId?: string;
+        }>(req);
+        if (body.action === "propose") {
+          const proposal = proposeLearnedSkill(APEX_DATA_DIR, {
+            skillName: body.skillName || "learned-workflow",
+            description: body.description || "Learned procedural workflow",
+            triggers: body.triggers,
+            instructions: body.instructions || "",
+          });
+          sendJson(res, 200, { ok: true, proposal }, allowedOrigin);
+          return;
+        }
+        if (body.action === "validate" && body.proposalId) {
+          const proposal = validateLearnedSkillProposal(APEX_DATA_DIR, body.proposalId);
+          sendJson(res, 200, { ok: true, proposal }, allowedOrigin);
+          return;
+        }
+        if (body.action === "promote" && body.proposalId) {
+          const promoted = promoteLearnedSkillProposal(APEX_DATA_DIR, body.proposalId);
+          sendJson(res, 200, { ok: true, ...promoted }, allowedOrigin);
+          return;
+        }
+        if (body.action === "rollback" && body.snapshotId) {
+          const rolled = rollbackLearnedSkillSnapshot(APEX_DATA_DIR, body.snapshotId);
+          sendJson(res, 200, rolled, allowedOrigin);
+          return;
+        }
+        sendJson(res, 400, { ok: false, error: "Invalid learned skill action" }, allowedOrigin);
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/subagents/delegate") {
+        const body = await readBoundedJsonBody<{
+          role?: "Coordinator" | "Scout" | "Architect" | "Builder" | "Critic" | "Verifier";
+          task: string;
+          projectId?: string;
+          contextSnippet?: string;
+        }>(req);
+        const proj = projects.find((p) => p.id === body.projectId) ?? projects[0]!;
+        const subRes = await delegateSubagentTask({
+          dataDir: APEX_DATA_DIR,
+          workspaceRoot: proj.path,
+          role: body.role ?? "Scout",
+          task: body.task || "Inspect workspace",
+          contextSnippet: body.contextSnippet,
+        });
+        sendJson(res, 200, { ok: true, result: subRes }, allowedOrigin);
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/drivers") {
+        const registry = new ApexDriverRegistry(
+          APEX_DATA_DIR,
+          loadProviderConfigs(APEX_DATA_DIR),
+        );
+        const drivers = registry.listDrivers().map((d) => ({
+          id: d.id,
+          displayName: d.displayName,
+          protocol: d.protocol,
+          capabilities: d.capabilities,
+        }));
+        sendJson(res, 200, { drivers }, allowedOrigin);
+        return;
+      }
+
+      // ======================================================================
       // REAL-TIME STREAMING MULTI-AGENT DAG CHAT TURN (SSE)
       // ======================================================================
       if (req.method === "POST" && url.pathname === "/api/chat/stream") {
@@ -1491,6 +1624,11 @@ export function createApexAppServer() {
             adaptiveTopology: Boolean(
               (body as { adaptiveTopology?: boolean }).adaptiveTopology,
             ),
+            memorySnippet: buildGroundedMemoryPromptSnippet(APEX_DATA_DIR, {
+              prompt: promptText,
+              projectId: project.id,
+              workspaceRoot: project.path,
+            }),
             systemPromptPrefix: [
               sysPromptSurface,
               guardrailsSurface,
