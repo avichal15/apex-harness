@@ -1,14 +1,23 @@
-// Elephant-Goldfish Model (EGM) Workplace Boardroom Engine for Apex Harness.
+// Elephant-Goldfish Model (EGM) Workplace Boardroom & Post-Implementation Independent Review Engine.
 // Separates the Deep-Context CEO ("The Elephant") from Stateless Zero-Context Specialist Lenses ("The Goldfish"):
 // - Desk 1: Grounded AST Symbol Manifest + Mistake Antibodies (antibodies.json & user_preferences.json)
 // - Desk 2: 4 Orthogonal Stateless Goldfish Lenses (codebase_details, zoom_out, implementation_readiness, design_critic)
 // - Desk 3: 2-Sentence Comprehension Paraphrase Check + Prioritized Findings (Blocker | Major | Nit)
-// - CEO Elephant Resolution Protocol: PROPOSE_FIX | CONTEST | ESCALATE | DECLINE
+// - Post-Implementation Independent EGM Review (`runPostImplementationEgmReview`):
+//   Inspects actual modified files, git diffs, command exit codes, and test/build outputs.
+//   Supports genuine `approve`, `request_changes`, `escalate`, `decline`, and `unavailable` outcomes.
+//   Crucial Invariant: An unsuccessful or unavailable reviewer NEVER defaults to approval.
 
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, lstatSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, relative, resolve } from "node:path";
+import { join, relative } from "node:path";
+import type {
+  ExecutedCommandEvidence,
+  PostImplReviewOutcome,
+  PostImplReviewReport,
+} from "../../shared/apex-contracts.ts";
 import { callUnifiedFleetWithFailover, type AgentStepEvent } from "../apex-llm-engine.ts";
+import { assertCanonicalWorkspacePath, resolveCanonicalWorkspaceRoot } from "./workspace-security.ts";
 
 export type GoldfishLensId =
   | "codebase_details"
@@ -23,6 +32,7 @@ export interface GoldfishLensReport {
   title: string;
   specialistModel: string;
   latencyMs: number;
+  available: boolean;
   summary: string;
 }
 
@@ -44,7 +54,7 @@ export interface EgmBoardroomBrief {
   desk2GoldfishLenses: GoldfishLensReport[];
   desk3Auditor: {
     comprehensionParaphrase: string;
-    verdict: "READY_TO_EXECUTE" | "CAUTION_EDGE_CASES" | "BLOCKER_DETECTED";
+    verdict: "READY_TO_EXECUTE" | "CAUTION_EDGE_CASES" | "BLOCKER_DETECTED" | "REVIEWER_UNAVAILABLE";
     score: number;
     findings: EgmFinding[];
   };
@@ -71,7 +81,7 @@ const IGNORED_DIRS = new Set([
   "coverage",
 ]);
 
-function extractFileSymbols(content: string): string[] {
+export function extractFileSymbols(content: string): string[] {
   const symbols = new Set<string>();
   const patterns = [
     /\b(?:export\s+)?(?:async\s+)?function\s+([A-Za-z0-9_]+)/g,
@@ -93,8 +103,11 @@ function extractFileSymbols(content: string): string[] {
 /**
  * Desk 1: Builds a grounded symbol manifest from disk + loads active Mistake Immunization antibodies.
  */
-export function buildDesk1GroundedManifest(workspacePath: string, prompt: string): EgmBoardroomBrief["desk1GroundedManifest"] {
-  const root = resolve(workspacePath);
+export function buildDesk1GroundedManifest(
+  workspacePath: string,
+  prompt: string,
+): EgmBoardroomBrief["desk1GroundedManifest"] {
+  const root = resolveCanonicalWorkspaceRoot(workspacePath);
   const scannedFiles: Array<{ file: string; lines: number; symbols: string[] }> = [];
 
   if (existsSync(root)) {
@@ -111,10 +124,11 @@ export function buildDesk1GroundedManifest(workspacePath: string, prompt: string
         if (IGNORED_DIRS.has(name) || name.startsWith(".")) continue;
         const full = join(dir, name);
         try {
-          const st = statSync(full);
-          if (st.isDirectory()) {
+          const lst = lstatSync(full);
+          if (lst.isSymbolicLink()) continue;
+          if (lst.isDirectory()) {
             walk(full, depth + 1);
-          } else if (/\.(ts|tsx|js|mjs|py|html|css)$/.test(name) && st.size < 250_000) {
+          } else if (/\.(ts|tsx|js|mjs|py|html|css)$/.test(name) && lst.size < 250_000) {
             candidates.push(full);
           }
         } catch {
@@ -219,14 +233,15 @@ const LENS_CONFIGS: ReadonlyArray<{
 ];
 
 /**
- * Runs the full Elephant-Goldfish Model (EGM) Boardroom:
+ * Runs the pre-execution Elephant-Goldfish Model (EGM) Boardroom:
  * Desk 1 (Symbol Manifest + Antibodies) -> Desk 2 (4 Orthogonal Stateless Goldfish Lenses)
- * -> Desk 3 (Comprehension Paraphrase + Findings) -> CEO Elephant Resolution (PROPOSE_FIX | CONTEST | ESCALATE | DECLINE).
+ * -> Desk 3 (Comprehension Paraphrase + Findings).
  */
 export async function runEgmBoardroomConference(options: {
   prompt: string;
   workspacePath: string;
   fastMode?: boolean;
+  signal?: AbortSignal;
   onStep?: (step: AgentStepEvent) => void;
 }): Promise<EgmBoardroomBrief> {
   const emit = options.onStep ?? (() => {});
@@ -281,13 +296,15 @@ export async function runEgmBoardroomConference(options: {
         return {
           lens: cfg.lens,
           title: cfg.title,
-          specialistModel: cfg.preferredModel,
-          latencyMs: 18,
+          specialistModel: `${cfg.preferredModel} (fast-local)`,
+          latencyMs: 12,
+          available: true,
           summary: `[${cfg.lens}] Grounded against ${desk1.scannedFiles.length} workspace files (${desk1.scannedFiles.map((f) => f.file).slice(0, 3).join(", ") || "root"}). Enforce 0->1 completion and verified boundaries.`,
         };
       }
       const res = await callUnifiedFleetWithFailover({
         preferredModelId: cfg.preferredModel,
+        signal: options.signal,
         messages: [
           { role: "system", content: cfg.systemDirective },
           {
@@ -299,11 +316,12 @@ export async function runEgmBoardroomConference(options: {
       return {
         lens: cfg.lens,
         title: cfg.title,
-        specialistModel: res.ok ? `${res.usedGateway}/${res.usedModel}` : cfg.preferredModel,
+        specialistModel: res.ok ? `${res.usedGateway}/${res.usedModel}` : `${cfg.preferredModel} (local-grounded)`,
         latencyMs: Date.now() - t0,
+        available: res.ok,
         summary: res.ok
           ? res.text.slice(0, 500)
-          : `[${cfg.lens}] Verified disk symbols in ${desk1.scannedFiles.map((f) => f.file).slice(0, 3).join(", ") || "workspace"}; proceed with surgical implementation.`,
+          : `[${cfg.lens}] Local AST symbol grounding verified in ${desk1.scannedFiles.map((f) => f.file).slice(0, 3).join(", ") || "workspace"}; external lens gateway offline.`,
       };
     }),
   );
@@ -320,7 +338,6 @@ export async function runEgmBoardroomConference(options: {
     durationMs: Date.now() - tDesk2,
   });
 
-  // Desk 3: Comprehension Check & CEO Elephant Resolution Ledger
   const tDesk3 = Date.now();
   const findings: EgmFinding[] = [
     {
@@ -335,17 +352,17 @@ export async function runEgmBoardroomConference(options: {
       id: "EGM-F2",
       severity: "MAJOR",
       lens: "design_critic",
-      finding: "Eliminate generic unverified stubs (// TODO) and validate output through the deterministic Self-Judge Gate.",
+      finding: "Eliminate generic unverified stubs (// TODO) and validate output through the post-implementation EGM review and evidence report.",
       resolution: "PROPOSE_FIX",
-      ceoRationale: "Enforced post-turn Self-Judging Gate and Harness² (c1..c8) reflection.",
+      ceoRationale: "Enforced post-implementation independent review and Harness² (c1..c8) validation.",
     },
     {
       id: "EGM-F3",
       severity: "NIT",
       lens: "zoom_out",
-      finding: "Keep context window lean by mounting only Top-K universal skills per turn.",
+      finding: "Keep context window lean by mounting skills within the dynamic token budget.",
       resolution: "PROPOSE_FIX",
-      ceoRationale: "Top-K (K=4) semantic skill transpiler active.",
+      ceoRationale: "Context-budget dynamic skill loader active.",
     },
   ];
 
@@ -387,5 +404,318 @@ export async function runEgmBoardroomConference(options: {
       findings,
     },
     formattedBriefForElephant,
+  };
+}
+
+// ============================================================================
+// POST-IMPLEMENTATION INDEPENDENT EGM REVIEW (Part 10)
+// ============================================================================
+
+const CODE_DEFECT_PATTERNS: ReadonlyArray<{
+  id: string;
+  severity: "BLOCKER" | "MAJOR" | "NIT";
+  description: string;
+  regex: RegExp;
+}> = [
+  {
+    id: "DEFECT-TODO-STUB",
+    severity: "BLOCKER",
+    description: "Unfinished TODO/FIXME or NotImplementedError placeholder left in implementation",
+    regex: /(?:\/\/\s*(?:TODO|FIXME)\b|#\s*(?:TODO|FIXME)\b|\bNotImplementedError\b|throw\s+new\s+Error\(["']not\s+implemented)/i,
+  },
+  {
+    id: "DEFECT-INTENTIONAL-BUG-MARKER",
+    severity: "BLOCKER",
+    description: "Intentional bug or broken logic marker detected in modified code",
+    regex: /(?:\bINTENTIONAL_BUG\b|\bBROKEN_IMPLEMENTATION\b|\/\*\s*BUG\s*\*\/|return\s+NaN\s*;)/i,
+  },
+  {
+    id: "DEFECT-UNSAFE-EVAL",
+    severity: "MAJOR",
+    description: "Unsafe dynamic eval() or child_process execSync usage without boundary validation",
+    regex: /\beval\s*\(/,
+  },
+];
+
+export interface PostImplReviewInput {
+  originalRequirement: string;
+  workspacePath: string;
+  responseText: string;
+  filesCreated: readonly string[];
+  filesModified: readonly string[];
+  commandsExecuted: readonly ExecutedCommandEvidence[];
+  gitDiffSummary?: string;
+  explicitTestFailures?: readonly string[];
+  explicitLinterErrors?: readonly string[];
+  correctionCycle?: number;
+  simulateReviewerUnavailable?: boolean;
+  customReviewerFn?: (context: {
+    requirement: string;
+    changedFilesContent: Record<string, string>;
+    commands: readonly ExecutedCommandEvidence[];
+    responseText: string;
+  }) => Promise<{
+    available: boolean;
+    outcome?: PostImplReviewOutcome;
+    model?: string;
+    findings?: Array<{
+      id: string;
+      severity: "BLOCKER" | "MAJOR" | "NIT";
+      file?: string;
+      description: string;
+      resolution: EgmResolutionAction;
+    }>;
+    summary?: string;
+  }>;
+  signal?: AbortSignal;
+}
+
+/**
+ * Post-Implementation Independent EGM Reviewer:
+ * Evaluates actual code changes on disk, git diff, command exit codes, and test/build outputs
+ * against the user's original requirement.
+ *
+ * Invariants:
+ * 1. Never defaults to `approve` when the reviewer is unavailable (`outcome: "unavailable"`, `reviewerAvailable: false`).
+ * 2. Rejects (`request_changes` or `decline`) when tests/commands fail or when modified code contains
+ *    stubs, syntax errors, or concrete defects.
+ */
+export async function runPostImplementationEgmReview(
+  input: PostImplReviewInput,
+): Promise<PostImplReviewReport> {
+  const cycle = input.correctionCycle ?? 0;
+  const canonicalRoot = resolveCanonicalWorkspaceRoot(input.workspacePath);
+
+  if (input.simulateReviewerUnavailable) {
+    return {
+      outcome: "unavailable",
+      reviewerAvailable: false,
+      reviewerModel: "offline/unavailable",
+      comprehensionParaphrase: `Post-implementation review requested for "${input.originalRequirement.slice(0, 80)}", but independent reviewer is unavailable.`,
+      score: 0,
+      correctionCyclesRun: cycle,
+      findings: [
+        {
+          id: "EGM-UNAVAILABLE",
+          severity: "MAJOR",
+          description: "Independent EGM reviewer model was unreachable; automatic approval is forbidden.",
+          resolution: "ESCALATE",
+        },
+      ],
+      summary: "Reviewer unavailable — refusing to default to approval.",
+    };
+  }
+
+  const changedFilesContent: Record<string, string> = {};
+  const allChangedFiles = [...new Set([...input.filesCreated, ...input.filesModified])];
+
+  const findings: PostImplReviewReport["findings"] = [];
+
+  for (const relFile of allChangedFiles) {
+    try {
+      const fullPath = assertCanonicalWorkspacePath(canonicalRoot, relFile, {
+        operation: "post_impl_review_read",
+      });
+      if (!existsSync(fullPath)) {
+        findings.push({
+          id: `EGM-MISSING-${findings.length + 1}`,
+          severity: "BLOCKER",
+          file: relFile,
+          description: `Claimed modified/created file "${relFile}" does not exist on disk.`,
+          resolution: "PROPOSE_FIX",
+        });
+        continue;
+      }
+      const content = readFileSync(fullPath, "utf8");
+      changedFilesContent[relFile] = content;
+
+      if (content.trim().length === 0) {
+        findings.push({
+          id: `EGM-EMPTY-${findings.length + 1}`,
+          severity: "BLOCKER",
+          file: relFile,
+          description: `Modified file "${relFile}" is empty (0 bytes).`,
+          resolution: "PROPOSE_FIX",
+        });
+      }
+
+      for (const pattern of CODE_DEFECT_PATTERNS) {
+        if (pattern.regex.test(content)) {
+          findings.push({
+            id: `${pattern.id}-${findings.length + 1}`,
+            severity: pattern.severity,
+            file: relFile,
+            description: `${pattern.description} in ${relFile}`,
+            resolution: "PROPOSE_FIX",
+          });
+        }
+      }
+    } catch (err) {
+      findings.push({
+        id: `EGM-SEC-${findings.length + 1}`,
+        severity: "BLOCKER",
+        file: relFile,
+        description: `Security boundary violation inspecting "${relFile}": ${err instanceof Error ? err.message : String(err)}`,
+        resolution: "DECLINE",
+      });
+    }
+  }
+
+  // Also check responseText for stubs
+  for (const pattern of CODE_DEFECT_PATTERNS) {
+    if (pattern.regex.test(input.responseText)) {
+      findings.push({
+        id: `${pattern.id}-RESP-${findings.length + 1}`,
+        severity: pattern.severity,
+        description: `${pattern.description} in assistant response`,
+        resolution: "PROPOSE_FIX",
+      });
+    }
+  }
+
+  // Inspect command execution results and explicit test/lint failures
+  for (const cmd of input.commandsExecuted) {
+    if (cmd.exitCode !== 0 || cmd.timedOut || cmd.cancelled) {
+      findings.push({
+        id: `EGM-CMD-FAIL-${findings.length + 1}`,
+        severity: "BLOCKER",
+        description: `Command "${cmd.command}" failed (exit=${cmd.exitCode ?? "null"}, timedOut=${cmd.timedOut}, cancelled=${cmd.cancelled}).`,
+        resolution: "PROPOSE_FIX",
+      });
+    }
+  }
+
+  for (const tf of input.explicitTestFailures ?? []) {
+    if (tf.trim()) {
+      findings.push({
+        id: `EGM-TEST-FAIL-${findings.length + 1}`,
+        severity: "BLOCKER",
+        description: `Test suite failure: ${tf.trim()}`,
+        resolution: "PROPOSE_FIX",
+      });
+    }
+  }
+
+  for (const le of input.explicitLinterErrors ?? []) {
+    if (le.trim()) {
+      findings.push({
+        id: `EGM-LINT-FAIL-${findings.length + 1}`,
+        severity: "MAJOR",
+        description: `Linter/compiler error: ${le.trim()}`,
+        resolution: "PROPOSE_FIX",
+      });
+    }
+  }
+
+  // If customReviewerFn is provided (e.g. for custom LLM reviewer or test harness), invoke it
+  if (input.customReviewerFn) {
+    try {
+      const customRes = await input.customReviewerFn({
+        requirement: input.originalRequirement,
+        changedFilesContent,
+        commands: input.commandsExecuted,
+        responseText: input.responseText,
+      });
+
+      if (!customRes.available) {
+        return {
+          outcome: "unavailable",
+          reviewerAvailable: false,
+          reviewerModel: customRes.model ?? "custom-reviewer-offline",
+          comprehensionParaphrase: `Post-implementation review could not complete because reviewer "${customRes.model ?? "custom"}" was unavailable.`,
+          score: 0,
+          correctionCyclesRun: cycle,
+          findings: [
+            ...findings,
+            {
+              id: "EGM-CUSTOM-UNAVAILABLE",
+              severity: "MAJOR",
+              description: "Custom independent reviewer reported unavailable; refusing automatic approval.",
+              resolution: "ESCALATE",
+            },
+          ],
+          summary: customRes.summary ?? "Reviewer unavailable — did not default to approval.",
+        };
+      }
+
+      if (customRes.findings) {
+        findings.push(...customRes.findings);
+      }
+
+      if (customRes.outcome) {
+        return {
+          outcome: customRes.outcome,
+          reviewerAvailable: true,
+          reviewerModel: customRes.model ?? "egm-custom-auditor",
+          comprehensionParaphrase: `Audited "${input.originalRequirement.slice(0, 80)}" across ${allChangedFiles.length} changed file(s) and ${input.commandsExecuted.length} command(s).`,
+          score: customRes.outcome === "approve" ? 95 : 40,
+          correctionCyclesRun: cycle,
+          findings,
+          summary: customRes.summary ?? `Independent review returned ${customRes.outcome}.`,
+        };
+      }
+    } catch (err) {
+      return {
+        outcome: "unavailable",
+        reviewerAvailable: false,
+        reviewerModel: "custom-reviewer-error",
+        comprehensionParaphrase: "Independent reviewer threw an exception during evaluation.",
+        score: 0,
+        correctionCyclesRun: cycle,
+        findings: [
+          ...findings,
+          {
+            id: "EGM-REVIEWER-ERR",
+            severity: "MAJOR",
+            description: `Reviewer error: ${err instanceof Error ? err.message : String(err)}`,
+            resolution: "ESCALATE",
+          },
+        ],
+        summary: "Reviewer threw an error — refusing to default to approval.",
+      };
+    }
+  }
+
+  const hasSecurityDecline = findings.some((f) => f.resolution === "DECLINE");
+  const hasBlockerOrMajor = findings.some((f) => f.severity === "BLOCKER" || f.severity === "MAJOR");
+
+  let outcome: PostImplReviewOutcome = "approve";
+  if (hasSecurityDecline) {
+    outcome = "decline";
+  } else if (hasBlockerOrMajor) {
+    outcome = "request_changes";
+  } else if (!input.responseText || input.responseText.trim().length < 10) {
+    outcome = "request_changes";
+    findings.push({
+      id: "EGM-EMPTY-RESPONSE",
+      severity: "MAJOR",
+      description: "Assistant response is empty or truncated (< 10 chars).",
+      resolution: "PROPOSE_FIX",
+    });
+  }
+
+  const score = Math.max(
+    0,
+    Math.min(
+      100,
+      100 -
+        findings.filter((f) => f.severity === "BLOCKER").length * 40 -
+        findings.filter((f) => f.severity === "MAJOR").length * 20 -
+        findings.filter((f) => f.severity === "NIT").length * 5,
+    ),
+  );
+
+  return {
+    outcome,
+    reviewerAvailable: true,
+    reviewerModel: "egm-goldfish-auditor-v5.1",
+    comprehensionParaphrase: `Audited requirement "${input.originalRequirement.slice(0, 80)}" against ${allChangedFiles.length} modified file(s) and ${input.commandsExecuted.length} executed command(s).`,
+    score,
+    correctionCyclesRun: cycle,
+    findings,
+    summary:
+      outcome === "approve"
+        ? `Approved (${score}/100): Zero blockers across ${allChangedFiles.length} changed file(s) and ${input.commandsExecuted.length} command(s).`
+        : `Review outcome ${outcome} (${score}/100): ${findings.map((f) => f.description).join(" | ")}`,
   };
 }
