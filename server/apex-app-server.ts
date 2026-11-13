@@ -53,6 +53,7 @@ import {
 import {
   buildExecutionDag,
   deleteProviderConfig,
+  executeTaskDag,
   loadProviderConfigs,
   loadRoleRoutingTable,
   saveProviderConfig,
@@ -1371,23 +1372,6 @@ export function createApexAppServer() {
           thread.title = promptText.slice(0, 48) + (promptText.length > 48 ? "…" : "");
         }
 
-        const preferredId =
-          thread.selectedModelId && thread.selectedModelId !== "auto"
-            ? thread.selectedModelId
-            : undefined;
-        const plan = buildOrchestrationPlan(promptText, {
-          dataDir: APEX_DATA_DIR,
-          workspaceRoot: project.path,
-          preferredModelId: preferredId,
-        });
-
-        const dagNodes = buildExecutionDag({
-          dataDir: APEX_DATA_DIR,
-          prompt: promptText,
-          preferredModelId: thread.selectedModelId,
-          mountedSkills: plan.mountedSkills.map((s) => s.name),
-        });
-
         const { record: execRecord, signal: execSignal } = executionManager.createExecution({
           conversationId: thread.id,
           projectId: project.id,
@@ -1396,7 +1380,6 @@ export function createApexAppServer() {
           mode: thread.mode,
           effort: thread.effort,
           selectedModelId: thread.selectedModelId,
-          subtasks: dagNodes,
         });
         const executionId = execRecord.executionId;
 
@@ -1454,23 +1437,6 @@ export function createApexAppServer() {
           });
         };
 
-        // Emit initial execution record & DAG immediately so UI can show Stop/Cancel/Pause controls
-        executionManager.transitionState(executionId, "planning", { subtasks: dagNodes });
-        emitDagState();
-
-        const filesInspected = new Set<string>();
-        const filesCreated = new Set<string>();
-        const filesModified = new Set<string>();
-        const commandsExecuted: ExecutedCommandEvidence[] = [];
-        const toolsInvoked: Array<{
-          tool: string;
-          target?: string;
-          status: "done" | "error";
-          durationMs: number;
-        }> = [];
-        let turnCheckpointId: string | undefined;
-        let actualModelUsed = plan.primaryModel.id;
-
         try {
           appendSessionGenerationEvent(APEX_DATA_DIR, {
             sessionId: thread.id,
@@ -1482,14 +1448,6 @@ export function createApexAppServer() {
             type: "user/message",
             content: promptText,
           });
-
-          // DAG Node 1: Coordinator
-          const tCoord = Date.now();
-          executionManager.updateSubtask(executionId, "node-coordinator", {
-            state: "running",
-            startedAt: new Date(tCoord).toISOString(),
-          });
-          emitDagState();
 
           const repeatOutcome = repeatGuard.recordToolCall(thread.id, "chat_turn", {
             prompt: promptText,
@@ -1507,136 +1465,6 @@ export function createApexAppServer() {
             });
           }
 
-          sendEvent("plan", plan);
-          pushStep({
-            id: `step-route-${Date.now()}`,
-            kind: "route",
-            agentRole: "Coordinator",
-            label: `Lead Coordinator assigned ${plan.primaryModel.displayName}`,
-            plainSummary: `Coordinator selected ${plan.primaryModel.displayName} for ${plan.classification.primaryDomain.replace(/_/g, " ")}`,
-            detail: `Task type: ${plan.classification.primaryDomain.replace(/_/g, " ")} · Execution ID: ${executionId}`,
-            status: "done",
-            durationMs: Date.now() - tCoord,
-          });
-
-          if (plan.mountedSkills.length > 0) {
-            pushStep({
-              id: `step-skills-${Date.now()}`,
-              kind: "skill",
-              agentRole: "Coordinator",
-              label: `Activated ${plan.mountedSkills.length} context-budgeted workflows`,
-              plainSummary: `Coordinator mounted ${plan.mountedSkills.map((s) => s.name).join(", ")}`,
-              detail: plan.mountedSkills.map((s) => s.name).join(", "),
-              status: "done",
-              durationMs: 12,
-            });
-          }
-
-          executionManager.updateSubtask(executionId, "node-coordinator", {
-            state: "completed",
-            actualModelUsed: plan.primaryModel.id,
-            completedAt: new Date().toISOString(),
-            durationMs: Date.now() - tCoord,
-            verificationPassed: true,
-          });
-          executionManager.transitionState(executionId, "running");
-          emitDagState();
-
-          await executionManager.waitIfPaused(executionId);
-          if (execSignal.aborted) throw new Error("Execution cancelled by user");
-
-          // DAG Layer 2 (Parallel): Scout || Architect
-          const tParallel = Date.now();
-          executionManager.updateSubtask(executionId, "node-scout", {
-            state: "running",
-            startedAt: new Date(tParallel).toISOString(),
-          });
-          executionManager.updateSubtask(executionId, "node-architect", {
-            state: "running",
-            startedAt: new Date(tParallel).toISOString(),
-          });
-          emitDagState();
-
-          const [scoutRes, egmBrief] = await Promise.all([
-            (async () => {
-              const tS = Date.now();
-              if (isIndependent) {
-                return {
-                  contextBlock: "Independent General Chat Mode (No project repository bound).",
-                  inspectedFiles: [] as string[],
-                  durationMs: Date.now() - tS,
-                };
-              }
-              const grounded = gatherGroundedWorkspaceContext(
-                project.path,
-                plan.effectivePrompt,
-                pushStep,
-              );
-              const spilledContext = applySpillPolicyToText({
-                dataDir: APEX_DATA_DIR,
-                sessionId: thread.id,
-                toolName: "workspace_context",
-                content: grounded.contextBlock,
-                maxInlineTokens: 2800,
-              });
-              if (spilledContext.spilled && spilledContext.spillRef) {
-                pushStep({
-                  id: `step-spill-${Date.now()}`,
-                  kind: "read",
-                  agentRole: "Scout",
-                  label: `Compressed large file context (${spilledContext.omittedBytes} bytes cached)`,
-                  plainSummary: `Scout Agent compressed large file preview`,
-                  detail: spilledContext.spillRef.locator,
-                  status: "done",
-                  durationMs: 4,
-                });
-              }
-              return {
-                contextBlock: spilledContext.text,
-                inspectedFiles: grounded.inspectedFiles,
-                durationMs: Date.now() - tS,
-              };
-            })(),
-            runEgmBoardroomConference({
-              prompt: plan.effectivePrompt,
-              workspacePath: project.path,
-              fastMode: isIndependent || plan.classification.complexity === "trivial",
-              signal: execSignal,
-              onStep: pushStep,
-            }),
-          ]);
-
-          for (const f of scoutRes.inspectedFiles) filesInspected.add(f);
-          for (const f of egmBrief.desk1GroundedManifest.scannedFiles) filesInspected.add(f.file);
-
-          executionManager.updateSubtask(executionId, "node-scout", {
-            state: "completed",
-            completedAt: new Date().toISOString(),
-            durationMs: scoutRes.durationMs,
-            outputSummary: `Inspected ${filesInspected.size} workspace files`,
-            verificationPassed: true,
-          });
-          executionManager.updateSubtask(executionId, "node-architect", {
-            state: "completed",
-            completedAt: new Date().toISOString(),
-            durationMs: Date.now() - tParallel,
-            outputSummary: egmBrief.desk3Auditor.comprehensionParaphrase,
-            verificationPassed: true,
-          });
-          emitDagState();
-          sendEvent("egm", egmBrief);
-
-          await executionManager.waitIfPaused(executionId);
-          if (execSignal.aborted) throw new Error("Execution cancelled by user");
-
-          // DAG Node 3: Builder
-          const tBuilder = Date.now();
-          executionManager.updateSubtask(executionId, "node-builder", {
-            state: "running",
-            startedAt: new Date(tBuilder).toISOString(),
-          });
-          emitDagState();
-
           const treeRoot = harnessTreeRoot(APEX_DATA_DIR);
           const sysPromptSurface = existsSync(join(treeRoot, "systemprompt.md"))
             ? readFileSync(join(treeRoot, "systemprompt.md"), "utf8")
@@ -1645,323 +1473,56 @@ export function createApexAppServer() {
             ? readFileSync(join(treeRoot, "guardrails.md"), "utf8")
             : "";
 
-          const systemInstruction = [
-            sysPromptSurface,
-            guardrailsSurface,
-            isIndependent
-              ? "Active Mode: Independent General Chat (not bound to a specific project folder unless the user provides a path)."
-              : `Active Project Workspace: ${project.name} (${project.path})`,
-            `Execution Mode: ${thread.mode} | Thinking Effort: ${thread.effort}`,
-            `--- SPECIALIST BOARDROOM BRIEF ---\n${egmBrief.formattedBriefForElephant}`,
-            repeatOutcome.reminderMessage
-              ? `\n--- LOOP HYGIENE GUARD ---\n${repeatOutcome.reminderMessage}`
-              : "",
-            plan.transpiledSkillsPrompt
-              ? `\n--- MOUNTED UNIVERSAL SKILLS ---\n${plan.transpiledSkillsPrompt}`
-              : "",
-            `\n--- WORKSPACE GROUNDED CONTEXT ---\n${scoutRes.contextBlock}`,
-            thread.mode !== "ask"
-              ? `\nAvailable Executable Agent Tools (emit inside \`\`\`apex-action blocks when you need to read, search, edit, or run commands):\n- Bounded file read: {"tool":"read_file","path":"rel/path.py","startLine":1,"endLine":180}\n- List folder: {"tool":"list_dir","path":"."}\n- Grep search: {"tool":"grep_search","query":"pattern","relDir":"."}\n- Surgical file edit: {"tool":"edit_file","path":"rel/path.py","target":"exact string","replacement":"new string"}\n- Full file write: {"tool":"write_file","path":"rel/path.py","content":"..."}\n- Update live task checklist: {"tool":"todo_write","todos":[{"content":"Inspect orchestrator","status":"completed"},{"content":"Audit backtester","status":"in_progress"}]}\n- Shell command: {"tool":"run_command","command":"..."}\n- MCP server tool: {"tool":"call_mcp_tool","serverName":"context7","toolName":"resolve-library-id","args":{"libraryName":"react"}}\nIMPORTANT: After reading files or running tools, always provide a clear, well-structured, comprehensive answer to the user.`
-              : "",
-          ]
-            .filter(Boolean)
-            .join("\n\n");
-
           const historyMessages = thread.messages.slice(-7, -1).map((m) => ({
             role: m.role,
-            content: plan.strictSanitized
-              ? m.content.replace(/\bCVE-\d{4}-\d+\b/gi, "[ADVISORY]")
-              : m.content,
+            content: m.content,
           }));
 
-          const loopMessages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [
-            { role: "system", content: systemInstruction },
-            ...historyMessages,
-            { role: "user", content: plan.effectivePrompt },
-          ];
-
-          const narrativeSegments: string[] = [];
-          const maxIterations = thread.mode === "ask" ? 1 : 5;
-
-          for (let iter = 0; iter < maxIterations; iter++) {
-            await executionManager.waitIfPaused(executionId);
-            if (execSignal.aborted) throw new Error("Execution cancelled by user");
-
-            const modelStepId = `step-model-${Date.now()}-${iter}`;
-            pushStep({
-              id: modelStepId,
-              kind: "model",
-              agentRole: iter === 0 ? "Builder" : "Architect",
-              label:
-                iter === 0
-                  ? `${plan.primaryModel.displayName} analyzing & drafting response`
-                  : `Step ${iter + 1}: Analyzing inspected files & tool results`,
-              plainSummary:
-                iter === 0
-                  ? `Builder Agent generating response`
-                  : `Architect Agent synthesizing inspected files (round ${iter + 1})`,
-              status: "running",
-            });
-
-            const llmRes = await callUnifiedFleetWithFailover({
-              preferredModelId: plan.primaryModel.id,
-              preferredBaseUrl: plan.primaryModel.baseUrl,
-              preferredApiKey: plan.primaryModel.apiKey,
-              messages: loopMessages,
-              signal: execSignal,
-            });
-
-            actualModelUsed = llmRes.ok
-              ? `${llmRes.usedGateway}/${llmRes.usedModel}`
-              : plan.primaryModel.id;
-
-            pushStep({
-              id: modelStepId,
-              kind: "model",
-              agentRole: iter === 0 ? "Builder" : "Architect",
-              label: llmRes.ok
-                ? `Completed reasoning step (${(llmRes.latencyMs / 1000).toFixed(1)}s)`
-                : `Completed local workspace synthesis`,
-              plainSummary: `Model step completed in ${(llmRes.latencyMs / 1000).toFixed(1)}s`,
-              detail: actualModelUsed,
-              status: "done",
-              durationMs: llmRes.latencyMs,
-            });
-
-            if (!llmRes.ok) {
-              if (narrativeSegments.length === 0) {
-                narrativeSegments.push(
-                  [
-                    `### Workspace Review for \`${project.name}\` (\`${project.path}\`)`,
-                    "",
-                    `- **Task Domain**: \`${plan.classification.primaryDomain.replace(/_/g, " ")}\``,
-                    `- **Lead Model**: \`${plan.primaryModel.displayName}\``,
-                    "",
-                    "#### Key Files & Structure Inspected:",
-                    "```text",
-                    scoutRes.contextBlock.slice(0, 2200),
-                    "```",
-                  ].join("\n"),
-                );
-              }
-              break;
-            }
-
-            const parsedTurn = parseAndScrubModelResponse(llmRes.text);
-            const hasPtcActions = llmRes.text.includes("```ptc-action");
-
-            if (parsedTurn.visibleText) {
-              const cleanedVis = parsedTurn.visibleText
-                .replace(/```ptc-action[\s\S]*?```/g, "")
-                .trim();
-              if (cleanedVis) narrativeSegments.push(cleanedVis);
-            }
-
-            if (
-              thread.mode === "ask" ||
-              (parsedTurn.toolCalls.length === 0 && !hasPtcActions)
-            ) {
-              break;
-            }
-
-            const iterObservations: string[] = [];
-
-            if (parsedTurn.toolCalls.length > 0) {
-              const executed = await executeAgentToolBlocksAsync(
-                llmRes.text,
-                project.path,
-                pushStep,
-                {
-                  dataDir: APEX_DATA_DIR,
-                  conversationId: thread.id,
-                  checkpointId: turnCheckpointId,
-                  mode: thread.mode,
-                  signal: execSignal,
-                  onApprovalRequired:
-                    thread.mode === "ask"
-                      ? async (info) => {
-                          const pPromise = executionManager.requestUserApproval(executionId, {
-                            tool: "run_command",
-                            commandOrPath: info.command,
-                            reason: info.reason,
-                          });
-                          emitDagState();
-                          return pPromise;
-                        }
-                      : undefined,
-                },
-              );
-              if (executed.checkpointId) {
-                turnCheckpointId = executed.checkpointId;
-                executionManager.transitionState(executionId, "running", {
-                  checkpointId: turnCheckpointId,
-                });
-              }
-              for (const f of executed.filesInspected) filesInspected.add(f);
-              for (const f of executed.filesCreated) filesCreated.add(f);
-              for (const f of executed.filesModified) filesModified.add(f);
-              commandsExecuted.push(...executed.commandsExecuted);
-              toolsInvoked.push(...executed.toolsInvoked);
-              iterObservations.push(...executed.toolObservations);
-            }
-
-            if (hasPtcActions) {
-              const ptcRegex = /```ptc-action\r?\n([\s\S]*?)```/g;
-              let ptcMatch: RegExpExecArray | null;
-              while ((ptcMatch = ptcRegex.exec(llmRes.text)) !== null) {
-                const codeBody = ptcMatch[1] ?? "";
-                const ptcRes = await executePtcProgram({
-                  code: codeBody,
-                  workspacePath: project.path,
-                  dataDir: APEX_DATA_DIR,
-                  sessionId: thread.id,
-                  signal: execSignal,
-                });
-                toolsInvoked.push({
-                  tool: "ptc-action",
-                  status: ptcRes.ok ? "done" : "error",
-                  durationMs: ptcRes.durationMs,
-                });
-                pushStep({
-                  id: `step-ptc-${Date.now()}`,
-                  kind: "command",
-                  agentRole: "Builder",
-                  label: `Executed OS-isolated PTC script (${ptcRes.toolCallsCount} operations)`,
-                  plainSummary: `Builder Agent ran programmatic batch (${ptcRes.toolCallsCount} calls)`,
-                  detail: `${ptcRes.durationMs}ms`,
-                  outputPreview: ptcRes.ok
-                    ? JSON.stringify(ptcRes.returnValue, null, 2).slice(0, 1200)
-                    : ptcRes.error,
-                  status: ptcRes.ok ? "done" : "error",
-                  durationMs: ptcRes.durationMs,
-                });
-                iterObservations.push(
-                  `[ptc-action] ok=${ptcRes.ok} returnValue=${JSON.stringify(ptcRes.returnValue).slice(0, 1500)}`,
-                );
-              }
-            }
-
-            if (iterObservations.length === 0 || iter + 1 >= maxIterations) {
-              break;
-            }
-
-            loopMessages.push({
-              role: "assistant",
-              content: parsedTurn.visibleText || "Executing workspace tools.",
-            });
-            loopMessages.push({
-              role: "user",
-              content: [
-                "Here are the exact results from the tools you just called:",
-                ...iterObservations,
-                "Now provide a complete, well-structured response answering the user's request based on these inspected files. Do NOT emit raw XML tags.",
-              ].join("\n\n"),
-            });
-          }
-
-          let finalResponseText = narrativeSegments.join("\n\n").trim();
-          if (!finalResponseText) {
-            finalResponseText =
-              "Completed workspace inspection. Expand any step above to view the file contents.";
-          }
-
-          executionManager.updateSubtask(executionId, "node-builder", {
-            state: "completed",
-            actualModelUsed,
-            completedAt: new Date().toISOString(),
-            durationMs: Date.now() - tBuilder,
-            outputSummary: finalResponseText.slice(0, 220),
-            verificationPassed: true,
+          const dagResult = await executeTaskDag({
+            executionManager,
+            executionId,
+            dataDir: APEX_DATA_DIR,
+            workspaceRoot: project.path,
+            prompt: promptText,
+            preferredModelId: thread.selectedModelId,
+            mode: thread.mode,
+            effort: thread.effort,
+            isIndependent,
+            adaptiveTopology: Boolean(
+              (body as { adaptiveTopology?: boolean }).adaptiveTopology,
+            ),
+            systemPromptPrefix: [
+              sysPromptSurface,
+              guardrailsSurface,
+              repeatOutcome.reminderMessage
+                ? `--- LOOP HYGIENE GUARD ---\n${repeatOutcome.reminderMessage}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
+            conversationHistory: historyMessages,
+            onPlan: (plan) => sendEvent("plan", plan),
+            onEgmBrief: (egm) => sendEvent("egm", egm),
+            onStep: pushStep,
+            onDagUpdate: () => emitDagState(),
           });
-          emitDagState();
+
+          if (dagResult.executionRecord.state === "cancelled" || execSignal.aborted) {
+            throw new Error(dagResult.executionRecord.error || "Execution cancelled by user");
+          }
+
+          const finalResponseText =
+            dagResult.responseText ||
+            "Completed workspace inspection. Expand any step above to view the file contents.";
+          const actualModelUsed = `${dagResult.usedGateway}/${dagResult.usedModel}`;
+          const { plan, completionReport, postImplReview } = dagResult;
+          const turnCheckpointId = dagResult.checkpointId || undefined;
 
           // Stream chunks smoothly to the UI
           const chunkSize = 120;
           for (let i = 0; i < finalResponseText.length; i += chunkSize) {
             sendEvent("delta", { text: finalResponseText.slice(i, i + chunkSize) });
           }
-
-          // DAG Node 4: Critic (Post-Implementation Independent EGM Review)
-          const tCritic = Date.now();
-          executionManager.updateSubtask(executionId, "node-critic", {
-            state: "running",
-            startedAt: new Date(tCritic).toISOString(),
-          });
-          emitDagState();
-
-          const postImplReview = await runPostImplementationEgmReview({
-            originalRequirement: promptText,
-            workspacePath: project.path,
-            responseText: finalResponseText,
-            filesCreated: [...filesCreated],
-            filesModified: [...filesModified],
-            commandsExecuted,
-            signal: execSignal,
-          });
-
-          pushStep({
-            id: `step-critic-${Date.now()}`,
-            kind: "judge",
-            agentRole: "Critic",
-            label: `Post-Implementation EGM Critic: ${postImplReview.outcome.toUpperCase()} (${postImplReview.score}/100)`,
-            plainSummary: postImplReview.summary,
-            detail: postImplReview.findings.map((f) => `[${f.severity}] ${f.description}`).join(" | ") || "Zero defects found",
-            status: postImplReview.outcome === "decline" ? "error" : "done",
-            durationMs: Date.now() - tCritic,
-          });
-
-          executionManager.updateSubtask(executionId, "node-critic", {
-            state: "completed",
-            actualModelUsed: postImplReview.reviewerModel,
-            completedAt: new Date().toISOString(),
-            durationMs: Date.now() - tCritic,
-            outputSummary: postImplReview.summary,
-            verificationPassed: postImplReview.outcome === "approve",
-          });
-          emitDagState();
-
-          // DAG Node 5: Verifier (Self-Judge + Evidence-Based Completion Report)
-          const tJudge = Date.now();
-          executionManager.updateSubtask(executionId, "node-verifier", {
-            state: "running",
-            startedAt: new Date(tJudge).toISOString(),
-          });
-          emitDagState();
-
-          const allSkills = discoverAllUniversalSkills({ workspaceRoot: project.path });
-          const skillsMountedEvidence = plan.mountedSkills.map((ms) => {
-            const found = allSkills.find((s) => s.name === ms.name);
-            return {
-              name: ms.name,
-              ecosystem: ms.ecosystem,
-              tokenEstimate: found ? found.estimatedTokens || estimateSkillTokens(found.rawBody) : 250,
-            };
-          });
-
-          executionManager.updateSubtask(executionId, "node-verifier", {
-            state: "completed",
-            actualModelUsed: plan.primaryModel.id,
-            completedAt: new Date().toISOString(),
-            durationMs: Date.now() - tJudge,
-            verificationPassed: true,
-          });
-
-          const currentExec = executionManager.getExecution(executionId)!;
-          const completionReport = buildCompletionEvidenceReport({
-            executionId,
-            originalRequirement: promptText,
-            executionPlanSummary: `6-Agent DAG (${plan.classification.primaryDomain}) routed via ${actualModelUsed}`,
-            workspaceRoot: project.path,
-            subtasks: currentExec.subtasks,
-            skillsMounted: skillsMountedEvidence,
-            toolsInvoked,
-            filesInspected: [...filesInspected],
-            filesCreated: [...filesCreated],
-            filesModified: [...filesModified],
-            commandsExecuted,
-            egmReview: postImplReview,
-            responseText: finalResponseText,
-          });
 
           const verdict = evaluateCompletedTurn({
             dataDir: APEX_DATA_DIR,
@@ -1979,19 +1540,6 @@ export function createApexAppServer() {
             fallbackModelIds: plan.fallbackModels.map((m) => m.id),
           });
 
-          pushStep({
-            id: `step-judge-${Date.now()}`,
-            kind: "judge",
-            agentRole: "Verifier",
-            label: `Verifier Agent: ${completionReport.status.toUpperCase()} (Quality ${(verdict.score * 100).toFixed(0)}%)`,
-            plainSummary: `Verifier stamped ${completionReport.status.replace(/_/g, " ")} (${(verdict.score * 100).toFixed(0)}%)`,
-            detail:
-              completionReport.remainingIssues.join(" | ") ||
-              "Evidence report verified, zero raw tool leakage",
-            status: completionReport.status === "failed" ? "error" : "done",
-            durationMs: Date.now() - tJudge,
-          });
-
           if (verdict.passed) {
             recordHarness2Reflection(APEX_DATA_DIR, {
               timestamp: new Date().toISOString(),
@@ -2003,18 +1551,6 @@ export function createApexAppServer() {
               lessonLearned: `Successfully executed ${plan.classification.primaryDomain} task in project "${project.name}" using ${actualModelUsed} with skills [${plan.mountedSkills.map((s) => s.name).join(", ")}].`,
             });
           }
-
-          const finalExecState =
-            completionReport.status === "failed"
-              ? "failed"
-              : completionReport.status === "blocked"
-                ? "blocked"
-                : "completed";
-          executionManager.transitionState(executionId, finalExecState, {
-            checkpointId: turnCheckpointId,
-            completionReport,
-          });
-          emitDagState();
 
           const assistantMsg: ConversationThread["messages"][number] = {
             id: `msg-${randomUUID().slice(0, 8)}`,
@@ -2032,7 +1568,7 @@ export function createApexAppServer() {
             completionStatus: completionReport.status,
             completionReport,
             postImplReview,
-            dagSubtasks: executionManager.getExecution(executionId)?.subtasks,
+            dagSubtasks: dagResult.executionRecord.subtasks,
             judgeVerdict: {
               passed: verdict.passed,
               score: verdict.score,
@@ -2066,6 +1602,7 @@ export function createApexAppServer() {
             completionReport,
             postImplReview,
             threadTitle: thread.title,
+            dagTopologyMode: dagResult.dagTopologyMode,
           });
         } catch (err) {
           const isCancelled =

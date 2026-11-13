@@ -11,7 +11,22 @@ export type ExecutionState =
   | "cancelled"
   | "completed"
   | "failed"
-  | "blocked";
+  | "blocked"
+  | "skipped";
+
+export type NodeLifecycleEventType =
+  | "queued"
+  | "started"
+  | "progress"
+  | "tool_call"
+  | "tool_result"
+  | "waiting_for_approval"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "skipped";
+
+export type DagTopologyMode = "fast_path" | "standard" | "full_engineering";
 
 export type CompletionStatus =
   | "implemented_and_verified"
@@ -87,10 +102,15 @@ export interface AgentExecutionNode {
   assignedTask: string;
   assignedModelId: string;
   actualModelUsed?: string;
+  driverId?: string;
+  sessionId?: string;
+  currentTool?: string;
+  retryCount?: number;
+  maxRetries?: number;
   capabilities: string[];
   contextBudgetTokens: number;
   mountedSkills: string[];
-  toolPermissions: Array<"read" | "write" | "command" | "mcp" | "ptc">;
+  toolPermissions: Array<"read" | "write" | "command" | "mcp" | "ptc" | "subagent">;
   state: ExecutionState;
   dependsOn: string[];
   parentTaskId?: string;
@@ -101,6 +121,11 @@ export interface AgentExecutionNode {
   durationMs?: number;
   error?: string;
   verificationPassed?: boolean;
+  events?: Array<{
+    type: NodeLifecycleEventType;
+    timestamp: string;
+    detail?: string;
+  }>;
 }
 
 export interface ExecutedCommandEvidence {
@@ -125,17 +150,42 @@ export interface PostImplReviewReport {
   outcome: PostImplReviewOutcome;
   reviewerAvailable: boolean;
   reviewerModel: string;
+  reviewerSessionId?: string;
+  independentContextVerified?: boolean;
   comprehensionParaphrase: string;
   score: number;
   correctionCyclesRun: number;
-  findings: Array<{
+  deterministicChecks?: Array<{
     id: string;
     severity: "BLOCKER" | "MAJOR" | "NIT";
     file?: string;
     description: string;
+  }>;
+  findings: Array<{
+    id: string;
+    severity: "BLOCKER" | "MAJOR" | "NIT";
+    file?: string;
+    line?: number;
+    source?: "goldfish_fresh_session" | "deterministic_static_check";
+    description: string;
     resolution: "PROPOSE_FIX" | "CONTEST" | "ESCALATE" | "DECLINE";
   }>;
   summary: string;
+}
+
+export interface RequirementEvidenceItem {
+  requirementId: string;
+  description: string;
+  status:
+    | "implemented_and_verified"
+    | "implemented_not_verified"
+    | "partially_implemented"
+    | "not_implemented"
+    | "blocked"
+    | "not_applicable";
+  evidenceFiles: string[];
+  evidenceCommands: string[];
+  justification?: string;
 }
 
 export interface CompletionEvidenceReport {
@@ -143,6 +193,8 @@ export interface CompletionEvidenceReport {
   status: CompletionStatus;
   originalRequirement: string;
   executionPlanSummary: string;
+  dagTopologyMode?: DagTopologyMode;
+  requirements?: RequirementEvidenceItem[];
   subtasks: Array<{
     id: string;
     role: AgentOfficeRole;
@@ -150,6 +202,8 @@ export interface CompletionEvidenceReport {
     task: string;
     state: ExecutionState;
     modelUsed: string;
+    driverId?: string;
+    sessionId?: string;
     durationMs: number;
   }>;
   agentsInvolved: AgentOfficeRole[];

@@ -13,9 +13,11 @@ import type {
   AgentExecutionNode,
   AgentOfficeRole,
   CompletionEvidenceReport,
+  DagTopologyMode,
   EngineeringRole10,
   ExecutedCommandEvidence,
   ExecutionRecord,
+  NodeLifecycleEventType,
   PostImplReviewReport,
   ProviderConfigEntry,
   ProviderProtocol,
@@ -41,7 +43,7 @@ import {
   type UnifiedModelEntry,
 } from "./apex-fleet-sync.ts";
 import { buildCompletionEvidenceReport } from "./completion-evidence.ts";
-import { executePtcProgram } from "./deepseek-subsystems.ts";
+import { applySpillPolicyToText, executePtcProgram } from "./deepseek-subsystems.ts";
 import {
   buildDesk1GroundedManifest,
   runEgmBoardroomConference,
@@ -782,13 +784,56 @@ export function detectDagCycle(nodes: readonly AgentExecutionNode[]): {
  *                      └──> node-critic
  *                              └──> node-verifier
  */
+export function determineDagTopologyMode(
+  prompt: string,
+  options: { isIndependent?: boolean; adaptiveTopology?: boolean } = {},
+): DagTopologyMode {
+  if (!options.adaptiveTopology && !options.isIndependent) {
+    return "full_engineering";
+  }
+  const trimmed = prompt.trim();
+  const hasEngineeringIntent =
+    /\b(file|code|repo|project|fix|bug|test|build|refactor|implement|audit|security|function|class|module|server|ui|git|diff|edit|write|create)\b/i.test(
+      trimmed,
+    );
+  if (options.isIndependent && !hasEngineeringIntent) {
+    return "fast_path";
+  }
+  if (
+    options.adaptiveTopology &&
+    trimmed.length < 80 &&
+    !hasEngineeringIntent &&
+    /^(hi|hello|hey|what\s+is|who\s+are|ping|thanks|thank\s+you|\d+\s*[+\-*/]\s*\d+)/i.test(trimmed)
+  ) {
+    return "fast_path";
+  }
+  const classification = classifyTaskPrompt(trimmed);
+  if (
+    options.adaptiveTopology &&
+    classification.complexity === "trivial" &&
+    !/\b(architecture|design|boardroom|audit|security|multi-agent)\b/i.test(trimmed)
+  ) {
+    return "standard";
+  }
+  return "full_engineering";
+}
+
 export function buildExecutionDag(input: {
   dataDir: string;
   prompt: string;
   preferredModelId?: string;
   mountedSkills: string[];
+  executionId?: string;
+  isIndependent?: boolean;
+  adaptiveTopology?: boolean;
 }): AgentExecutionNode[] {
   const classification = classifyTaskPrompt(input.prompt);
+  const topologyMode = determineDagTopologyMode(input.prompt, {
+    isIndependent: input.isIndependent,
+    adaptiveTopology: input.adaptiveTopology,
+  });
+  const execPrefix = input.executionId || "dag";
+  const nowIso = new Date().toISOString();
   const manualOverride =
     input.preferredModelId && input.preferredModelId !== "auto"
       ? input.preferredModelId
@@ -822,19 +867,37 @@ export function buildExecutionDag(input: {
   });
   const verifierModel = selectModelForEngineeringRole(input.dataDir, "final_verification");
 
+  const skipScout = topologyMode === "fast_path";
+  const skipArchitect = topologyMode === "fast_path" || topologyMode === "standard";
+  const skipCritic = topologyMode === "fast_path";
+
+  const builderDeps =
+    topologyMode === "fast_path"
+      ? ["node-coordinator"]
+      : topologyMode === "standard"
+        ? ["node-scout"]
+        : ["node-scout", "node-architect"];
+
+  const verifierDeps = skipCritic ? ["node-builder"] : ["node-critic"];
+
   const nodes: AgentExecutionNode[] = [
     {
       id: "node-coordinator",
       role: "Coordinator",
       engineeringRole: "main_planning",
-      assignedTask: "Classify request domain, assign specialist models, and mount context-budgeted skills",
+      assignedTask: `Classify request domain (${topologyMode}), assign specialist models, and mount context-budgeted skills`,
       assignedModelId: coordModel.primaryModel.id,
+      driverId: `${coordModel.primaryModel.provider}:${coordModel.primaryModel.driver}`,
+      sessionId: `sess_${execPrefix}_node-coordinator`,
+      retryCount: 0,
+      maxRetries: 1,
       capabilities: ["task_classification", "dag_scheduling", "skill_budgeting"],
       contextBudgetTokens: 16_000,
       mountedSkills: input.mountedSkills,
       toolPermissions: ["read"],
       state: "queued",
       dependsOn: [],
+      events: [{ type: "queued", timestamp: nowIso, detail: `Topology: ${topologyMode}` }],
     },
     {
       id: "node-scout",
@@ -842,13 +905,25 @@ export function buildExecutionDag(input: {
       engineeringRole: "repo_exploration",
       assignedTask: "Scan canonical workspace files, extract AST symbols, and load operational memory",
       assignedModelId: scoutModel.primaryModel.id,
+      driverId: `${scoutModel.primaryModel.provider}:${scoutModel.primaryModel.driver}`,
+      sessionId: `sess_${execPrefix}_node-scout`,
+      retryCount: 0,
+      maxRetries: 1,
       capabilities: ["ast_symbol_indexing", "file_discovery", "memory_recall"],
       contextBudgetTokens: 32_000,
       mountedSkills: input.mountedSkills.slice(0, 2),
       toolPermissions: ["read", "mcp"],
-      state: "queued",
+      state: skipScout ? "skipped" : "queued",
+      outputSummary: skipScout ? "Skipped on fast_path (no repository scan required)" : undefined,
       dependsOn: ["node-coordinator"],
       parentTaskId: "node-coordinator",
+      events: [
+        {
+          type: skipScout ? "skipped" : "queued",
+          timestamp: nowIso,
+          detail: skipScout ? "Bypassed on fast_path" : "Queued for parallel exploration",
+        },
+      ],
     },
     {
       id: "node-architect",
@@ -856,13 +931,27 @@ export function buildExecutionDag(input: {
       engineeringRole: "architecture",
       assignedTask: "Run 4 stateless Goldfish specialist lenses and synthesize architectural constraints",
       assignedModelId: archModel.primaryModel.id,
+      driverId: `${archModel.primaryModel.provider}:${archModel.primaryModel.driver}`,
+      sessionId: `sess_${execPrefix}_node-architect`,
+      retryCount: 0,
+      maxRetries: 1,
       capabilities: ["egm_4_lenses", "contract_design", "boundary_analysis"],
       contextBudgetTokens: 32_000,
       mountedSkills: input.mountedSkills,
       toolPermissions: ["read"],
-      state: "queued",
+      state: skipArchitect ? "skipped" : "queued",
+      outputSummary: skipArchitect
+        ? `Skipped on ${topologyMode} topology`
+        : undefined,
       dependsOn: ["node-coordinator"],
       parentTaskId: "node-coordinator",
+      events: [
+        {
+          type: skipArchitect ? "skipped" : "queued",
+          timestamp: nowIso,
+          detail: skipArchitect ? `Bypassed on ${topologyMode}` : "Queued for EGM Desk 1-3",
+        },
+      ],
     },
     {
       id: "node-builder",
@@ -870,13 +959,18 @@ export function buildExecutionDag(input: {
       engineeringRole: builderEngRole,
       assignedTask: "Create safety checkpoint, execute workspace tools, and synthesize implementation",
       assignedModelId: builderModel.primaryModel.id,
-      capabilities: ["file_read_write", "managed_command_exec", "ptc_sandbox", "mcp_tools"],
+      driverId: `${builderModel.primaryModel.provider}:${builderModel.primaryModel.driver}`,
+      sessionId: `sess_${execPrefix}_node-builder`,
+      retryCount: 0,
+      maxRetries: 1,
+      capabilities: ["file_read_write", "managed_command_exec", "ptc_sandbox", "mcp_tools", "subagent_delegation"],
       contextBudgetTokens: 64_000,
       mountedSkills: input.mountedSkills,
-      toolPermissions: ["read", "write", "command", "mcp", "ptc"],
+      toolPermissions: ["read", "write", "command", "mcp", "ptc", "subagent"],
       state: "queued",
-      dependsOn: ["node-scout", "node-architect"],
+      dependsOn: builderDeps,
       parentTaskId: "node-coordinator",
+      events: [{ type: "queued", timestamp: nowIso }],
     },
     {
       id: "node-critic",
@@ -884,13 +978,24 @@ export function buildExecutionDag(input: {
       engineeringRole: criticEngRole,
       assignedTask: "Perform independent post-implementation EGM review of code diffs and command outputs",
       assignedModelId: criticModel.primaryModel.id,
+      driverId: `${criticModel.primaryModel.provider}:${criticModel.primaryModel.driver}`,
+      sessionId: `sess_${execPrefix}_node-critic`,
+      retryCount: 0,
+      maxRetries: 1,
       capabilities: ["post_impl_egm_audit", "defect_detection", "correction_loop"],
       contextBudgetTokens: 32_000,
       mountedSkills: input.mountedSkills.slice(0, 2),
       toolPermissions: ["read"],
-      state: "queued",
+      state: skipCritic ? "skipped" : "queued",
+      outputSummary: skipCritic ? "Skipped on fast_path (no code mutation)" : undefined,
       dependsOn: ["node-builder"],
       parentTaskId: "node-builder",
+      events: [
+        {
+          type: skipCritic ? "skipped" : "queued",
+          timestamp: nowIso,
+        },
+      ],
     },
     {
       id: "node-verifier",
@@ -898,13 +1003,18 @@ export function buildExecutionDag(input: {
       engineeringRole: "final_verification",
       assignedTask: "Verify test/build evidence, update EMA model scoreboard, and assemble CompletionEvidenceReport",
       assignedModelId: verifierModel.primaryModel.id,
+      driverId: `${verifierModel.primaryModel.provider}:${verifierModel.primaryModel.driver}`,
+      sessionId: `sess_${execPrefix}_node-verifier`,
+      retryCount: 0,
+      maxRetries: 1,
       capabilities: ["evidence_verification", "ema_scoreboard_update", "completion_report"],
       contextBudgetTokens: 16_000,
       mountedSkills: [],
       toolPermissions: ["read", "command"],
       state: "queued",
-      dependsOn: ["node-critic"],
-      parentTaskId: "node-critic",
+      dependsOn: verifierDeps,
+      parentTaskId: skipCritic ? "node-builder" : "node-critic",
+      events: [{ type: "queued", timestamp: nowIso }],
     },
   ];
 
@@ -928,6 +1038,10 @@ export interface ExecuteTaskDagOptions {
   preferredModelId?: string;
   effort?: "high" | "medium" | "low";
   mode?: "turbo" | "auto_edit" | "ask";
+  isIndependent?: boolean;
+  adaptiveTopology?: boolean;
+  maxParallelNodes?: number;
+  systemPromptPrefix?: string;
   memorySnippet?: string;
   maxCorrectionCycles?: number;
   simulateReviewerUnavailable?: boolean;
@@ -947,6 +1061,12 @@ export interface ExecuteTaskDagOptions {
     commandsExecuted?: ExecutedCommandEvidence[];
     toolsInvoked?: Array<{ tool: string; target?: string; status: "done" | "error"; durationMs: number }>;
   }>;
+  onPlan?: (plan: OrchestrationPlan) => void;
+  onEgmBrief?: (brief: EgmBoardroomBrief) => void;
+  onNodeEvent?: (
+    nodeId: string,
+    event: { type: NodeLifecycleEventType; timestamp: string; detail?: string },
+  ) => void;
   onStep?: (step: AgentStepEvent) => void;
   onDagUpdate?: (subtasks: AgentExecutionNode[], state: ExecutionRecord["state"]) => void;
 }
@@ -954,6 +1074,7 @@ export interface ExecuteTaskDagOptions {
 export interface ExecuteTaskDagResult {
   executionRecord: ExecutionRecord;
   plan: OrchestrationPlan;
+  dagTopologyMode: DagTopologyMode;
   egmPreBrief: EgmBoardroomBrief;
   postImplReview: PostImplReviewReport;
   completionReport: CompletionEvidenceReport;
@@ -970,11 +1091,14 @@ async function runBuilderCodingPass(input: {
   executionId: string;
   preferredModelId: string;
   transpiledSkillsBlock: string;
+  systemPromptPrefix?: string;
   memorySnippet: string;
+  isIndependent?: boolean;
   conversationHistory: Array<{ role: "user" | "assistant"; content: string }>;
   maxToolIterations: number;
   mode: "turbo" | "auto_edit" | "ask";
   signal?: AbortSignal;
+  onToolStateChange?: (toolName?: string) => void;
   onApprovalRequest?: (info: {
     command: string;
     cwd: string;
@@ -1000,18 +1124,32 @@ async function runBuilderCodingPass(input: {
   const toolsInvoked: Array<{ tool: string; target?: string; status: "done" | "error"; durationMs: number }> = [];
   let checkpointId: string | undefined;
 
-  const grounded = gatherGroundedWorkspaceContext(input.workspacePath, input.prompt, input.onStep);
-  for (const f of grounded.inspectedFiles) filesInspected.add(f);
+  let contextBlock = "Independent General Chat Mode (No project repository bound).";
+  if (!input.isIndependent) {
+    const grounded = gatherGroundedWorkspaceContext(input.workspacePath, input.prompt, input.onStep);
+    for (const f of grounded.inspectedFiles) filesInspected.add(f);
+    const spilled = applySpillPolicyToText({
+      dataDir: input.dataDir,
+      sessionId: input.executionId,
+      toolName: "workspace_context",
+      content: grounded.contextBlock,
+      maxInlineTokens: 2800,
+    });
+    contextBlock = spilled.text;
+  }
 
   const systemContent = [
     "You are the Apex Harness Builder Agent.",
-    `Active Workspace: ${input.workspacePath}`,
+    input.systemPromptPrefix,
+    input.isIndependent
+      ? "Active Mode: Independent General Chat (not bound to a specific project folder unless the user provides a path)."
+      : `Active Workspace: ${input.workspacePath}`,
     `Execution Mode: ${input.mode}`,
     input.transpiledSkillsBlock,
     input.memorySnippet,
-    `--- GROUNDED WORKSPACE CONTEXT ---\n${grounded.contextBlock}`,
+    `--- GROUNDED WORKSPACE CONTEXT ---\n${contextBlock}`,
     input.mode !== "ask"
-      ? `Emit executable tools inside \`\`\`apex-action JSON blocks when reading, editing, writing, or running commands:\n- {"tool":"read_file","path":"rel/path.ts","startLine":1,"endLine":180}\n- {"tool":"edit_file","path":"rel/path.ts","target":"old","replacement":"new"}\n- {"tool":"write_file","path":"rel/path.ts","content":"..."}\n- {"tool":"run_command","command":"node --test"}`
+      ? `Emit executable tools inside \`\`\`apex-action JSON blocks when reading, editing, writing, or running commands:\n- {"tool":"read_file","path":"rel/path.ts","startLine":1,"endLine":180}\n- {"tool":"list_dir","path":"."}\n- {"tool":"grep_search","query":"pattern","relDir":"."}\n- {"tool":"edit_file","path":"rel/path.ts","target":"old","replacement":"new"}\n- {"tool":"write_file","path":"rel/path.ts","content":"..."}\n- {"tool":"todo_write","todos":[{"content":"Task","status":"in_progress"}]}\n- {"tool":"run_command","command":"node --test"}\n- {"tool":"call_mcp_tool","serverName":"context7","toolName":"resolve-library-id","args":{"libraryName":"react"}}`
       : "",
   ]
     .filter(Boolean)
@@ -1049,7 +1187,7 @@ async function runBuilderCodingPass(input: {
             `### Workspace Synthesis for \`${input.workspacePath}\``,
             `- **Assigned Model**: \`${input.preferredModelId}\``,
             "```text",
-            grounded.contextBlock.slice(0, 1800),
+            contextBlock.slice(0, 1800),
             "```",
           ].join("\n"),
         );
@@ -1070,6 +1208,7 @@ async function runBuilderCodingPass(input: {
 
     const observations: string[] = [];
     if (parsed.toolCalls.length > 0) {
+      input.onToolStateChange?.(parsed.toolCalls[0]?.tool);
       const execRes = await executeAgentToolBlocksAsync(llmRes.text, input.workspacePath, input.onStep, {
         dataDir: input.dataDir,
         conversationId: input.executionId,
@@ -1078,6 +1217,7 @@ async function runBuilderCodingPass(input: {
         signal: input.signal,
         onApprovalRequired: input.onApprovalRequest,
       });
+      input.onToolStateChange?.(undefined);
       if (execRes.checkpointId) checkpointId = execRes.checkpointId;
       for (const f of execRes.filesInspected) filesInspected.add(f);
       for (const f of execRes.filesCreated) filesCreated.add(f);
@@ -1088,6 +1228,7 @@ async function runBuilderCodingPass(input: {
     }
 
     if (hasPtc) {
+      input.onToolStateChange?.("ptc-action");
       const ptcRegex = /```ptc-action\r?\n([\s\S]*?)```/g;
       let match: RegExpExecArray | null;
       while ((match = ptcRegex.exec(llmRes.text)) !== null) {
@@ -1107,6 +1248,7 @@ async function runBuilderCodingPass(input: {
           `[ptc-action] ok=${ptcRes.ok} returnValue=${JSON.stringify(ptcRes.returnValue).slice(0, 1200)}`,
         );
       }
+      input.onToolStateChange?.(undefined);
     }
 
     if (observations.length === 0 || iter + 1 >= maxIter) {
@@ -1137,6 +1279,7 @@ async function runBuilderCodingPass(input: {
 
 /**
  * Executes the 6-agent DAG with genuine parallel execution for independent subtasks (`Scout` || `Architect`),
+ * adaptive topology (`fast_path` | `standard` | `full_engineering`), bounded concurrency,
  * live state transitions, cancellation & pause propagation, bounded EGM correction cycles, and
  * evidence-backed completion reporting.
  */
@@ -1157,6 +1300,29 @@ export async function executeTaskDag(
     }
   };
 
+  const appendNodeEvent = (
+    nodeId: string,
+    type: NodeLifecycleEventType,
+    detail?: string,
+  ): AgentNodeLifecycleEvent[] => {
+    const rec = executionManager.getExecution(executionId);
+    const existing = rec?.subtasks.find((s) => s.id === nodeId)?.events ?? [];
+    return [
+      ...existing,
+      {
+        type,
+        timestamp: new Date().toISOString(),
+        detail,
+      },
+    ];
+  };
+
+  const dagTopologyMode = determineDagTopologyMode({
+    prompt,
+    isIndependent: options.isIndependent,
+    adaptiveTopology: options.adaptiveTopology,
+  });
+
   // Build orchestration plan & initial 6-node DAG
   const plan = buildOrchestrationPlan(prompt, {
     dataDir,
@@ -1166,12 +1332,16 @@ export async function executeTaskDag(
         ? options.preferredModelId
         : undefined,
   });
+  options.onPlan?.(plan);
 
   const dagNodes = buildExecutionDag({
     dataDir,
     prompt,
+    executionId,
     preferredModelId: options.preferredModelId,
     mountedSkills: plan.mountedSkills.map((s) => s.name),
+    isIndependent: options.isIndependent,
+    adaptiveTopology: options.adaptiveTopology,
   });
 
   executionManager.transitionState(executionId, "planning", { subtasks: dagNodes });
@@ -1179,7 +1349,18 @@ export async function executeTaskDag(
 
   // State shared across DAG nodes
   let desk1Manifest = buildDesk1GroundedManifest(workspaceRoot, prompt);
-  let egmPreBrief!: EgmBoardroomBrief;
+  let egmPreBrief: EgmBoardroomBrief = {
+    desk1Manifest,
+    desk2GoldfishLenses: [],
+    desk3Auditor: {
+      comprehensionParaphrase: `Topology mode '${dagTopologyMode}': executing task "${prompt.slice(0, 120)}".`,
+      resolutions: [],
+      readyToExecute: true,
+      score: 95,
+    },
+    formattedBriefForElephant: "",
+    totalDurationMs: 0,
+  };
   let checkpointId = "";
   let responseText = "";
   let usedModel = plan.primaryModel.id;
@@ -1194,7 +1375,16 @@ export async function executeTaskDag(
     status: "done" | "error";
     durationMs: number;
   }> = [];
-  let postImplReview!: PostImplReviewReport;
+  let postImplReview: PostImplReviewReport = {
+    outcome: "approve",
+    reviewerAvailable: true,
+    reviewerModel: "skipped",
+    comprehensionParaphrase: "Fast-path topology: no code mutation critic required.",
+    score: 95,
+    correctionCyclesRun: 0,
+    findings: [],
+    summary: "Fast-path conversational turn completed.",
+  };
   let completionReport!: CompletionEvidenceReport;
 
   // Individual node executors
@@ -1209,6 +1399,7 @@ export async function executeTaskDag(
     executionManager.updateSubtask(executionId, node.id, {
       state: "running",
       startedAt: new Date(t0).toISOString(),
+      events: appendNodeEvent(node.id, "started", `Assigned model ${node.assignedModelId}`),
     });
     notifyDag();
 
@@ -1218,8 +1409,8 @@ export async function executeTaskDag(
           id: `step-coord-${Date.now()}`,
           kind: "route",
           agentRole: "Coordinator",
-          label: `Lead Coordinator assigned ${plan.primaryModel.displayName} & 10-role DAG`,
-          plainSummary: `Coordinator scheduled 6 specialist agents across ${plan.classification.primaryDomain.replace(/_/g, " ")}`,
+          label: `Lead Coordinator assigned ${plan.primaryModel.displayName} (${dagTopologyMode})`,
+          plainSummary: `Coordinator scheduled DAG (${dagTopologyMode}) across ${plan.classification.primaryDomain.replace(/_/g, " ")}`,
           detail: `Primary: ${plan.primaryModel.id} · Skills: ${plan.mountedSkills.map((s) => s.name).join(", ") || "none"}`,
           status: "done",
           durationMs: Date.now() - t0,
@@ -1229,10 +1420,11 @@ export async function executeTaskDag(
           state: "completed",
           actualModelUsed: plan.primaryModel.id,
           inputSummary: prompt.slice(0, 200),
-          outputSummary: `Domain: ${plan.classification.primaryDomain}, Skills: ${plan.mountedSkills.length}`,
+          outputSummary: `Topology: ${dagTopologyMode}, Domain: ${plan.classification.primaryDomain}, Skills: ${plan.mountedSkills.length}`,
           completedAt: new Date().toISOString(),
           durationMs: Date.now() - t0,
           verificationPassed: true,
+          events: appendNodeEvent(node.id, "completed", `Planned ${dagTopologyMode} DAG`),
         });
         executionManager.transitionState(executionId, "running");
         notifyDag();
@@ -1263,6 +1455,7 @@ export async function executeTaskDag(
           completedAt: new Date().toISOString(),
           durationMs: Date.now() - t0,
           verificationPassed: true,
+          events: appendNodeEvent(node.id, "completed", `Indexed ${desk1Manifest.scannedFiles.length} files`),
         });
         notifyDag();
         return;
@@ -1275,6 +1468,7 @@ export async function executeTaskDag(
           fastMode: options.effort !== "high",
           signal: subSignal,
         });
+        options.onEgmBrief?.(egmPreBrief);
 
         emitStep({
           id: `step-arch-${Date.now()}`,
@@ -1295,12 +1489,16 @@ export async function executeTaskDag(
           completedAt: new Date().toISOString(),
           durationMs: Date.now() - t0,
           verificationPassed: true,
+          events: appendNodeEvent(node.id, "completed", `Score ${egmPreBrief.desk3Auditor.score}/100`),
         });
         notifyDag();
         return;
       }
 
       if (node.id === "node-builder") {
+        if (!egmPreBrief.desk2GoldfishLenses.length) {
+          options.onEgmBrief?.(egmPreBrief);
+        }
         const loopRes = options.customBuilderFn
           ? await options.customBuilderFn({
               prompt: plan.effectivePrompt,
@@ -1321,10 +1519,18 @@ export async function executeTaskDag(
                 .filter(Boolean)
                 .join("\n\n"),
               memorySnippet: options.memorySnippet ?? "",
+              systemPromptPrefix: options.systemPromptPrefix,
+              isIndependent: options.isIndependent,
               conversationHistory: options.conversationHistory,
               maxToolIterations: options.effort === "low" ? 1 : 3,
               mode: options.mode ?? "turbo",
               signal: subSignal,
+              onToolStateChange: (toolName) => {
+                executionManager.updateSubtask(executionId, node.id, {
+                  currentTool: toolName,
+                });
+                notifyDag();
+              },
               onApprovalRequest:
                 options.mode === "ask"
                   ? async (info) =>
@@ -1353,11 +1559,13 @@ export async function executeTaskDag(
         executionManager.updateSubtask(executionId, node.id, {
           state: "completed",
           actualModelUsed: usedModel,
+          currentTool: undefined,
           inputSummary: `Scout (${desk1Manifest.scannedFiles.length} files) + Architect EGM brief`,
           outputSummary: loopRes.responseText.slice(0, 260),
           completedAt: new Date().toISOString(),
           durationMs: Date.now() - t0,
           verificationPassed: true,
+          events: appendNodeEvent(node.id, "completed", `Used ${usedModel} (${toolsInvoked.length} tools)`),
         });
         notifyDag();
         return;
@@ -1415,6 +1623,8 @@ export async function executeTaskDag(
                 preferredModelId: usedModel,
                 transpiledSkillsBlock: plan.transpiledSkillsPrompt,
                 memorySnippet: options.memorySnippet ?? "",
+                systemPromptPrefix: options.systemPromptPrefix,
+                isIndependent: options.isIndependent,
                 conversationHistory: [
                   ...options.conversationHistory,
                   { role: "assistant", content: responseText },
@@ -1466,11 +1676,13 @@ export async function executeTaskDag(
         executionManager.updateSubtask(executionId, node.id, {
           state: "completed",
           actualModelUsed: postImplReview.reviewerModel,
+          retryCount: cycle,
           inputSummary: `Changed files: ${filesCreated.size + filesModified.size}, Commands: ${commandsExecuted.length}`,
           outputSummary: postImplReview.summary,
           completedAt: new Date().toISOString(),
           durationMs: Date.now() - t0,
           verificationPassed: postImplReview.outcome === "approve",
+          events: appendNodeEvent(node.id, "completed", `Outcome: ${postImplReview.outcome}`),
         });
         notifyDag();
         return;
@@ -1503,7 +1715,7 @@ export async function executeTaskDag(
         completionReport = buildCompletionEvidenceReport({
           executionId,
           originalRequirement: prompt,
-          executionPlanSummary: `6-Agent DAG (${plan.classification.primaryDomain}) routed via ${usedModel}`,
+          executionPlanSummary: `6-Agent DAG (${dagTopologyMode} · ${plan.classification.primaryDomain}) routed via ${usedModel}`,
           workspaceRoot,
           subtasks: subtasksSnapshot,
           skillsMounted: skillsWithTokens,
@@ -1554,6 +1766,7 @@ export async function executeTaskDag(
           verificationPassed:
             completionReport.status === "implemented_and_verified" ||
             completionReport.status === "implemented_not_verified",
+          events: appendNodeEvent(node.id, "completed", `Status: ${completionReport.status}`),
         });
         notifyDag();
       }
@@ -1564,15 +1777,20 @@ export async function executeTaskDag(
         error: (err as Error).message,
         completedAt: new Date().toISOString(),
         durationMs: Date.now() - t0,
+        events: appendNodeEvent(node.id, isAbort ? "cancelled" : "failed", (err as Error).message),
       });
       notifyDag();
       throw err;
     }
   };
 
-  // Topological parallel layer scheduler
+  // Topological parallel layer scheduler with bounded concurrency and skipped-node handling
   try {
-    const completedIds = new Set<string>();
+    const completedIds = new Set<string>(
+      dagNodes.filter((n) => n.state === "skipped").map((n) => n.id),
+    );
+    const maxParallel = Math.max(1, options.maxParallelNodes ?? 4);
+
     while (completedIds.size < dagNodes.length) {
       await executionManager.waitIfPaused(executionId);
       if (signal?.aborted) {
@@ -1581,18 +1799,20 @@ export async function executeTaskDag(
 
       const rec = executionManager.getExecution(executionId);
       const currentNodes = rec?.subtasks ?? dagNodes;
-      const readyNodes = currentNodes.filter(
-        (n) =>
-          !completedIds.has(n.id) &&
-          n.state === "queued" &&
-          n.dependsOn.every((depId) => completedIds.has(depId)),
-      );
+      const readyNodes = currentNodes
+        .filter(
+          (n) =>
+            !completedIds.has(n.id) &&
+            n.state === "queued" &&
+            n.dependsOn.every((depId) => completedIds.has(depId)),
+        )
+        .slice(0, maxParallel);
 
       if (readyNodes.length === 0) {
         break;
       }
 
-      // Execute all ready independent nodes in this layer concurrently!
+      // Execute all ready independent nodes in this bounded layer concurrently!
       await Promise.all(readyNodes.map((n) => runNode(n)));
       for (const n of readyNodes) {
         completedIds.add(n.id);
@@ -1622,6 +1842,7 @@ export async function executeTaskDag(
       usedModel,
       usedGateway,
       checkpointId,
+      dagTopologyMode,
     };
   } catch (err) {
     const isCancelled =
@@ -1638,7 +1859,7 @@ export async function executeTaskDag(
     }
 
     const failedRec = executionManager.getExecution(executionId)!;
-    if (!postImplReview) {
+    if (!postImplReview || postImplReview.reviewerModel === "skipped") {
       postImplReview = {
         outcome: "unavailable",
         reviewerAvailable: false,
@@ -1681,6 +1902,7 @@ export async function executeTaskDag(
       usedModel,
       usedGateway,
       checkpointId,
+      dagTopologyMode,
     };
   }
 }
