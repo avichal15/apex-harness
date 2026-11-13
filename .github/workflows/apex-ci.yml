@@ -1,0 +1,35 @@
+name: Apex Harness CI
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apex-ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || format('{0}-{1}', github.event_name, github.ref) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  apex-verification:
+    name: Apex Harness 29-Test Suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Run 29-Test Apex Harness Security & Engineering Suite
+        run: node --experimental-strip-types --test server/apex-harness.node-test.mjs server/apex-master-verification.node-test.mjs
+      - name: Run Harness² Python Substrate Check
+        run: python -c "import sys; sys.path.insert(0, 'harness2'); import apex_maus_substrate as s; r = s.validate_all_surfaces(); assert r['valid'], r; print('Harness2 surfaces valid:', r['surface_count'])"
