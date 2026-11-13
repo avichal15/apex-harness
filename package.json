@@ -36,7 +36,7 @@
     "apex:app": "node --experimental-strip-types server/apex-app-server.ts",
     "apex:desktop": "electron electron/apex-main.mjs",
     "apex:exe": "ApexHarness.exe",
-    "test:apex": "node --experimental-strip-types --test server/apex-harness.node-test.mjs server/apex-master-verification.node-test.mjs",
+    "test:apex": "node --experimental-strip-types --test server/apex-harness.node-test.mjs server/apex-master-verification.node-test.mjs server/apex-reference-integration.node-test.mjs",
     "apex:status": "node --experimental-strip-types server/apex-cli.ts status",
     "apex:route": "node --experimental-strip-types server/apex-cli.ts route",
     "apex:skills": "node --experimental-strip-types server/apex-cli.ts skills",

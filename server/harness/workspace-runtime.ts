@@ -71,20 +71,22 @@ export class WorkspaceRuntime {
   ): WorkspacePatchResult {
     const abs = this.resolveSafePath(relPath, true);
     const existed = existsSync(abs);
-    const prevContent = existed ? readFileSync(abs, "utf8") : null;
-    const ckpt = saveTurnCheckpoint({
-      dataDir: this.dataDir,
-      conversationId: options?.conversationId || "runtime-session",
-      workspacePath: this.workspaceRoot,
-      checkpointId: options?.checkpointId,
-      backups: [{ relPath, existedBefore: existed, previousContent: prevContent }],
+    const prevContent = existed ? readFileSync(abs, "utf8") : undefined;
+    const checkpointId =
+      options?.checkpointId || `ckpt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    saveTurnCheckpoint(this.dataDir, {
+      checkpointId,
+      workspaceRoot: this.workspaceRoot,
+      createdAt: new Date().toISOString(),
+      reverted: false,
+      files: [{ fullPath: abs, existedBefore: existed, previousContent: prevContent }],
     });
     mkdirSync(dirname(abs), { recursive: true });
     writeFileSync(abs, content, "utf8");
     return {
       ok: true,
       path: relative(this.workspaceRoot, abs).replace(/\\/g, "/"),
-      checkpointId: ckpt.checkpointId,
+      checkpointId,
       diffPreview: `+++ b/${relPath} (${content.split(/\r?\n/).length} lines)`,
     };
   }
@@ -116,18 +118,20 @@ export class WorkspaceRuntime {
       };
     }
 
-    const ckpt = saveTurnCheckpoint({
-      dataDir: this.dataDir,
-      conversationId: options?.conversationId || "runtime-session",
-      workspacePath: this.workspaceRoot,
-      checkpointId: options?.checkpointId,
-      backups: [{ relPath, existedBefore: true, previousContent: raw }],
+    const checkpointId =
+      options?.checkpointId || `ckpt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    saveTurnCheckpoint(this.dataDir, {
+      checkpointId,
+      workspaceRoot: this.workspaceRoot,
+      createdAt: new Date().toISOString(),
+      reverted: false,
+      files: [{ fullPath: abs, existedBefore: true, previousContent: raw }],
     });
     writeFileSync(abs, updated, "utf8");
     return {
       ok: true,
       path: relative(this.workspaceRoot, abs).replace(/\\/g, "/"),
-      checkpointId: ckpt.checkpointId,
+      checkpointId,
       diffPreview: `--- a/${relPath}\n+++ b/${relPath}\n@@ replaced ${target.split(/\r?\n/).length} line(s) @@`,
     };
   }

@@ -742,6 +742,7 @@ const sandboxConsole = Object.freeze({
       Object.freeze({
         host: hostBindings,
         tools: hostBindings,
+        apex: hostBindings,
         console: sandboxConsole,
         JSON,
         Math,

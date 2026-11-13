@@ -787,7 +787,9 @@ export function determineDagTopologyMode(
   const classification = classifyTaskPrompt(trimmed);
   if (
     options.adaptiveTopology &&
-    classification.complexity === "trivial" &&
+    (classification.complexity === "trivial" ||
+      (classification.complexity === "moderate" &&
+        !/\b(refactor|implement|rewrite|migrate)\b/i.test(trimmed))) &&
     !/\b(architecture|design|boardroom|audit|security|multi-agent)\b/i.test(trimmed)
   ) {
     return "standard";

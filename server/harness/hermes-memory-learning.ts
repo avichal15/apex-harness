@@ -346,7 +346,7 @@ export function validateLearnedSkillProposal(
       `Skill token estimate (${proposal.estimatedTokens}) exceeds maximum single-skill budget (2500).`,
     );
   }
-  if (/\b(?:rm\s+-rf\s+\/|curl\s+[^|]+\|\s*(?:sh|bash)|Invoke-Expression)\b/i.test(proposal.fullSkillMd)) {
+  if (/(?:\brm\s+-rf\s+\/|\bcurl\s+[^|]+\|\s*(?:sh|bash)\b|\bInvoke-Expression\b)/i.test(proposal.fullSkillMd)) {
     issues.push("Skill contains forbidden destructive shell pattern.");
   }
 

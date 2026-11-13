@@ -727,6 +727,22 @@ export class NativeCliJsonlProtocolAdapter {
         } else if (type === "item.completed" && obj.item && typeof obj.item === "object") {
           const item = obj.item as Record<string, unknown>;
           if (typeof item.text === "string") visibleParts.push(item.text.trim());
+        } else if (
+          (type === "tool_use" || type === "function_call" || type === "tool_call") &&
+          typeof obj.name === "string"
+        ) {
+          const rawInput = obj.input ?? obj.arguments ?? obj.args ?? {};
+          const parsedArgs =
+            typeof rawInput === "string"
+              ? (JSON.parse(rawInput) as Record<string, unknown>)
+              : (rawInput as Record<string, unknown>);
+          toolCalls.push({
+            id: typeof obj.id === "string" ? obj.id : `cli_${randomUUID().slice(0, 8)}`,
+            name: obj.name,
+            arguments: parsedArgs,
+            rawArgumentsJson: JSON.stringify(parsedArgs),
+            protocol: "cli-jsonl",
+          });
         } else if (typeof obj.text === "string") {
           visibleParts.push(obj.text.trim());
         }
