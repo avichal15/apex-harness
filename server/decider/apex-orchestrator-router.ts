@@ -13,6 +13,7 @@ import {
 } from "../harness/apex-fleet-sync.ts";
 import {
   discoverAllUniversalSkills,
+  loadSkillManagementConfig,
   selectTopKSkillsForTurn,
 } from "../harness/universal-skill-loader.ts";
 
@@ -257,6 +258,8 @@ export function buildOrchestrationPlan(
     hasImages?: boolean;
     estimatedContextTokens?: number;
     topKSkills?: number;
+    maxContextBudgetTokens?: number;
+    agentRole?: string;
   },
 ): OrchestrationPlan {
   const fleet = loadUnifiedModelFleet();
@@ -298,11 +301,15 @@ export function buildOrchestrationPlan(
     .filter((m) => m.id !== primaryModel.id && m.provider !== primaryModel.provider)
     .slice(0, 3);
 
+  const skillCfg = loadSkillManagementConfig(options.dataDir);
   const allSkills = discoverAllUniversalSkills({ workspaceRoot: options.workspaceRoot });
   const selectedSkills = selectTopKSkillsForTurn(prompt, allSkills, {
     topK: options.topKSkills ?? 4,
+    maxContextBudgetTokens: options.maxContextBudgetTokens,
+    modelContextWindow: primaryModel.contextWindow,
     strictFirewall: primaryModel.strictFirewall,
     targetDriver: primaryModel.driver,
+    disabledSkillIds: new Set(skillCfg.disabledSkillIds),
   });
 
   const transpiledSkillsPrompt = selectedSkills.map((s) => s.transpiledPromptBlock).join("\n---\n");
