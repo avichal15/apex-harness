@@ -1,101 +1,104 @@
-// AI Agent Office & Multi-Agent Orchestration Simulation Engine for Apex Harness.
-// Synthesizes OpenClaude Coordinator/Buddy state machines, OpenCode Simulation UI,
-// OpenCodex Subagent Dispatch, and Hermes Tool-Round telemetry into a live visual studio.
+// AI Agent Office & Live Multi-Agent DAG Orchestration Engine for Apex Harness.
+// Reflects real backend DAG execution states (`Coordinator` -> parallel `Scout` || `Architect` -> `Builder` -> `Critic` -> `Verifier`),
+// assigned models, dependency edges, and live execution controls (Stop/Cancel/Pause/Resume/Approve),
+// while clearly distinguishing LIVE DAG EXECUTION from DEMO SIMULATION.
 
 (function () {
   const AGENT_DESKS = [
     {
       id: "Coordinator",
-      title: "Coordinator",
-      roleTag: "ORCHESTRATOR",
+      title: "Lead Coordinator",
+      roleTag: "main_planning",
       x: 17,
       y: 26,
       color: "#3b82f6",
-      defaultTask: "Ready to route tasks & plan checklist",
+      defaultTask: "Ready to decompose request & schedule 6-agent DAG",
       modelLabel: "Auto-Router",
     },
     {
       id: "Scout",
-      title: "Scout",
-      roleTag: "EXPLORER",
+      title: "Codebase Scout",
+      roleTag: "repo_exploration",
       x: 50,
       y: 26,
       color: "#06b6d4",
-      defaultTask: "Standby for file & symbol indexing",
+      defaultTask: "Standby for parallel file & AST symbol indexing",
       modelLabel: "Fast Indexer",
     },
     {
       id: "Architect",
-      title: "Architect",
-      roleTag: "DESIGN",
+      title: "System Architect",
+      roleTag: "architecture",
       x: 83,
       y: 26,
       color: "#8b5cf6",
-      defaultTask: "Standby for architecture & design",
-      modelLabel: "Deep Reasoner",
+      defaultTask: "Standby for parallel 4-lens EGM architecture review",
+      modelLabel: "4 Goldfish Lenses",
     },
     {
       id: "Critic",
-      title: "Risk Critic",
-      roleTag: "AUDITOR",
+      title: "EGM Critic",
+      roleTag: "code_review",
       x: 17,
       y: 74,
       color: "#f59e0b",
-      defaultTask: "Standby for edge-case & risk audit",
-      modelLabel: "Goldfish Lens",
+      defaultTask: "Standby for independent post-implementation review",
+      modelLabel: "Post-Impl Reviewer",
     },
     {
       id: "Builder",
-      title: "Builder",
-      roleTag: "ENGINEER",
+      title: "Code Builder",
+      roleTag: "backend_impl",
       x: 50,
       y: 74,
       color: "#10b981",
-      defaultTask: "Standby for edits & shell execution",
-      modelLabel: "Primary Coder",
+      defaultTask: "Standby for checkpointed edits, commands & PTC",
+      modelLabel: "Primary Engineer",
     },
     {
       id: "Verifier",
-      title: "Verifier",
-      roleTag: "JUDGE",
+      title: "Quality Verifier",
+      roleTag: "final_verification",
       x: 83,
       y: 74,
       color: "#22c55e",
-      defaultTask: "Standby for quality & test verification",
-      modelLabel: "Self-Judge Gate",
+      defaultTask: "Standby for test verification & CompletionEvidenceReport",
+      modelLabel: "Evidence Gate",
     },
   ];
 
   const OFFICE_LINKS = [
     ["Coordinator", "Scout"],
-    ["Coordinator", "Critic"],
-    ["Scout", "Architect"],
+    ["Coordinator", "Architect"],
     ["Scout", "Builder"],
     ["Architect", "Builder"],
-    ["Critic", "Builder"],
-    ["Builder", "Verifier"],
-    ["Architect", "Verifier"],
+    ["Builder", "Critic"],
+    ["Critic", "Verifier"],
   ];
 
   const officeState = {
     mode: "expanded", // "expanded" | "compact"
+    runOrigin: "standby", // "standby" | "live" | "demo"
+    executionId: null,
+    executionState: "idle",
+    pendingApproval: null,
     activeRole: null,
     completedRoles: new Set(),
     deskStatuses: {},
     packets: [],
     todos: [
-      { id: "t1", label: "Assign Lead Coordinator & specialist skills", status: "done" },
-      { id: "t2", label: "Scout workspace files & code symbols", status: "pending" },
-      { id: "t3", label: "Architect & Critic review edge cases", status: "pending" },
-      { id: "t4", label: "Builder executes tools & drafts solution", status: "pending" },
-      { id: "t5", label: "Verifier checks output quality", status: "pending" },
+      { id: "t1", label: "Coordinator: Classify domain & schedule 10-role DAG", status: "done" },
+      { id: "t2", label: "Scout || Architect: Parallel symbol scan & 4-lens EGM review", status: "pending" },
+      { id: "t3", label: "Builder: Execute checkpointed tools & synthesize code", status: "pending" },
+      { id: "t4", label: "Critic: Independent post-implementation EGM code review", status: "pending" },
+      { id: "t5", label: "Verifier: Assemble CompletionEvidenceReport & update EMA", status: "pending" },
     ],
     simTimer: null,
   };
 
   for (const d of AGENT_DESKS) {
     officeState.deskStatuses[d.id] = {
-      state: "idle", // "idle" | "working" | "done"
+      state: "idle", // "idle" | "working" | "done" | "error"
       taskText: d.defaultTask,
       modelLabel: d.modelLabel,
       updatedAt: 0,
@@ -132,9 +135,9 @@
     const mapRoleToIdx = {
       Coordinator: 0,
       Scout: 1,
-      Architect: 2,
-      Critic: 2,
-      Builder: 3,
+      Architect: 1,
+      Builder: 2,
+      Critic: 3,
       Verifier: 4,
     };
     const idx = mapRoleToIdx[role] ?? 0;
@@ -142,7 +145,7 @@
       if (i < idx) t.status = "done";
       else if (i === idx) {
         t.status = "working";
-        if (statusText && statusText.length < 68) {
+        if (statusText && statusText.length < 76) {
           t.liveDetail = statusText;
         }
       }
@@ -154,8 +157,63 @@
     }
   }
 
+  /**
+   * Synchronizes the Agent Office directly with the authoritative backend DAG execution state.
+   */
+  function syncExecutionDag(payload) {
+    if (!payload) return;
+    if (officeState.simTimer) {
+      clearInterval(officeState.simTimer);
+      officeState.simTimer = null;
+    }
+    officeState.runOrigin = "live";
+    officeState.executionId = payload.executionId || officeState.executionId;
+    officeState.executionState = payload.state || officeState.executionState;
+    officeState.pendingApproval = payload.pendingApproval || null;
+
+    if (Array.isArray(payload.subtasks)) {
+      for (const node of payload.subtasks) {
+        const desk = officeState.deskStatuses[node.role];
+        if (!desk) continue;
+        const mappedState =
+          node.state === "running" || node.state === "planning"
+            ? "working"
+            : node.state === "completed"
+              ? "done"
+              : node.state === "failed" || node.state === "cancelled"
+                ? "error"
+                : "idle";
+        desk.state = mappedState;
+        desk.modelLabel = (node.actualModelUsed || node.assignedModelId || node.engineeringRole || "")
+          .replace(/^agy-acp\//, "")
+          .slice(0, 26);
+        desk.taskText = node.outputSummary || node.assignedTask || desk.taskText;
+      }
+
+      officeState.todos = payload.subtasks.map((node) => ({
+        id: node.id,
+        label: `${node.role} (${node.engineeringRole}): ${node.assignedTask.slice(0, 56)}`,
+        status:
+          node.state === "completed"
+            ? "done"
+            : node.state === "running"
+              ? "working"
+              : "pending",
+        liveDetail: node.outputSummary ? node.outputSummary.slice(0, 68) : undefined,
+      }));
+    }
+
+    renderAgentOffice();
+  }
+
   function notifyAgentOfficeEvent(payload) {
     if (!payload) return;
+    if (payload.mode === "live") {
+      officeState.runOrigin = "live";
+    }
+    if (payload.executionId) {
+      officeState.executionId = payload.executionId;
+    }
     const role = payload.activeRole || "Coordinator";
     const prevRole = officeState.activeRole || "Coordinator";
     const desk = getDeskCoords(role);
@@ -168,28 +226,27 @@
       spawnPacket(prevRole, role, desk.color);
     } else if (role === "Scout") {
       spawnPacket("Coordinator", "Scout", "#06b6d4");
+      spawnPacket("Coordinator", "Architect", "#8b5cf6");
     } else if (role === "Architect") {
-      spawnPacket("Scout", "Architect", "#8b5cf6");
-      spawnPacket("Coordinator", "Critic", "#f59e0b");
+      spawnPacket("Coordinator", "Architect", "#8b5cf6");
     } else if (role === "Builder") {
+      spawnPacket("Scout", "Builder", "#10b981");
       spawnPacket("Architect", "Builder", "#10b981");
+    } else if (role === "Critic") {
+      spawnPacket("Builder", "Critic", "#f59e0b");
     } else if (role === "Verifier") {
-      spawnPacket("Builder", "Verifier", "#22c55e");
+      spawnPacket("Critic", "Verifier", "#22c55e");
     }
 
     officeState.activeRole = role;
     if (officeState.deskStatuses[role]) {
-      officeState.deskStatuses[role].state = payload.status === "done" && role === "Verifier" ? "done" : "working";
+      officeState.deskStatuses[role].state =
+        payload.status === "done" && role === "Verifier" ? "done" : "working";
       officeState.deskStatuses[role].taskText = payload.statusText || desk.defaultTask;
       if (payload.detail && payload.detail.length < 40) {
         officeState.deskStatuses[role].modelLabel = payload.detail;
       }
       officeState.deskStatuses[role].updatedAt = Date.now();
-    }
-
-    if (role === "Architect") {
-      officeState.deskStatuses["Critic"].state = "working";
-      officeState.deskStatuses["Critic"].taskText = "Auditing edge cases, risks & code quality";
     }
 
     if (role === "Verifier" && payload.status === "done") {
@@ -205,8 +262,10 @@
     renderAgentOffice();
   }
 
-  function resetOfficeForNewTurn(promptPreview) {
+  function resetOfficeForNewTurn(promptPreview, isDemo) {
     officeState.completedRoles.clear();
+    officeState.runOrigin = isDemo ? "demo" : "live";
+    officeState.executionState = "running";
     officeState.activeRole = "Coordinator";
     officeState.packets = [];
     for (const d of AGENT_DESKS) {
@@ -221,11 +280,11 @@
       };
     }
     officeState.todos = [
-      { id: "t1", label: "Coordinator: Select best model & specialist skills", status: "working" },
-      { id: "t2", label: "Scout: Scan project files & code symbols", status: "pending" },
-      { id: "t3", label: "Architect & Critic: Audit architecture & risks", status: "pending" },
-      { id: "t4", label: "Builder: Execute tools & synthesize solution", status: "pending" },
-      { id: "t5", label: "Verifier: Run quality & completeness check", status: "pending" },
+      { id: "t1", label: "Coordinator: Classify domain & schedule 10-role DAG", status: "working" },
+      { id: "t2", label: "Scout || Architect: Parallel symbol scan & 4-lens EGM review", status: "pending" },
+      { id: "t3", label: "Builder: Execute checkpointed tools & synthesize code", status: "pending" },
+      { id: "t4", label: "Critic: Independent post-implementation EGM code review", status: "pending" },
+      { id: "t5", label: "Verifier: Assemble CompletionEvidenceReport & update EMA", status: "pending" },
     ];
     renderAgentOffice();
   }
@@ -235,42 +294,48 @@
       clearInterval(officeState.simTimer);
       officeState.simTimer = null;
     }
-    resetOfficeForNewTurn("Simulated multi-agent codebase orchestration");
+    resetOfficeForNewTurn("Demo walkthrough of 6-agent DAG pipeline", true);
     const steps = [
       {
+        mode: "demo",
         activeRole: "Coordinator",
-        statusText: "Assigned Gemini 4 Argon High + 4 specialist skills",
+        statusText: "[DEMO] Assigned Gemini 4 Argon High + 10-role DAG",
         detail: "Gemini 4 Argon",
         status: "running",
       },
       {
+        mode: "demo",
         activeRole: "Scout",
-        statusText: "Scanning workspace files & indexing symbols",
-        detail: "Fast Indexer",
+        statusText: "[DEMO] Parallel layer: Scanning workspace files & AST symbols",
+        detail: "Gemini 3 Flash",
         status: "running",
       },
       {
+        mode: "demo",
         activeRole: "Architect",
-        statusText: "4 Specialist Agents reviewing architecture & risk boundaries",
-        detail: "4 Goldfish Lenses",
+        statusText: "[DEMO] Parallel layer: 4 Goldfish lenses auditing architecture",
+        detail: "Claude Opus 4.6",
         status: "running",
       },
       {
-        activeRole: "Critic",
-        statusText: "Checking for mock data, missing edge cases & loop safety",
-        detail: "Risk Auditor",
-        status: "running",
-      },
-      {
+        mode: "demo",
         activeRole: "Builder",
-        statusText: "Reading source files, running tools & drafting solution",
-        detail: "ReAct Tool Loop",
+        statusText: "[DEMO] Executing checkpointed edits & managed commands",
+        detail: "Codex GPT-5.4",
         status: "running",
       },
       {
+        mode: "demo",
+        activeRole: "Critic",
+        statusText: "[DEMO] Independent post-implementation EGM review: APPROVE",
+        detail: "Claude Opus 4.6",
+        status: "running",
+      },
+      {
+        mode: "demo",
         activeRole: "Verifier",
-        statusText: "Verifier Agent approved response (Quality 100%)",
-        detail: "PASS (1.0)",
+        statusText: "[DEMO] CompletionEvidenceReport: IMPLEMENTED_AND_VERIFIED",
+        detail: "PASS (100%)",
         status: "done",
       },
     ];
@@ -281,10 +346,12 @@
       if (i >= steps.length) {
         clearInterval(officeState.simTimer);
         officeState.simTimer = null;
+        officeState.executionState = "completed";
+        renderAgentOffice();
         return;
       }
       notifyAgentOfficeEvent(steps[i]);
-    }, 950);
+    }, 900);
   }
 
   function toggleOfficeMode() {
@@ -296,18 +363,54 @@
     const mount = document.getElementById("agent-office-mount");
     if (!mount) return;
 
-    const workingCount = Object.values(officeState.deskStatuses).filter((s) => s.state === "working").length;
-    const doneCount = Object.values(officeState.deskStatuses).filter((s) => s.state === "done").length;
+    const workingCount = Object.values(officeState.deskStatuses).filter(
+      (s) => s.state === "working",
+    ).length;
+    const doneCount = Object.values(officeState.deskStatuses).filter(
+      (s) => s.state === "done",
+    ).length;
+
+    const originBadgeText =
+      officeState.runOrigin === "demo"
+        ? "AI AGENT OFFICE · DEMO SIMULATION"
+        : officeState.runOrigin === "live"
+          ? `AI AGENT OFFICE · LIVE DAG (${(officeState.executionState || "READY").toUpperCase()})`
+          : "AI AGENT OFFICE · 6-AGENT DAG READY";
+
+    const isLiveActive =
+      officeState.runOrigin === "live" &&
+      (officeState.executionState === "running" ||
+        officeState.executionState === "planning" ||
+        officeState.executionState === "paused" ||
+        officeState.executionState === "waiting_for_approval");
+
+    const liveControlsHtml = isLiveActive
+      ? `
+        ${
+          officeState.executionState === "paused"
+            ? `<button class="btn-ghost" onclick="window.resumeActiveExecution && window.resumeActiveExecution()">Resume DAG</button>`
+            : `<button class="btn-ghost" onclick="window.pauseActiveExecution && window.pauseActiveExecution()">Pause</button>`
+        }
+        <button class="btn-danger-sm" onclick="window.cancelActiveExecution && window.cancelActiveExecution()">Stop / Cancel</button>
+      `
+      : "";
 
     if (officeState.mode === "compact") {
       const pills = AGENT_DESKS.map((d) => {
         const st = officeState.deskStatuses[d.id];
-        const cls = st.state === "working" ? "working" : st.state === "done" ? "done" : "idle";
+        const cls =
+          st.state === "working"
+            ? "working"
+            : st.state === "done"
+              ? "done"
+              : st.state === "error"
+                ? "error"
+                : "idle";
         return `
           <div class="office-mini-pill ${cls}" title="${escapeHtml(st.taskText)}">
             <span class="office-mini-dot" style="background:${st.state === "idle" ? "#525866" : d.color}"></span>
             <span class="office-mini-name">${escapeHtml(d.id)}</span>
-            <span class="office-mini-state">${st.state === "working" ? "ACTIVE" : st.state === "done" ? "DONE" : "IDLE"}</span>
+            <span class="office-mini-state">${st.state === "working" ? "ACTIVE" : st.state === "done" ? "DONE" : st.state === "error" ? "ABORT" : "IDLE"}</span>
           </div>
         `;
       }).join("");
@@ -315,11 +418,12 @@
       mount.innerHTML = `
         <div class="office-bar-compact">
           <div class="office-bar-left">
-            <span class="office-badge-live ${workingCount > 0 ? "pulse" : ""}">AI AGENT OFFICE</span>
+            <span class="office-badge-live ${workingCount > 0 ? "pulse" : ""}">${escapeHtml(originBadgeText)}</span>
             <div class="office-mini-strip">${pills}</div>
           </div>
           <div class="office-bar-actions">
-            <button class="btn-ghost" onclick="window.ApexAgentOffice.runDemo()">Simulate Run</button>
+            ${liveControlsHtml}
+            <button class="btn-ghost" onclick="window.ApexAgentOffice.runDemo()">Preview Demo</button>
             <button class="btn-ghost" onclick="window.ApexAgentOffice.toggleMode()">Expand Floorplan</button>
           </div>
         </div>
@@ -327,14 +431,14 @@
       return;
     }
 
-    // Build SVG connections & animated packets
     const svgLines = OFFICE_LINKS.map(([fromId, toId]) => {
       const a = getDeskCoords(fromId);
       const b = getDeskCoords(toId);
       const fromSt = officeState.deskStatuses[fromId]?.state;
       const toSt = officeState.deskStatuses[toId]?.state;
       const isHot =
-        (fromSt === "working" || fromSt === "done") && (toSt === "working" || toSt === "done");
+        (fromSt === "working" || fromSt === "done") &&
+        (toSt === "working" || toSt === "done");
       return `
         <line
           x1="${a.x}" y1="${a.y}"
@@ -366,8 +470,22 @@
 
     const deskNodes = AGENT_DESKS.map((d) => {
       const st = officeState.deskStatuses[d.id];
-      const stateCls = st.state === "working" ? "working" : st.state === "done" ? "done" : "idle";
-      const badgeLabel = st.state === "working" ? "WORKING" : st.state === "done" ? "DONE" : "STANDBY";
+      const stateCls =
+        st.state === "working"
+          ? "working"
+          : st.state === "done"
+            ? "done"
+            : st.state === "error"
+              ? "error"
+              : "idle";
+      const badgeLabel =
+        st.state === "working"
+          ? "WORKING"
+          : st.state === "done"
+            ? "DONE"
+            : st.state === "error"
+              ? "STOPPED"
+              : "STANDBY";
       return `
         <div
           class="office-desk-card ${stateCls}"
@@ -407,19 +525,20 @@
       <div class="office-stage">
         <div class="office-stage-header">
           <div class="office-stage-title-row">
-            <span class="office-badge-live ${workingCount > 0 ? "pulse" : ""}">AI AGENT OFFICE · LIVE ORCHESTRATION</span>
+            <span class="office-badge-live ${workingCount > 0 ? "pulse" : ""}">${escapeHtml(originBadgeText)}</span>
             <span class="office-stage-summary">
               ${
                 workingCount > 0
-                  ? `${workingCount} agent(s) actively working · ${doneCount} completed`
+                  ? `${workingCount} agent(s) executing DAG · ${doneCount} completed`
                   : doneCount > 0
-                    ? `All 6 specialist agents ready (${doneCount} completed last run)`
-                    : "6 specialist agents standing by at their workstations"
+                    ? `6-agent DAG ready (${doneCount}/6 completed in last ${officeState.runOrigin === "demo" ? "demo" : "live"} run)`
+                    : "6 specialist agents standing by (Coordinator -> parallel Scout || Architect -> Builder -> Critic -> Verifier)"
               }
             </span>
           </div>
           <div class="office-bar-actions">
-            <button class="btn-ghost" onclick="window.ApexAgentOffice.runDemo()">Simulate Agent Swarm</button>
+            ${liveControlsHtml}
+            <button class="btn-ghost" onclick="window.ApexAgentOffice.runDemo()">Preview Demo Swarm</button>
             <button class="btn-ghost" onclick="window.ApexAgentOffice.toggleMode()">Minimize Office</button>
           </div>
         </div>
@@ -432,7 +551,7 @@
             ${deskNodes}
           </div>
           <div class="office-taskboard">
-            <div class="office-taskboard-header">LIVE EXECUTION CHECKLIST</div>
+            <div class="office-taskboard-header">DAG EXECUTION PIPELINE</div>
             <div class="office-taskboard-list">${todoRows}</div>
           </div>
         </div>
@@ -442,6 +561,7 @@
 
   window.ApexAgentOffice = {
     notifyEvent: notifyAgentOfficeEvent,
+    syncExecutionDag,
     resetForTurn: resetOfficeForNewTurn,
     runDemo: runDemoSimulation,
     toggleMode: toggleOfficeMode,
