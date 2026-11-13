@@ -1,0 +1,940 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Apex</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="/agent-office.js"></script>
+</head>
+<body>
+  <!-- Compact Precision Topbar -->
+  <header class="titlebar">
+    <div class="titlebar-left">
+      <div class="brand-logo">
+        <span class="brand-mark">A</span>
+        <span>Apex</span>
+      </div>
+      <nav class="titlebar-menu">
+        <button class="brutal-tab-btn active" data-top-tab="egm" onclick="switchInspectorTab('egm')">Boardroom</button>
+        <button class="brutal-tab-btn" data-top-tab="router" onclick="switchInspectorTab('router')">Router</button>
+        <button class="brutal-tab-btn" data-top-tab="skills" onclick="switchInspectorTab('skills')">Skills</button>
+        <button class="brutal-tab-btn" data-top-tab="harness2" onclick="switchInspectorTab('harness2')">Harness²</button>
+        <button class="brutal-tab-btn" data-top-tab="scoreboard" onclick="switchInspectorTab('scoreboard')">Scores</button>
+      </nav>
+    </div>
+
+    <div class="titlebar-center">
+      <span class="proj-crumb" id="top-project-name">apex-harness</span>
+      <span>/</span>
+      <span class="conv-crumb" id="top-conv-title">Workspace</span>
+    </div>
+
+    <div class="titlebar-right">
+      <div class="status-pill" title="Standalone runtime · EGM 3-Desk Boardroom · Carbon Clean-Room active">
+        <span class="status-dot"></span>
+        <span id="fleet-pill-text">19 models · 110 skills</span>
+      </div>
+      <button class="brutal-tab-btn" id="toggle-inspector-btn" onclick="toggleInspector()" title="Toggle Inspector">
+        Inspector
+      </button>
+    </div>
+  </header>
+
+  <!-- 3-Column Desktop Shell -->
+  <div class="workspace-shell">
+    <!-- Left Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-top">
+        <button class="new-conv-btn" id="newChatBtn" onclick="createNewConversation('independent', true)" title="Start a standalone chat not tied to any folder">
+          <span>New Independent Chat</span>
+          <span class="new-conv-shortcut">+</span>
+        </button>
+        <button class="new-conv-btn" style="margin-bottom:8px;background:transparent" onclick="createNewConversation(state.activeProjectId || 'proj-apex-harness', true)" title="Start a new thread in the selected project folder">
+          <span>New Project Thread</span>
+          <span class="new-conv-shortcut">+</span>
+        </button>
+        <button class="nav-item" onclick="window.ApexAgentOffice && window.ApexAgentOffice.runDemo()">
+          <span>AI Agent Office</span>
+          <span class="nav-badge">6 agents</span>
+        </button>
+        <button class="nav-item" onclick="switchInspectorTab('egm')">
+          <span>Specialist Boardroom</span>
+          <span class="nav-badge">4 lenses</span>
+        </button>
+        <button class="nav-item" onclick="switchInspectorTab('harness2')">
+          <span>Harness² surfaces</span>
+          <span class="nav-badge" id="nav-h2-badge">c1..c8</span>
+        </button>
+        <button class="nav-item" onclick="switchInspectorTab('skills')">
+          <span>Skill transpiler</span>
+          <span class="nav-badge" id="nav-skills-badge">112</span>
+        </button>
+        <button class="nav-item" onclick="switchInspectorTab('scoreboard')">
+          <span>Model scoreboard</span>
+          <span class="nav-badge" id="nav-models-badge">19</span>
+        </button>
+      </div>
+
+      <div class="sidebar-section-header">
+        <span>Chats & Workspaces</span>
+        <button class="brutal-tab-btn" style="padding:1px 6px;font-size:11px" onclick="promptAddProject()" title="Add workspace folder">+</button>
+      </div>
+
+      <div class="sidebar-scroll" id="projects-tree"></div>
+    </aside>
+
+    <!-- Center Conversation Stage -->
+    <main class="center-stage">
+      <!-- Live AI Agent Office & Multi-Agent Orchestration Simulation -->
+      <div id="agent-office-mount"></div>
+
+      <div class="chat-scroll" id="chat-scroll">
+        <div class="chat-container" id="chat-messages"></div>
+      </div>
+
+      <!-- Quiet Precision Composer -->
+      <div class="composer-wrap">
+        <div class="quick-prompts">
+          <button class="quick-chip" onclick="insertPrompt('Run an Elephant-Goldfish (EGM) Boardroom audit on this workspace and list concrete improvements.')">Boardroom audit</button>
+          <button class="quick-chip" onclick="insertPrompt('Inspect the files in this project and complete all remaining features end-to-end.')">Complete project</button>
+          <button class="quick-chip" onclick="insertPrompt('Audit this codebase for bugs, edge cases, and security boundaries.')">Codebase review</button>
+          <button class="quick-chip" onclick="insertPrompt('Verify build and test commands across this repository.')">Verify tests</button>
+        </div>
+
+        <div class="composer-box">
+          <textarea
+            id="prompt-input"
+            class="composer-textarea"
+            placeholder="Ask anything, reference @files, or run /boardroom..."
+            rows="2"
+          ></textarea>
+
+          <div class="composer-toolbar">
+            <div class="composer-left-controls">
+              <button class="brutal-tab-btn" onclick="promptAddProject()" title="Add workspace folder">+ Folder</button>
+              <select id="model-picker" class="picker-select" title="Select model or Auto-Orchestrate">
+                <option value="auto">Auto-Orchestrate (EMA + EGM)</option>
+              </select>
+              <select id="effort-picker" class="picker-select" title="Reasoning effort">
+                <option value="high">Effort: High</option>
+                <option value="medium">Effort: Medium</option>
+                <option value="low">Effort: Low</option>
+              </select>
+            </div>
+
+            <div class="composer-right-controls">
+              <select id="mode-picker" class="picker-select" title="Execution permission mode">
+                <option value="turbo">Mode: Turbo</option>
+                <option value="auto_edit">Mode: Auto-edit</option>
+                <option value="ask">Mode: Ask first</option>
+              </select>
+              <button class="send-btn" id="send-btn" onclick="sendChatTurn()" title="Send message (Enter)">
+                <span>Send</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Right Inspector Panel -->
+    <aside class="inspector" id="inspector-drawer">
+      <div class="inspector-tabs">
+        <button class="inspector-tab active" data-tab="egm" onclick="switchInspectorTab('egm')">Boardroom</button>
+        <button class="inspector-tab" data-tab="router" onclick="switchInspectorTab('router')">Router</button>
+        <button class="inspector-tab" data-tab="skills" onclick="switchInspectorTab('skills')">Skills</button>
+        <button class="inspector-tab" data-tab="harness2" onclick="switchInspectorTab('harness2')">c1..c8</button>
+        <button class="inspector-tab" data-tab="scoreboard" onclick="switchInspectorTab('scoreboard')">Scores</button>
+      </div>
+
+      <div class="inspector-body" id="inspector-content"></div>
+    </aside>
+  </div>
+
+  <script>
+    const state = {
+      projects: [],
+      conversations: [],
+      models: [],
+      skills: [],
+      mcpServers: [],
+      harness2: null,
+      activeProjectId: null,
+      activeConversationId: null,
+      inspectorTab: "egm",
+      lastPlan: null,
+      lastEgmBrief: null,
+      skillSearchQuery: "",
+      selectedTranspileDriver: "antigravity",
+      transpiledPreview: "",
+      activeSurfaceFile: "systemprompt.md",
+      streaming: false,
+    };
+
+    function escapeHtml(str) {
+      return String(str ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function renderMarkdown(md) {
+      let html = escapeHtml(md);
+      html = html.replace(/```([a-zA-Z0-9_-]*)\r?\n([\s\S]*?)```/g, (_m, _lang, code) => {
+        return `<pre><code>${code}</code></pre>`;
+      });
+      html = html.replace(/((?:^\|.+\|\r?\n)+)/gm, (block) => {
+        const rows = block.trim().split(/\r?\n/).filter((r) => !/^\|\s*[:\-| ]+\|\s*$/.test(r));
+        if (rows.length === 0) return block;
+        const trs = rows.map((row, idx) => {
+          const cells = row.replace(/^\||\|$/g, "").split("|").map((c) => c.trim());
+          const tag = idx === 0 ? "th" : "td";
+          return `<tr>${cells.map((c) => `<${tag}>${c}</${tag}>`).join("")}</tr>`;
+        }).join("");
+        return `<table class="md-table">${trs}</table>`;
+      });
+      html = html.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+      html = html.replace(/^####\s+(.+)$/gm, "<h4>$1</h4>");
+      html = html.replace(/^###\s+(.+)$/gm, "<h3>$1</h3>");
+      html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      html = html.replace(/\*([^*]+)\*/g, "<em>$1</em>");
+      html = html.replace(/^- (.+)$/gm, "<li>$1</li>");
+      html = html.replace(/(<li>[\s\S]*?<\/li>)/g, "<ul>$1</ul>");
+      html = html.replace(/<\/ul>\s*<ul>/g, "");
+      html = html.replace(/\n\n+/g, "</p><p>");
+      return `<p>${html}</p>`;
+    }
+
+    async function loadBootstrap() {
+      const res = await fetch("/api/bootstrap");
+      const data = await res.json();
+      state.projects = data.projects || [];
+      state.conversations = data.conversations || [];
+      state.models = data.models || [];
+      state.skills = data.skills || [];
+      state.mcpServers = data.mcpServers || [];
+      state.harness2 = data.harness2 || null;
+      state.deepseekRuntime = data.deepseekRuntime || null;
+
+      if (!state.activeConversationId && state.conversations.length > 0) {
+        state.activeConversationId = state.conversations[0].id;
+        state.activeProjectId = state.conversations[0].projectId;
+      } else if (!state.activeProjectId && state.projects.length > 0) {
+        state.activeProjectId = state.projects[0].id;
+      }
+
+      document.getElementById("fleet-pill-text").textContent =
+        `${state.models.length} models · ${state.skills.length} skills`;
+      document.getElementById("nav-skills-badge").textContent = String(state.skills.length);
+      document.getElementById("nav-models-badge").textContent = String(state.models.length);
+
+      populateModelPicker();
+      renderSidebar();
+      renderChat();
+      renderInspector();
+      if (window.ApexAgentOffice) {
+        window.ApexAgentOffice.render();
+      }
+    }
+
+    function populateModelPicker() {
+      const picker = document.getElementById("model-picker");
+      const currentVal = picker.value || "auto";
+      picker.innerHTML = `<option value="auto">Auto-Orchestrate (EMA + EGM)</option>`;
+      for (const m of state.models) {
+        const opt = document.createElement("option");
+        opt.value = m.id;
+        const badge = m.strictFirewall ? "clean-room" : `EMA ${m.emaScore}`;
+        opt.textContent = `${m.displayName} (${badge})`;
+        picker.appendChild(opt);
+      }
+      picker.value = currentVal;
+    }
+
+    function renderSidebar() {
+      const container = document.getElementById("projects-tree");
+      container.innerHTML = "";
+
+      for (const proj of state.projects) {
+        const projThreads = state.conversations.filter((c) => c.projectId === proj.id);
+        const group = document.createElement("div");
+        group.className = "project-group";
+
+        const header = document.createElement("div");
+        header.className = `project-header ${proj.id === state.activeProjectId ? "active" : ""}`;
+        const iconChar = proj.id === "independent" ? "✦" : "/";
+        header.innerHTML = `
+          <div class="project-name-wrap" title="${escapeHtml(proj.id === 'independent' ? 'General Chats (No repository bound)' : proj.path)}">
+            <span class="folder-glyph">${iconChar}</span>
+            <span>${escapeHtml(proj.name)}</span>
+          </div>
+          <span class="nav-badge" title="New conversation in ${escapeHtml(proj.name)}">+</span>
+        `;
+        header.onclick = () => createNewConversation(proj.id, false);
+        group.appendChild(header);
+
+        if (projThreads.length > 0) {
+          const list = document.createElement("div");
+          list.className = "project-threads";
+          for (const t of projThreads) {
+            const item = document.createElement("div");
+            item.className = `thread-item ${t.id === state.activeConversationId ? "active" : ""}`;
+            item.innerHTML = `
+              <span class="thread-title" title="${escapeHtml(t.title)}">${escapeHtml(t.title)}</span>
+              <div class="thread-right-actions">
+                <span class="thread-time">${t.messages?.length || 0}</span>
+                <button class="thread-del-btn" title="Delete conversation" onclick="deleteConversation('${escapeHtml(t.id)}', event)">×</button>
+              </div>
+            `;
+            item.onclick = (e) => {
+              e.stopPropagation();
+              state.activeConversationId = t.id;
+              state.activeProjectId = proj.id;
+              document.getElementById("model-picker").value = t.selectedModelId || "auto";
+              document.getElementById("effort-picker").value = t.effort || "high";
+              document.getElementById("mode-picker").value = t.mode || "turbo";
+              renderSidebar();
+              renderChat();
+            };
+            list.appendChild(item);
+          }
+          group.appendChild(list);
+        }
+        container.appendChild(group);
+      }
+    }
+
+    function getActiveConversation() {
+      return state.conversations.find((c) => c.id === state.activeConversationId);
+    }
+
+    function renderStepsHtml(steps, durationMs) {
+      if (!steps || steps.length === 0) return "";
+      const sec = ((durationMs || 650) / 1000).toFixed(1);
+      const rows = steps
+        .map((s) => {
+          const statusCls = s.status === "running" ? "running" : "";
+          const symbol = s.status === "running" ? "…" : s.status === "error" ? "×" : "✓";
+          const dur = s.durationMs ? `${s.durationMs}ms` : "";
+          const roleBadge = s.agentRole
+            ? `<span class="step-role-pill">${escapeHtml(s.agentRole)}</span>`
+            : "";
+          const hasPreview = Boolean(s.outputPreview);
+          return `
+            <div class="step-line ${hasPreview ? "clickable" : ""}" ${hasPreview ? `onclick="this.classList.toggle('expanded')"` : ""}>
+              <div class="step-line-row">
+                <div class="step-line-left">
+                  <span class="step-status-icon ${statusCls}">${symbol}</span>
+                  ${roleBadge}
+                  <span class="step-label-text">${escapeHtml(s.label)}</span>
+                  ${s.detail ? `<span class="step-detail">· ${escapeHtml(s.detail)}</span>` : ""}
+                </div>
+                <span class="step-dur">${hasPreview ? "inspect · " : ""}${dur}</span>
+              </div>
+              ${hasPreview ? `<div class="step-preview-box">${escapeHtml(s.outputPreview)}</div>` : ""}
+            </div>
+          `;
+        })
+        .join("");
+
+      return `
+        <div class="steps-box">
+          <div class="steps-header" onclick="this.nextElementSibling.classList.toggle('collapsed')">
+            <span>Agent Orchestration Trace · ${steps.length} steps (${sec}s)</span>
+            <span>Click any step to inspect</span>
+          </div>
+          <div class="steps-list">${rows}</div>
+        </div>
+      `;
+    }
+
+    function renderChat() {
+      const conv = getActiveConversation();
+      const proj = state.projects.find((p) => p.id === (conv?.projectId || state.activeProjectId));
+      document.getElementById("top-project-name").textContent = proj ? proj.name : "General Chats";
+      document.getElementById("top-conv-title").textContent = conv ? conv.title : "New thread";
+
+      const container = document.getElementById("chat-messages");
+      container.innerHTML = "";
+
+      if (!conv || conv.messages.length === 0) {
+        const isInd = !proj || proj.id === "independent";
+        container.innerHTML = `
+          <div class="empty-hero">
+            <h2>${escapeHtml(isInd ? "Independent General Chat" : proj.name)}</h2>
+            <p>${escapeHtml(isInd ? "Standalone conversation — ask anything, brainstorm, or write code without binding to a specific repository." : `${proj.path} — 6 Specialist Agents (Coordinator, Scout, Architect, Builder, Critic, Verifier) ready.`)}</p>
+          </div>
+        `;
+        return;
+      }
+
+      for (const msg of conv.messages) {
+        if (msg.role === "user") {
+          const row = document.createElement("div");
+          row.className = "msg-row user";
+          row.innerHTML = `<div class="msg-user-bubble">${escapeHtml(msg.content)}</div>`;
+          container.appendChild(row);
+        } else {
+          const row = document.createElement("div");
+          row.className = "msg-row assistant";
+          const judgeBadge = msg.judgeVerdict
+            ? `<span class="meta-tag ${msg.judgeVerdict.passed ? "pass" : "warn"}">verified: ${msg.judgeVerdict.passed ? "pass" : "review"} (${(msg.judgeVerdict.score * 100).toFixed(0)}%)</span>`
+            : "";
+          const revertBtn = msg.checkpointId
+            ? msg.reverted
+              ? `<span class="meta-tag warn">edits reverted</span>`
+              : `<button class="btn-ghost" style="height:20px;padding:0 7px;font-size:11px" onclick="revertTurnEdits('${escapeHtml(msg.checkpointId)}','${escapeHtml(msg.id)}')">Undo edits</button>`
+            : "";
+          row.innerHTML = `
+            <div class="msg-assistant-card">
+              ${renderStepsHtml(msg.steps, msg.durationMs)}
+              <div class="msg-content">${renderMarkdown(msg.content)}</div>
+              <div class="msg-meta-bar">
+                ${msg.modelDisplayName ? `<span class="meta-tag">${escapeHtml(msg.modelDisplayName)}</span>` : ""}
+                ${msg.domain ? `<span class="meta-tag">${escapeHtml(msg.domain.replace(/_/g, " "))}</span>` : ""}
+                ${judgeBadge}
+                ${revertBtn}
+              </div>
+            </div>
+          `;
+          container.appendChild(row);
+        }
+      }
+
+      const scrollEl = document.getElementById("chat-scroll");
+      scrollEl.scrollTop = scrollEl.scrollHeight;
+    }
+
+    async function createNewConversation(projectId, forceNew) {
+      const targetProjId = projectId || state.activeProjectId || "independent";
+      const res = await fetch("/api/conversations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: targetProjId,
+          forceNew: Boolean(forceNew),
+          selectedModelId: document.getElementById("model-picker").value,
+          effort: document.getElementById("effort-picker").value,
+          mode: document.getElementById("mode-picker").value,
+        }),
+      });
+      const data = await res.json();
+      if (data.conversations) {
+        state.conversations = data.conversations;
+      } else if (data.thread) {
+        state.conversations.unshift(data.thread);
+      }
+      if (data.thread) {
+        state.activeConversationId = data.thread.id;
+        state.activeProjectId = data.thread.projectId;
+        renderSidebar();
+        renderChat();
+      }
+    }
+
+    async function deleteConversation(convId, event) {
+      if (event) event.stopPropagation();
+      const res = await fetch(`/api/conversations/${encodeURIComponent(convId)}`, {
+        method: "DELETE",
+      });
+      const data = await res.json();
+      if (data.conversations) {
+        state.conversations = data.conversations;
+      } else {
+        state.conversations = state.conversations.filter((c) => c.id !== convId);
+      }
+      if (state.activeConversationId === convId) {
+        const next = state.conversations.find((c) => c.projectId === state.activeProjectId) || state.conversations[0];
+        state.activeConversationId = next ? next.id : null;
+        if (next) state.activeProjectId = next.projectId;
+      }
+      renderSidebar();
+      renderChat();
+    }
+
+    async function promptAddProject() {
+      const folderPath = prompt("Enter the full folder path of the project workspace:", "./my-project");
+      if (!folderPath) return;
+      const res = await fetch("/api/projects", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: folderPath }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        alert(data.error);
+        return;
+      }
+      state.projects = data.projects;
+      await createNewConversation(data.project.id);
+    }
+
+    function insertPrompt(text) {
+      const input = document.getElementById("prompt-input");
+      input.value = text;
+      input.focus();
+    }
+
+    async function revertTurnEdits(checkpointId, messageId) {
+      const conv = getActiveConversation();
+      const res = await fetch("/api/turn/revert", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          checkpointId,
+          conversationId: conv?.id,
+          messageId,
+        }),
+      });
+      const data = await res.json();
+      if (data.ok && conv) {
+        const msg = conv.messages.find((m) => m.id === messageId);
+        if (msg) msg.reverted = true;
+        renderChat();
+      } else {
+        alert(data.error || "Failed to revert checkpoint");
+      }
+    }
+
+    async function runStandaloneEgmShootdown() {
+      const conv = getActiveConversation();
+      const projId = conv?.projectId || state.activeProjectId;
+      const res = await fetch("/api/egm/boardroom", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: "Perform a full Desk 1 + Desk 2 + Desk 3 Elephant-Goldfish Boardroom audit on this workspace",
+          projectId: projId,
+          fastMode: false,
+        }),
+      });
+      const data = await res.json();
+      if (data.brief) {
+        state.lastEgmBrief = data.brief;
+        switchInspectorTab("egm");
+      }
+    }
+
+    async function sendChatTurn() {
+      if (state.streaming) return;
+      const input = document.getElementById("prompt-input");
+      const promptText = input.value.trim();
+      if (!promptText) return;
+
+      let conv = getActiveConversation();
+      if (!conv) {
+        await createNewConversation();
+        conv = getActiveConversation();
+      }
+
+      input.value = "";
+      state.streaming = true;
+      if (window.ApexAgentOffice) {
+        window.ApexAgentOffice.resetForTurn(promptText);
+      }
+
+      conv.messages.push({
+        id: `user-${Date.now()}`,
+        role: "user",
+        content: promptText,
+        createdAt: new Date().toISOString(),
+      });
+
+      const liveAssistantMsg = {
+        id: `asst-${Date.now()}`,
+        role: "assistant",
+        content: "",
+        createdAt: new Date().toISOString(),
+        steps: [],
+        durationMs: 1000,
+      };
+      conv.messages.push(liveAssistantMsg);
+      renderChat();
+
+      try {
+        const response = await fetch("/api/chat/stream", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            conversationId: conv.id,
+            prompt: promptText,
+            selectedModelId: document.getElementById("model-picker").value,
+            effort: document.getElementById("effort-picker").value,
+            mode: document.getElementById("mode-picker").value,
+          }),
+        });
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const frames = buffer.split("\n\n");
+          buffer = frames.pop() || "";
+
+          for (const frame of frames) {
+            const eventMatch = /^event:\s*(.+)$/m.exec(frame);
+            const dataMatch = /^data:\s*(.+)$/m.exec(frame);
+            if (!eventMatch || !dataMatch) continue;
+            const eventName = eventMatch[1].trim();
+            const payload = JSON.parse(dataMatch[1]);
+
+            if (eventName === "plan") {
+              state.lastPlan = payload;
+              liveAssistantMsg.modelDisplayName = payload.primaryModel?.displayName;
+              liveAssistantMsg.domain = payload.classification?.primaryDomain;
+              renderInspector();
+            } else if (eventName === "egm") {
+              state.lastEgmBrief = payload;
+              renderInspector();
+            } else if (eventName === "office") {
+              if (window.ApexAgentOffice) {
+                window.ApexAgentOffice.notifyEvent(payload);
+              }
+            } else if (eventName === "step") {
+              const idx = liveAssistantMsg.steps.findIndex((s) => s.id === payload.id);
+              if (idx >= 0) liveAssistantMsg.steps[idx] = payload;
+              else liveAssistantMsg.steps.push(payload);
+              if (window.ApexAgentOffice && payload.agentRole) {
+                window.ApexAgentOffice.notifyEvent({
+                  activeRole: payload.agentRole,
+                  statusText: payload.plainSummary || payload.label,
+                  detail: payload.detail || "",
+                  status: payload.status,
+                });
+              }
+              renderChat();
+            } else if (eventName === "delta") {
+              liveAssistantMsg.content += payload.text || "";
+              renderChat();
+            } else if (eventName === "done") {
+              Object.assign(liveAssistantMsg, payload.message);
+              if (payload.threadTitle) conv.title = payload.threadTitle;
+              renderSidebar();
+              renderChat();
+            } else if (eventName === "error") {
+              liveAssistantMsg.content += `\n\nError: ${payload.message}`;
+              renderChat();
+            }
+          }
+        }
+      } catch (err) {
+        liveAssistantMsg.content += `\n\nConnection error: ${err.message}`;
+        renderChat();
+      } finally {
+        state.streaming = false;
+      }
+    }
+
+    function toggleInspector() {
+      const drawer = document.getElementById("inspector-drawer");
+      drawer.classList.toggle("hidden");
+    }
+
+    function switchInspectorTab(tab) {
+      state.inspectorTab = tab;
+      const drawer = document.getElementById("inspector-drawer");
+      drawer.classList.remove("hidden");
+      document.querySelectorAll(".inspector-tab").forEach((btn) => {
+        btn.classList.toggle("active", btn.getAttribute("data-tab") === tab);
+      });
+      document.querySelectorAll("[data-top-tab]").forEach((btn) => {
+        btn.classList.toggle("active", btn.getAttribute("data-top-tab") === tab);
+      });
+      renderInspector();
+    }
+
+    async function previewSkillTranspilation(skillName) {
+      const driver = state.selectedTranspileDriver || "antigravity";
+      const res = await fetch("/api/skills/transpile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ skillName, driver, args: "src/app.ts" }),
+      });
+      const data = await res.json();
+      if (data.transpiled) {
+        state.transpiledPreview = data.transpiled;
+        renderInspector();
+      }
+    }
+
+    async function saveSurfaceFile() {
+      const textarea = document.getElementById("surface-textarea");
+      if (!textarea) return;
+      const content = textarea.value;
+      const res = await fetch("/api/harness2/surface", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ relPath: state.activeSurfaceFile, content }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        state.harness2.surfaceFiles[state.activeSurfaceFile] = content;
+        state.harness2.validation = data.validation;
+        renderInspector();
+      }
+    }
+
+    function renderInspector() {
+      const container = document.getElementById("inspector-content");
+      if (!container) return;
+
+      if (state.inspectorTab === "egm") {
+        const egm = state.lastEgmBrief;
+        container.innerHTML = `
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Elephant-Goldfish Boardroom</span>
+              <span class="insp-badge ok">${egm ? `score ${egm.desk3Auditor.score}` : "EGM v5.1"}</span>
+            </div>
+            <p class="insp-desc">
+              Separates the deep-context CEO (Elephant) from 4 stateless specialist lenses (Goldfish) governed by <code>PROPOSE_FIX | CONTEST | ESCALATE | DECLINE</code>.
+            </p>
+            <button class="insp-action-btn" onclick="runStandaloneEgmShootdown()">
+              Run 4-lens workspace audit
+            </button>
+          </div>
+          ${
+            egm
+              ? `
+            <div class="insp-card">
+              <div class="insp-card-header">
+                <span class="insp-card-title">Desk 1 · Symbol Grounding</span>
+                <span class="insp-badge">${egm.desk1GroundedManifest.scannedFiles.length} files</span>
+              </div>
+              <div class="insp-mono">${egm.desk1GroundedManifest.scannedFiles
+                .map((f) => `${escapeHtml(f.file)} (${f.symbols.length} symbols)`)
+                .join("\n")}</div>
+            </div>
+            <div class="insp-card">
+              <div class="insp-card-header">
+                <span class="insp-card-title">Desk 2 · Stateless Goldfish Lenses</span>
+                <span class="insp-badge">4 lenses</span>
+              </div>
+              ${egm.desk2GoldfishLenses
+                .map(
+                  (l) => `
+                <div class="insp-mono" style="margin-bottom:4px"><strong>${escapeHtml(l.lens)}</strong> (${escapeHtml(l.specialistModel)})\n${escapeHtml(l.summary.slice(0, 180))}</div>
+              `,
+                )
+                .join("")}
+            </div>
+            <div class="insp-card">
+              <div class="insp-card-header">
+                <span class="insp-card-title">Desk 3 · CEO Resolution Ledger</span>
+                <span class="insp-badge ok">${escapeHtml(egm.desk3Auditor.verdict)}</span>
+              </div>
+              ${egm.desk3Auditor.findings
+                .map(
+                  (f) => `
+                <div class="insp-mono" style="margin-bottom:4px">[${escapeHtml(f.severity)} → ${escapeHtml(f.resolution)}] ${escapeHtml(f.finding)}</div>
+              `,
+                )
+                .join("")}
+            </div>
+          `
+              : `
+            <div class="insp-card">
+              <div class="insp-card-header">
+                <span class="insp-card-title">Execution Pipeline</span>
+                <span class="insp-badge ok">Ready</span>
+              </div>
+              <p class="insp-desc">Every prompt runs Desk 1 AST symbol extraction, Desk 2 stateless lenses, and Desk 3 comprehension verification before code generation.</p>
+            </div>
+          `
+          }
+        `;
+        return;
+      }
+
+      if (state.inspectorTab === "router") {
+        const plan = state.lastPlan;
+        container.innerHTML = `
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Orchestration Router</span>
+              <span class="insp-badge">EMA Decider</span>
+            </div>
+            <p class="insp-desc">
+              ${
+                plan
+                  ? `Routed to <strong>${escapeHtml(plan.primaryModel.displayName)}</strong> (${escapeHtml(plan.classification.primaryDomain)} · ${escapeHtml(plan.classification.complexity)}).`
+                  : "Classifies each prompt across 10 engineering domains and routes to the highest-scoring model."
+              }
+            </p>
+            ${
+              plan
+                ? `
+              <div class="insp-mono">Fallback: ${escapeHtml(plan.fallbackModels.map((m) => m.id).join(" → "))}\nCouncil: ${escapeHtml(plan.councilReviewers.map((m) => m.id).join(", "))}\nClean-room: ${plan.strictSanitized ? `active (${plan.redactionsCount} redactions)` : "standby"}</div>
+            `
+                : ""
+            }
+          </div>
+
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">DeepSeek-Harness Subsystems</span>
+              <span class="insp-badge ok">${state.deepseekRuntime?.capabilities?.length || 5} active</span>
+            </div>
+            <div class="insp-mono">${(state.deepseekRuntime?.capabilities || [])
+              .map((c) => `${escapeHtml(c.seam)}: ${escapeHtml(c.provider)}`)
+              .join("\n")}</div>
+          </div>
+
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Connected MCP Servers</span>
+              <span class="insp-badge">${state.mcpServers.length}</span>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:5px">
+              ${state.mcpServers
+                .map((m) => `<span class="meta-tag" title="${escapeHtml(m.sourcePath)}">${escapeHtml(m.name)}</span>`)
+                .join("")}
+            </div>
+          </div>
+        `;
+        return;
+      }
+
+      if (state.inspectorTab === "skills") {
+        const q = (state.skillSearchQuery || "").toLowerCase();
+        const filtered = state.skills.filter(
+          (s) => !q || s.name.toLowerCase().includes(q) || s.description.toLowerCase().includes(q) || s.ecosystem.includes(q),
+        );
+        container.innerHTML = `
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Universal Skill Transpiler</span>
+              <span class="insp-badge">${state.skills.length}</span>
+            </div>
+            <input
+              type="text"
+              class="insp-input"
+              placeholder="Filter skills across Antigravity, Codex, Claude..."
+              value="${escapeHtml(state.skillSearchQuery)}"
+              oninput="state.skillSearchQuery = this.value; renderInspector();"
+            />
+            <div style="display:flex;justify-content:space-between;align-items:center;gap:6px">
+              <span class="insp-desc">Target runtime</span>
+              <select
+                class="picker-select"
+                onchange="state.selectedTranspileDriver = this.value;"
+              >
+                <option value="antigravity" ${state.selectedTranspileDriver === "antigravity" ? "selected" : ""}>Antigravity</option>
+                <option value="claude" ${state.selectedTranspileDriver === "claude" ? "selected" : ""}>Claude Code</option>
+                <option value="codex" ${state.selectedTranspileDriver === "codex" ? "selected" : ""}>Codex CLI</option>
+                <option value="opencode" ${state.selectedTranspileDriver === "opencode" ? "selected" : ""}>OpenCode / Hermes</option>
+              </select>
+            </div>
+            <div class="insp-list">
+              ${filtered
+                .slice(0, 45)
+                .map(
+                  (s) => `
+                <div class="insp-row" onclick="previewSkillTranspilation('${escapeHtml(s.name)}')">
+                  <div style="display:flex;flex-direction:column;gap:2px;overflow:hidden">
+                    <span style="color:var(--text-primary)">${escapeHtml(s.name)}</span>
+                    ${
+                      s.mergedFrom && s.mergedFrom.length > 0
+                        ? `<span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">fused: ${escapeHtml(s.mergedFrom.join(", "))}</span>`
+                        : ""
+                    }
+                  </div>
+                  <span class="insp-badge">${escapeHtml(s.capabilityCluster || s.ecosystem)}</span>
+                </div>
+              `,
+                )
+                .join("")}
+            </div>
+          </div>
+          ${
+            state.transpiledPreview
+              ? `
+            <div class="insp-card">
+              <div class="insp-card-header">
+                <span class="insp-card-title">Transpiled output</span>
+                <span class="insp-badge">${escapeHtml(state.selectedTranspileDriver)}</span>
+              </div>
+              <div class="insp-mono" style="max-height:200px;overflow-y:auto">${escapeHtml(state.transpiledPreview.slice(0, 1500))}</div>
+            </div>
+          `
+              : ""
+          }
+        `;
+        return;
+      }
+
+      if (state.inspectorTab === "harness2") {
+        const files = state.harness2?.surfaceFiles || {};
+        const val = state.harness2?.validation;
+        container.innerHTML = `
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Harness² Surfaces (c1..c8)</span>
+              <span class="insp-badge ${val?.ok ? "ok" : "warn"}">${val?.ok ? "8/8 valid" : "check"}</span>
+            </div>
+            <p class="insp-desc">${escapeHtml(val?.details || "")}</p>
+            <select
+              class="picker-select"
+              style="width:100%"
+              onchange="state.activeSurfaceFile = this.value; renderInspector();"
+            >
+              <option value="systemprompt.md" ${state.activeSurfaceFile === "systemprompt.md" ? "selected" : ""}>c1 · systemprompt.md</option>
+              <option value="guardrails.md" ${state.activeSurfaceFile === "guardrails.md" ? "selected" : ""}>c2 · guardrails.md</option>
+              <option value="LongTermMEMORY.md" ${state.activeSurfaceFile === "LongTermMEMORY.md" ? "selected" : ""}>c3 · LongTermMEMORY.md</option>
+              <option value="tool_descriptions/tool_guidance.md" ${state.activeSurfaceFile === "tool_descriptions/tool_guidance.md" ? "selected" : ""}>c4 · tool_guidance.md</option>
+            </select>
+            <textarea id="surface-textarea" class="surface-editor">${escapeHtml(files[state.activeSurfaceFile] || "")}</textarea>
+            <button class="insp-action-btn" onclick="saveSurfaceFile()">Save & validate c1..c8 tree</button>
+          </div>
+        `;
+        return;
+      }
+
+      if (state.inspectorTab === "scoreboard") {
+        const sorted = [...state.models].sort((a, b) => (b.emaScore || 0) - (a.emaScore || 0));
+        container.innerHTML = `
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Model EMA Scoreboard</span>
+              <span class="insp-badge">${sorted.length} models</span>
+            </div>
+            <div class="insp-list" style="max-height:520px">
+              ${sorted
+                .map(
+                  (m) => `
+                <div class="insp-row" style="flex-direction:column;align-items:stretch;gap:4px" onclick="document.getElementById('model-picker').value='${escapeHtml(m.id)}'">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span style="color:var(--text-primary);font-weight:500">${escapeHtml(m.displayName)}</span>
+                    <span class="insp-badge">${m.emaScore}</span>
+                  </div>
+                  <div style="font-family:var(--font-mono);font-size:10.5px;color:var(--text-muted)">${escapeHtml(m.id)}</div>
+                  <div class="score-bar-track">
+                    <div class="score-bar-fill" style="width:${Math.min(100, Math.max(15, m.emaScore || 80))}%"></div>
+                  </div>
+                </div>
+              `,
+                )
+                .join("")}
+            </div>
+          </div>
+        `;
+      }
+    }
+
+    document.getElementById("prompt-input").addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendChatTurn();
+      }
+    });
+
+    loadBootstrap();
+  </script>
+</body>
+</html>
