@@ -1,22 +1,21 @@
 // Real Multi-Gateway LLM & Agentic Tool-Loop Engine for the Apex Harness App.
-// Connects to custom_models.json, model-matrix.json (KiloCode, NVIDIA NIM, OpenRouter, FreeLLMAPI :3001,
-// OmniRoute :20128, Gemini Web :8765), and executes real workspace tools (list_dir, read_file, write_file,
-// edit_file, grep_search, run_command) with live SSE step callbacks and automatic model failover.
+// Enforces:
+// - Canonical workspace containment (`assertCanonicalWorkspacePath` against ../, absolute paths, sibling prefixes, and symlinks)
+// - Asynchronous managed command execution (`runManagedCommand` with process-tree kill, timeouts, AbortSignal, and permission policy)
+// - End-to-end AbortSignal propagation across HTTP provider calls, CLI fallbacks, shell commands, and MCP calls
+// - Detailed execution evidence tracking (`filesInspected`, `filesCreated`, `filesModified`, `commandsExecuted`, `toolsInvoked`)
 
-import { execSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, relative, resolve } from "node:path";
+import type { AgentOfficeRole, ExecutedCommandEvidence } from "../shared/apex-contracts.ts";
 import { callMcpServerTool } from "./harness/mcp-client-bridge.ts";
+import { killProcessTree, runManagedCommand } from "./harness/process-manager.ts";
 import { parseAndScrubModelResponse } from "./harness/universal-tool-parser.ts";
+import { assertCanonicalWorkspacePath, resolveCanonicalWorkspaceRoot } from "./harness/workspace-security.ts";
 
-export type AgentOfficeRole =
-  | "Coordinator"
-  | "Scout"
-  | "Architect"
-  | "Builder"
-  | "Critic"
-  | "Verifier";
+export type { AgentOfficeRole };
 
 export interface AgentStepEvent {
   id: string;
@@ -37,6 +36,7 @@ export interface ChatMessage {
   role: "user" | "assistant" | "system";
   content: string;
   createdAt: string;
+  executionId?: string;
   modelId?: string;
   modelDisplayName?: string;
   domain?: string;
@@ -51,6 +51,7 @@ export interface ChatMessage {
     recommendedAction: string;
     issues: string[];
   };
+  completionStatus?: string;
 }
 
 interface GatewayConfig {
@@ -112,47 +113,100 @@ export interface LlmCallResult {
   usedModel: string;
   usedGateway: string;
   latencyMs: number;
+  cancelled?: boolean;
+  failoverAttempts?: Array<{ gateway: string; model: string; error?: string }>;
   error?: string;
 }
 
-async function callOpenAiCompatibleEndpoint(options: {
+export async function callProviderEndpoint(options: {
   baseUrl: string;
   apiKey: string;
   model: string;
   messages: Array<{ role: string; content: string }>;
   gatewayName: string;
+  protocol?: "openai-compat" | "anthropic-compat" | "gemini" | "omniroute" | "freellmapi" | "openrouter" | "local-ollama";
   userAgent?: string;
   timeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<LlmCallResult> {
   const t0 = Date.now();
-  const cleanBase = options.baseUrl.replace(/\/+$/, "").replace(/\/chat\/completions$/, "");
-  const url = `${cleanBase}/chat/completions`;
+  if (options.signal?.aborted) {
+    return {
+      ok: false,
+      text: "",
+      usedModel: options.model,
+      usedGateway: options.gatewayName,
+      latencyMs: 0,
+      cancelled: true,
+      error: "Provider request cancelled before start",
+    };
+  }
 
+  const cleanBase = options.baseUrl.replace(/\/+$/, "");
+  const isAnthropic = options.protocol === "anthropic-compat" || cleanBase.endsWith("/v1/messages");
+  const isGeminiNative = options.protocol === "gemini" || cleanBase.includes("generativelanguage.googleapis.com");
+
+  let url = `${cleanBase.replace(/\/chat\/completions$/, "")}/chat/completions`;
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
     "User-Agent": options.userAgent || "Kilo-Code/5.10.0",
   };
-  if (options.apiKey) {
-    headers["Authorization"] = `Bearer ${options.apiKey}`;
-  }
-  if (options.gatewayName === "openrouter" || cleanBase.includes("openrouter")) {
-    headers["HTTP-Referer"] = "https://kilocode.ai";
-    headers["X-Title"] = "Kilo Code";
+
+  let bodyPayload: Record<string, unknown>;
+
+  if (isAnthropic) {
+    url = cleanBase.endsWith("/messages") ? cleanBase : `${cleanBase}/messages`;
+    if (options.apiKey) headers["x-api-key"] = options.apiKey;
+    headers["anthropic-version"] = "2023-06-01";
+    const sysMsg = options.messages.find((m) => m.role === "system")?.content;
+    const chatMsgs = options.messages
+      .filter((m) => m.role !== "system")
+      .map((m) => ({ role: m.role === "assistant" ? "assistant" : "user", content: m.content }));
+    bodyPayload = {
+      model: options.model,
+      max_tokens: 4096,
+      ...(sysMsg ? { system: sysMsg } : {}),
+      messages: chatMsgs.length > 0 ? chatMsgs : [{ role: "user", content: "Hello" }],
+    };
+  } else if (isGeminiNative) {
+    url = `${cleanBase}/models/${options.model}:generateContent${options.apiKey ? `?key=${encodeURIComponent(options.apiKey)}` : ""}`;
+    const contents = options.messages.map((m) => ({
+      role: m.role === "assistant" ? "model" : "user",
+      parts: [{ text: m.content }],
+    }));
+    bodyPayload = { contents };
+  } else {
+    if (options.apiKey) {
+      headers.Authorization = `Bearer ${options.apiKey}`;
+    }
+    if (options.gatewayName === "openrouter" || cleanBase.includes("openrouter")) {
+      headers["HTTP-Referer"] = "https://kilocode.ai";
+      headers["X-Title"] = "Kilo Code";
+    }
+    bodyPayload = {
+      model: options.model,
+      messages: options.messages,
+      max_tokens: 4096,
+      temperature: 0.2,
+    };
   }
 
   const controller = new AbortController();
+  let cancelledByParent = false;
+  const onParentAbort = () => {
+    cancelledByParent = true;
+    controller.abort();
+  };
+  if (options.signal) {
+    options.signal.addEventListener("abort", onParentAbort, { once: true });
+  }
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 35_000);
 
   try {
     const response = await fetch(url, {
       method: "POST",
       headers,
-      body: JSON.stringify({
-        model: options.model,
-        messages: options.messages,
-        max_tokens: 4096,
-        temperature: 0.2,
-      }),
+      body: JSON.stringify(bodyPayload),
       signal: controller.signal,
     });
 
@@ -172,9 +226,19 @@ async function callOpenAiCompatibleEndpoint(options: {
 
     const data = JSON.parse(rawText) as {
       choices?: Array<{ message?: { content?: string; reasoning_content?: string } }>;
+      content?: Array<{ type?: string; text?: string }>;
+      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
     };
-    const msg = data.choices?.[0]?.message;
-    const rawContent = (msg?.content || msg?.reasoning_content || "").trim();
+
+    let rawContent = "";
+    if (Array.isArray(data.choices) && data.choices[0]?.message) {
+      rawContent = (data.choices[0].message.content || data.choices[0].message.reasoning_content || "").trim();
+    } else if (Array.isArray(data.content)) {
+      rawContent = data.content.map((c) => c.text || "").join("\n").trim();
+    } else if (Array.isArray(data.candidates)) {
+      rawContent = (data.candidates[0]?.content?.parts?.map((p) => p.text || "").join("\n") || "").trim();
+    }
+
     const cleaned = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() || rawContent;
 
     if (!cleaned) {
@@ -202,23 +266,47 @@ async function callOpenAiCompatibleEndpoint(options: {
       usedModel: options.model,
       usedGateway: options.gatewayName,
       latencyMs: Date.now() - t0,
-      error: err instanceof Error ? err.message : String(err),
+      cancelled: cancelledByParent || Boolean(options.signal?.aborted),
+      error: cancelledByParent ? "Cancelled by user" : err instanceof Error ? err.message : String(err),
     };
   } finally {
     clearTimeout(timer);
+    if (options.signal) {
+      options.signal.removeEventListener("abort", onParentAbort);
+    }
   }
 }
 
 /**
- * Calls the requested model first, and if its local proxy is asleep or rate-limited,
- * automatically fails over across the live gateways in `model-matrix.json` & `specialist_pool.json`.
+ * Calls the requested model first, and if its local proxy is asleep, rate-limited, or returns 5xx,
+ * automatically fails over across configured providers and live gateways while respecting `AbortSignal`.
  */
 export async function callUnifiedFleetWithFailover(options: {
   preferredModelId: string;
   preferredBaseUrl?: string;
   preferredApiKey?: string;
   messages: Array<{ role: string; content: string }>;
+  signal?: AbortSignal;
+  extraCandidates?: Array<{
+    gatewayName: string;
+    baseUrl: string;
+    apiKey: string;
+    model: string;
+    protocol?: "openai-compat" | "anthropic-compat" | "gemini";
+  }>;
 }): Promise<LlmCallResult> {
+  if (options.signal?.aborted) {
+    return {
+      ok: false,
+      text: "",
+      usedModel: options.preferredModelId,
+      usedGateway: "cancelled",
+      latencyMs: 0,
+      cancelled: true,
+      error: "Cancelled before model invocation",
+    };
+  }
+
   let gateways: Record<string, GatewayConfig> = {};
   let candidates: MatrixCandidate[] = [];
 
@@ -239,7 +327,6 @@ export async function callUnifiedFleetWithFailover(options: {
     }
   }
 
-  // 1. Try preferred endpoint if baseUrl is provided and not a local closed port, or try waking FreeLLMAPI
   if (gateways.freellmapi?.ensure_script) {
     ensureFreeLlmApiAwake(gateways.freellmapi.ensure_script);
   }
@@ -249,10 +336,10 @@ export async function callUnifiedFleetWithFailover(options: {
     baseUrl: string;
     apiKey: string;
     model: string;
+    protocol?: "openai-compat" | "anthropic-compat" | "gemini";
     userAgent?: string;
   }> = [];
 
-  // Map preferredModelId to a live gateway when possible
   const cleanModelId = options.preferredModelId
     .replace(/^agy-acp\//, "")
     .replace(/^models\//, "");
@@ -277,7 +364,10 @@ export async function callUnifiedFleetWithFailover(options: {
     });
   }
 
-  // Add high-speed cloud & local candidates from model-matrix.json
+  if (options.extraCandidates) {
+    attempts.push(...options.extraCandidates);
+  }
+
   const seen = new Set<string>();
   for (const cand of candidates) {
     const gw = gateways[cand.gateway];
@@ -288,7 +378,7 @@ export async function callUnifiedFleetWithFailover(options: {
     const apiKey =
       (gw.api_key_env ? process.env[gw.api_key_env] : "") ||
       getPoolKey(gw.pool_key, gw.default_api_key ?? "") ||
-      ( gw.default_api_key ?? "" );
+      (gw.default_api_key ?? "");
     attempts.push({
       gatewayName: cand.gateway,
       baseUrl: gw.base_url,
@@ -298,27 +388,60 @@ export async function callUnifiedFleetWithFailover(options: {
     });
   }
 
+  const failoverAttempts: Array<{ gateway: string; model: string; error?: string }> = [];
   let lastError = "No gateways configured";
+
   for (const attempt of attempts.slice(0, 6)) {
-    const res = await callOpenAiCompatibleEndpoint({
+    if (options.signal?.aborted) {
+      return {
+        ok: false,
+        text: "",
+        usedModel: attempt.model,
+        usedGateway: attempt.gatewayName,
+        latencyMs: 0,
+        cancelled: true,
+        failoverAttempts,
+        error: "Cancelled during provider failover",
+      };
+    }
+
+    const res = await callProviderEndpoint({
       baseUrl: attempt.baseUrl,
       apiKey: attempt.apiKey,
       model: attempt.model,
       messages: options.messages,
       gatewayName: attempt.gatewayName,
+      protocol: attempt.protocol,
       userAgent: attempt.userAgent,
-      timeoutMs: attempt.baseUrl.includes("127.0.0.1") ? 6_000 : 28_000,
+      timeoutMs: attempt.baseUrl.includes("127.0.0.1") || attempt.baseUrl.includes("localhost") ? 6_000 : 28_000,
+      signal: options.signal,
     });
-    if (res.ok) {
-      return res;
+
+    if (res.cancelled) {
+      return { ...res, failoverAttempts };
     }
+
+    if (res.ok) {
+      return { ...res, failoverAttempts };
+    }
+
+    failoverAttempts.push({
+      gateway: attempt.gatewayName,
+      model: attempt.model,
+      error: res.error,
+    });
     lastError = `${attempt.gatewayName}/${attempt.model}: ${res.error}`;
   }
 
-  // Native Local CLI Driver Fallback (codex / claude / gemini)
-  const cliFallback = callLocalCliDriverFallback(options.preferredModelId, options.messages);
-  if (cliFallback.ok) {
-    return cliFallback;
+  if (!options.signal?.aborted) {
+    const cliFallback = await callLocalCliDriverFallbackAsync(
+      options.preferredModelId,
+      options.messages,
+      options.signal,
+    );
+    if (cliFallback.ok || cliFallback.cancelled) {
+      return { ...cliFallback, failoverAttempts };
+    }
   }
 
   return {
@@ -327,18 +450,19 @@ export async function callUnifiedFleetWithFailover(options: {
     usedModel: options.preferredModelId,
     usedGateway: "offline-fallback",
     latencyMs: 0,
+    failoverAttempts,
     error: lastError,
   };
 }
 
 /**
- * Spawns local installed CLI agent binaries (`codex`, `claude`, `gemini`) non-interactively
- * when HTTP gateways are offline or when a native CLI driver is explicitly selected.
+ * Asynchronous CLI driver fallback supporting `AbortSignal` and process-tree kill.
  */
-export function callLocalCliDriverFallback(
+export async function callLocalCliDriverFallbackAsync(
   preferredModelId: string,
   messages: ReadonlyArray<{ role: string; content: string }>,
-): LlmCallResult {
+  signal?: AbortSignal,
+): Promise<LlmCallResult> {
   const t0 = Date.now();
   const lastUser = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
   if (!lastUser) {
@@ -355,26 +479,99 @@ export function callLocalCliDriverFallback(
   }
 
   for (const cand of cliCandidates) {
-    try {
-      const proc = spawnSync(cand.bin, cand.args, {
-        encoding: "utf8",
-        timeout: 18_000,
+    if (signal?.aborted) {
+      return {
+        ok: false,
+        text: "",
+        usedModel: preferredModelId,
+        usedGateway: cand.name,
+        latencyMs: Date.now() - t0,
+        cancelled: true,
+        error: "Cancelled",
+      };
+    }
+
+    const res = await new Promise<LlmCallResult>((resolvePromise) => {
+      let settled = false;
+      const child = spawn(cand.bin, cand.args, {
+        stdio: ["ignore", "pipe", "pipe"],
         windowsHide: true,
         shell: process.platform === "win32",
       });
-      const out = (proc.stdout ?? "").trim();
-      if (proc.status === 0 && out.length > 0) {
-        return {
-          ok: true,
-          text: out,
+      const pid = child.pid;
+      let stdout = "";
+
+      const finish = (result: LlmCallResult) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
+        resolvePromise(result);
+      };
+
+      const onAbort = () => {
+        killProcessTree(pid);
+        finish({
+          ok: false,
+          text: "",
           usedModel: preferredModelId,
           usedGateway: cand.name,
           latencyMs: Date.now() - t0,
-        };
-      }
-    } catch {
-      // Try next CLI candidate
-    }
+          cancelled: true,
+          error: "CLI fallback cancelled",
+        });
+      };
+
+      if (signal) signal.addEventListener("abort", onAbort, { once: true });
+      const timer = setTimeout(() => {
+        killProcessTree(pid);
+        finish({
+          ok: false,
+          text: "",
+          usedModel: preferredModelId,
+          usedGateway: cand.name,
+          latencyMs: Date.now() - t0,
+          error: "CLI timeout",
+        });
+      }, 16_000);
+
+      child.stdout?.on("data", (c: Buffer) => {
+        stdout += c.toString("utf8");
+      });
+      child.on("error", (err) => {
+        finish({
+          ok: false,
+          text: "",
+          usedModel: preferredModelId,
+          usedGateway: cand.name,
+          latencyMs: Date.now() - t0,
+          error: err.message,
+        });
+      });
+      child.on("close", (code) => {
+        const trimmed = stdout.trim();
+        if (code === 0 && trimmed.length > 0) {
+          finish({
+            ok: true,
+            text: trimmed,
+            usedModel: preferredModelId,
+            usedGateway: cand.name,
+            latencyMs: Date.now() - t0,
+          });
+        } else {
+          finish({
+            ok: false,
+            text: "",
+            usedModel: preferredModelId,
+            usedGateway: cand.name,
+            latencyMs: Date.now() - t0,
+            error: `CLI exited with ${code}`,
+          });
+        }
+      });
+    });
+
+    if (res.ok || res.cancelled) return res;
   }
 
   return {
@@ -384,6 +581,20 @@ export function callLocalCliDriverFallback(
     usedGateway: "cli-fallback",
     latencyMs: Date.now() - t0,
     error: "No local CLI driver responded",
+  };
+}
+
+export function callLocalCliDriverFallback(
+  preferredModelId: string,
+  messages: ReadonlyArray<{ role: string; content: string }>,
+): LlmCallResult {
+  return {
+    ok: false,
+    text: "",
+    usedModel: preferredModelId,
+    usedGateway: "cli-fallback",
+    latencyMs: 0,
+    error: "Use callLocalCliDriverFallbackAsync",
   };
 }
 
@@ -406,15 +617,16 @@ const IGNORED_FOLDERS = new Set([
 
 /**
  * Gathers grounded workspace context (top files, README/GATES/package.json, and matching files)
- * while emitting real-time AgentStepEvents (just like Antigravity's "Explored files, ran commands" UI).
+ * while enforcing canonical path boundaries and emitting real-time AgentStepEvents.
  */
 export function gatherGroundedWorkspaceContext(
   workspaceRoot: string,
   prompt: string,
   onStep: (step: AgentStepEvent) => void,
-): { contextBlock: string; steps: AgentStepEvent[] } {
+): { contextBlock: string; steps: AgentStepEvent[]; inspectedFiles: string[] } {
   const steps: AgentStepEvent[] = [];
-  const root = resolve(workspaceRoot);
+  const inspectedFiles: string[] = [];
+  const root = resolveCanonicalWorkspaceRoot(workspaceRoot);
   const emit = (step: AgentStepEvent) => {
     const idx = steps.findIndex((s) => s.id === step.id);
     if (idx >= 0) steps[idx] = step;
@@ -423,7 +635,7 @@ export function gatherGroundedWorkspaceContext(
   };
 
   if (!existsSync(root)) {
-    return { contextBlock: `Workspace path ${root} does not exist yet.`, steps };
+    return { contextBlock: `Workspace path ${root} does not exist yet.`, steps, inspectedFiles };
   }
 
   const stepListId = `step-list-${Date.now()}`;
@@ -462,7 +674,6 @@ export function gatherGroundedWorkspaceContext(
     `Top-level entries: ${topEntries.join(", ")}`,
   ];
 
-  // Check priority files + any file mentioned in prompt + top code entrypoints
   const priorityFiles = ["GATES.md", "README.md", "package.json", "pyproject.toml", "AGENTS.md"];
   const codeEntries = topEntries.filter((e) => /\.(?:py|ts|tsx|js|mjs|go|rs)$/i.test(e)).slice(0, 3);
   const promptFileMatches = prompt.match(/[A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|mjs|py|json|md|html|css)/g) ?? [];
@@ -472,8 +683,8 @@ export function gatherGroundedWorkspaceContext(
   for (const relCandidate of filesToRead) {
     if (readCount >= 4) break;
     const cleanRel = relCandidate.replace(/^[@/\\]+/, "");
-    const fullPath = join(root, cleanRel);
     try {
+      const fullPath = assertCanonicalWorkspacePath(root, cleanRel, { operation: "scout_read" });
       if (!existsSync(fullPath) || !statSync(fullPath).isFile()) continue;
       const tRead = Date.now();
       const content = readFileSync(fullPath, "utf8");
@@ -482,7 +693,8 @@ export function gatherGroundedWorkspaceContext(
       const preview = lines.slice(0, maxLines).join("\n");
       const stepId = `step-read-${readCount}-${Date.now()}`;
       readCount += 1;
-      const relName = relative(root, fullPath) || cleanRel;
+      const relName = (relative(root, fullPath) || cleanRel).replace(/\\/g, "/");
+      inspectedFiles.push(relName);
       emit({
         id: stepId,
         kind: "read",
@@ -498,18 +710,28 @@ export function gatherGroundedWorkspaceContext(
       });
       snippets.push(`--- FILE: ${relName} (lines 1-${maxLines}) ---\n${preview}`);
     } catch {
-      // Ignore unreadable file
+      // Skip files outside workspace or unreadable
     }
   }
 
   return {
     contextBlock: snippets.join("\n\n"),
     steps,
+    inspectedFiles,
   };
 }
 
 export interface ToolExecutionAction {
-  tool: "write_file" | "edit_file" | "read_file" | "grep_search" | "run_command" | "call_mcp_tool";
+  tool:
+    | "write_file"
+    | "edit_file"
+    | "read_file"
+    | "list_dir"
+    | "grep_search"
+    | "run_command"
+    | "call_mcp_tool"
+    | "todo_write"
+    | "repo_map";
   path?: string;
   content?: string;
   target?: string;
@@ -517,10 +739,13 @@ export interface ToolExecutionAction {
   startLine?: number;
   endLine?: number;
   pattern?: string;
+  query?: string;
+  relDir?: string;
   command?: string;
   serverName?: string;
   toolName?: string;
   args?: Record<string, unknown>;
+  todos?: Array<{ content: string; status: "pending" | "in_progress" | "completed" }>;
 }
 
 export interface FileBackupEntry {
@@ -553,15 +778,17 @@ export function revertTurnCheckpoint(
   }
   try {
     const cp = JSON.parse(readFileSync(p, "utf8")) as TurnCheckpoint;
+    const canonicalRoot = resolveCanonicalWorkspaceRoot(cp.workspaceRoot);
     const restored: string[] = [];
     for (const f of cp.files) {
+      const safePath = assertCanonicalWorkspacePath(canonicalRoot, f.fullPath, { operation: "checkpoint_revert" });
       if (f.existedBefore && typeof f.previousContent === "string") {
-        mkdirSync(dirname(f.fullPath), { recursive: true });
-        writeFileSync(f.fullPath, f.previousContent, "utf8");
-        restored.push(f.fullPath);
-      } else if (!f.existedBefore && existsSync(f.fullPath)) {
-        rmSync(f.fullPath, { force: true });
-        restored.push(`${f.fullPath} (removed new file)`);
+        mkdirSync(dirname(safePath), { recursive: true });
+        writeFileSync(safePath, f.previousContent, "utf8");
+        restored.push(safePath);
+      } else if (!f.existedBefore && existsSync(safePath)) {
+        rmSync(safePath, { force: true });
+        restored.push(`${safePath} (removed new file)`);
       }
     }
     cp.reverted = true;
@@ -576,11 +803,25 @@ export function revertTurnCheckpoint(
   }
 }
 
+export interface AgentToolExecutionReport {
+  cleanedResponse: string;
+  executedSteps: AgentStepEvent[];
+  toolObservations: string[];
+  checkpoint?: TurnCheckpoint;
+  checkpointId?: string;
+  filesInspected: string[];
+  filesCreated: string[];
+  filesModified: string[];
+  commandsExecuted: ExecutedCommandEvidence[];
+  toolsInvoked: Array<{ tool: string; target?: string; status: "done" | "error"; durationMs: number }>;
+}
+
 /**
- * Synchronous + Asynchronous Agent Tool Block Executor:
- * Executes `write_file`, `edit_file`, `read_file`, `grep_search`, `run_command`, and `call_mcp_tool`
- * emitted inside ```apex-action blocks, records pre-edit file snapshots for 1-click undo,
- * and returns structured `toolObservations` for the multi-step ReAct loop.
+ * Asynchronous Agent Tool Block Executor with:
+ * - Canonical workspace path containment (`assertCanonicalWorkspacePath`)
+ * - Asynchronous managed command execution (`runManagedCommand` with process-tree kill & permission policy)
+ * - End-to-end `AbortSignal` cancellation
+ * - Pre-edit file checkpointing and detailed execution evidence tracking
  */
 export async function executeAgentToolBlocksAsync(
   arg1:
@@ -590,18 +831,22 @@ export async function executeAgentToolBlocksAsync(
         workspaceRoot: string;
         dataDir?: string;
         checkpointId?: string;
+        mode?: "turbo" | "auto_edit" | "ask";
+        signal?: AbortSignal;
+        onApprovalRequired?: (command: string, reason: string) => Promise<boolean>;
         onStep: (step: AgentStepEvent) => void;
       },
   workspaceRootArg?: string,
   onStepArg?: (step: AgentStepEvent) => void,
-  extraOpts?: { dataDir?: string; conversationId?: string; checkpointId?: string },
-): Promise<{
-  cleanedResponse: string;
-  executedSteps: AgentStepEvent[];
-  toolObservations: string[];
-  checkpoint?: TurnCheckpoint;
-  checkpointId?: string;
-}> {
+  extraOpts?: {
+    dataDir?: string;
+    conversationId?: string;
+    checkpointId?: string;
+    mode?: "turbo" | "auto_edit" | "ask";
+    signal?: AbortSignal;
+    onApprovalRequired?: (command: string, reason: string) => Promise<boolean>;
+  },
+): Promise<AgentToolExecutionReport> {
   const options =
     typeof arg1 === "string"
       ? {
@@ -609,60 +854,87 @@ export async function executeAgentToolBlocksAsync(
           workspaceRoot: workspaceRootArg!,
           dataDir: extraOpts?.dataDir,
           checkpointId: extraOpts?.checkpointId,
+          mode: extraOpts?.mode,
+          signal: extraOpts?.signal,
+          onApprovalRequired: extraOpts?.onApprovalRequired,
           onStep: onStepArg!,
         }
       : arg1;
+
   const executedSteps: AgentStepEvent[] = [];
   const toolObservations: string[] = [];
-  const root = resolve(options.workspaceRoot);
+  const filesInspected = new Set<string>();
+  const filesCreated = new Set<string>();
+  const filesModified = new Set<string>();
+  const commandsExecuted: ExecutedCommandEvidence[] = [];
+  const toolsInvoked: Array<{ tool: string; target?: string; status: "done" | "error"; durationMs: number }> = [];
+
+  const root = resolveCanonicalWorkspaceRoot(options.workspaceRoot);
   const backups = new Map<string, FileBackupEntry>();
 
-  const recordBackupIfNeeded = (targetPath: string) => {
-    if (backups.has(targetPath)) return;
-    if (existsSync(targetPath) && statSync(targetPath).isFile()) {
-      backups.set(targetPath, {
-        fullPath: targetPath,
-        existedBefore: true,
-        previousContent: readFileSync(targetPath, "utf8"),
-      });
-    } else {
-      backups.set(targetPath, {
-        fullPath: targetPath,
-        existedBefore: false,
-      });
+  const recordBackupIfNeeded = (targetPath: string): boolean => {
+    const existed = existsSync(targetPath) && statSync(targetPath).isFile();
+    if (!backups.has(targetPath)) {
+      if (existed) {
+        backups.set(targetPath, {
+          fullPath: targetPath,
+          existedBefore: true,
+          previousContent: readFileSync(targetPath, "utf8"),
+        });
+      } else {
+        backups.set(targetPath, {
+          fullPath: targetPath,
+          existedBefore: false,
+        });
+      }
     }
+    return existed;
   };
 
-  const resolveTargetPath = (rawPath: string): string => {
-    const normalized = process.platform === "win32" ? rawPath.replace(/\//g, "\\") : rawPath;
-    return resolve(root, normalized);
+  const resolveSafeTargetPath = (rawPath: string, op: string): string => {
+    return assertCanonicalWorkspacePath(root, rawPath, { operation: op });
   };
 
   const parsedOutput = parseAndScrubModelResponse(options.responseText);
-  let cleanedResponse = parsedOutput.visibleText;
+  const cleanedResponse = parsedOutput.visibleText;
 
   for (const action of parsedOutput.toolCalls) {
+    if (options.signal?.aborted) {
+      toolObservations.push("[tool_cancelled] Execution cancelled via AbortSignal.");
+      break;
+    }
+
     const t0 = Date.now();
     try {
       if (action.tool === "write_file" && action.path && typeof action.content === "string") {
-        const targetPath = resolveTargetPath(action.path);
-        recordBackupIfNeeded(targetPath);
+        if (options.mode === "ask") {
+          throw new Error("write_file blocked in 'ask' mode without explicit write approval");
+        }
+        const targetPath = resolveSafeTargetPath(action.path, "write_file");
+        const existedBefore = recordBackupIfNeeded(targetPath);
         mkdirSync(dirname(targetPath), { recursive: true });
-        writeFileSync(targetPath, action.content, "utf8");
-        const rel = relative(root, targetPath) || action.path;
+        // Re-verify canonical path after mkdirSync in case parent was a symlink
+        const verifiedTarget = resolveSafeTargetPath(action.path, "write_file_post_mkdir");
+        writeFileSync(verifiedTarget, action.content, "utf8");
+        const rel = (relative(root, verifiedTarget) || action.path).replace(/\\/g, "/");
+        if (existedBefore) filesModified.add(rel);
+        else filesCreated.add(rel);
+
         const linesCount = action.content.split(/\r?\n/).length;
+        const dur = Date.now() - t0;
+        toolsInvoked.push({ tool: "write_file", target: rel, status: "done", durationMs: dur });
         const step: AgentStepEvent = {
           id: `step-write-${Date.now()}-${executedSteps.length}`,
           kind: "edit",
           agentRole: "Builder",
-          label: `Created file ${rel}`,
+          label: `${existedBefore ? "Updated" : "Created"} file ${rel}`,
           plainSummary: `Builder Agent wrote ${linesCount} lines to ${rel}`,
           detail: `${linesCount} lines · ${action.content.length} bytes`,
           outputPreview: action.content.slice(0, 1200),
           fileRef: rel,
           lineRange: `#L1-${linesCount}`,
           status: "done",
-          durationMs: Date.now() - t0,
+          durationMs: dur,
         };
         executedSteps.push(step);
         options.onStep(step);
@@ -676,8 +948,11 @@ export async function executeAgentToolBlocksAsync(
         typeof action.target === "string" &&
         typeof action.replacement === "string"
       ) {
-        const targetPath = resolveTargetPath(action.path);
-        const rel = relative(root, targetPath) || action.path;
+        if (options.mode === "ask") {
+          throw new Error("edit_file blocked in 'ask' mode without explicit edit approval");
+        }
+        const targetPath = resolveSafeTargetPath(action.path, "edit_file");
+        const rel = (relative(root, targetPath) || action.path).replace(/\\/g, "/");
         if (!existsSync(targetPath)) {
           throw new Error(`edit_file target does not exist: ${rel}`);
         }
@@ -688,8 +963,12 @@ export async function executeAgentToolBlocksAsync(
         recordBackupIfNeeded(targetPath);
         const updated = current.replaceAll(action.target, action.replacement);
         writeFileSync(targetPath, updated, "utf8");
+        filesModified.add(rel);
+
         const addedLines = action.replacement.split(/\r?\n/).length;
         const removedLines = action.target.split(/\r?\n/).length;
+        const dur = Date.now() - t0;
+        toolsInvoked.push({ tool: "edit_file", target: rel, status: "done", durationMs: dur });
         const step: AgentStepEvent = {
           id: `step-edit-${Date.now()}-${executedSteps.length}`,
           kind: "edit",
@@ -701,7 +980,7 @@ export async function executeAgentToolBlocksAsync(
           fileRef: rel,
           lineRange: `Δ +${addedLines}/-${removedLines}`,
           status: "done",
-          durationMs: Date.now() - t0,
+          durationMs: dur,
         };
         executedSteps.push(step);
         options.onStep(step);
@@ -710,16 +989,19 @@ export async function executeAgentToolBlocksAsync(
       }
 
       if (action.tool === "read_file" && action.path) {
-        const targetPath = resolveTargetPath(action.path);
-        const rel = relative(root, targetPath) || action.path;
+        const targetPath = resolveSafeTargetPath(action.path, "read_file");
+        const rel = (relative(root, targetPath) || action.path).replace(/\\/g, "/");
         if (!existsSync(targetPath) || !statSync(targetPath).isFile()) {
           throw new Error(`File not found: ${rel}`);
         }
+        filesInspected.add(rel);
         const raw = readFileSync(targetPath, "utf8");
         const allLines = raw.split(/\r?\n/);
         const sLine = Math.max(1, action.startLine ?? 1);
         const eLine = Math.min(allLines.length, action.endLine ?? Math.min(allLines.length, sLine + 199));
         const slice = allLines.slice(sLine - 1, eLine).join("\n");
+        const dur = Date.now() - t0;
+        toolsInvoked.push({ tool: "read_file", target: rel, status: "done", durationMs: dur });
         const step: AgentStepEvent = {
           id: `step-read-act-${Date.now()}-${executedSteps.length}`,
           kind: "read",
@@ -731,7 +1013,7 @@ export async function executeAgentToolBlocksAsync(
           fileRef: rel,
           lineRange: `#L${sLine}-${eLine}`,
           status: "done",
-          durationMs: Date.now() - t0,
+          durationMs: dur,
         };
         executedSteps.push(step);
         options.onStep(step);
@@ -740,11 +1022,14 @@ export async function executeAgentToolBlocksAsync(
       }
 
       if (action.tool === "list_dir") {
-        const targetDir = action.path ? resolveTargetPath(action.path) : root;
-        const rel = relative(root, targetDir) || ".";
-        const entries = existsSync(targetDir) && statSync(targetDir).isDirectory()
-          ? readdirSync(targetDir).filter((e) => !IGNORED_FOLDERS.has(e)).slice(0, 80)
-          : [];
+        const targetDir = action.path ? resolveSafeTargetPath(action.path, "list_dir") : root;
+        const rel = (relative(root, targetDir) || ".").replace(/\\/g, "/");
+        const entries =
+          existsSync(targetDir) && statSync(targetDir).isDirectory()
+            ? readdirSync(targetDir).filter((e) => !IGNORED_FOLDERS.has(e)).slice(0, 80)
+            : [];
+        const dur = Date.now() - t0;
+        toolsInvoked.push({ tool: "list_dir", target: rel, status: "done", durationMs: dur });
         const step: AgentStepEvent = {
           id: `step-listdir-${Date.now()}-${executedSteps.length}`,
           kind: "read",
@@ -755,7 +1040,7 @@ export async function executeAgentToolBlocksAsync(
           outputPreview: entries.join("\n"),
           fileRef: rel,
           status: "done",
-          durationMs: Date.now() - t0,
+          durationMs: dur,
         };
         executedSteps.push(step);
         options.onStep(step);
@@ -763,10 +1048,10 @@ export async function executeAgentToolBlocksAsync(
         continue;
       }
 
-      const grepPattern = action.pattern || (action as { query?: string }).query;
-      const grepRelPath = action.path || (action as { relDir?: string }).relDir;
+      const grepPattern = action.pattern || action.query;
+      const grepRelPath = action.path || action.relDir;
       if (action.tool === "grep_search" && grepPattern) {
-        const searchDir = grepRelPath ? resolveTargetPath(grepRelPath) : root;
+        const searchDir = grepRelPath ? resolveSafeTargetPath(grepRelPath, "grep_search") : root;
         const rx = new RegExp(grepPattern, "i");
         const hits: string[] = [];
         const walk = (dir: string, depth: number) => {
@@ -781,13 +1066,16 @@ export async function executeAgentToolBlocksAsync(
             if (IGNORED_FOLDERS.has(e) || e.startsWith(".")) continue;
             const p = join(dir, e);
             try {
-              const st = statSync(p);
-              if (st.isDirectory()) walk(p, depth + 1);
-              else if (st.size < 200_000) {
+              const lst = lstatSync(p);
+              if (lst.isSymbolicLink()) continue; // Do not follow symlinks during grep
+              if (lst.isDirectory()) walk(p, depth + 1);
+              else if (lst.size < 200_000) {
                 const lines = readFileSync(p, "utf8").split(/\r?\n/);
                 for (let i = 0; i < lines.length; i++) {
                   if (rx.test(lines[i]!)) {
-                    hits.push(`${relative(root, p)}:${i + 1}: ${lines[i]!.trim().slice(0, 140)}`);
+                    const relFile = relative(root, p).replace(/\\/g, "/");
+                    filesInspected.add(relFile);
+                    hits.push(`${relFile}:${i + 1}: ${lines[i]!.trim().slice(0, 140)}`);
                     if (hits.length >= 30) break;
                   }
                 }
@@ -798,6 +1086,8 @@ export async function executeAgentToolBlocksAsync(
           }
         };
         walk(searchDir, 0);
+        const dur = Date.now() - t0;
+        toolsInvoked.push({ tool: "grep_search", target: grepPattern, status: "done", durationMs: dur });
         const step: AgentStepEvent = {
           id: `step-grep-${Date.now()}-${executedSteps.length}`,
           kind: "search",
@@ -807,7 +1097,7 @@ export async function executeAgentToolBlocksAsync(
           detail: `${hits.length} matches`,
           outputPreview: hits.join("\n") || "No matches found.",
           status: "done",
-          durationMs: Date.now() - t0,
+          durationMs: dur,
         };
         executedSteps.push(step);
         options.onStep(step);
@@ -817,6 +1107,8 @@ export async function executeAgentToolBlocksAsync(
 
       if (action.tool === "todo_write" && Array.isArray(action.todos)) {
         const summary = action.todos.map((t) => `[${t.status}] ${t.content}`).join("\n");
+        const dur = Date.now() - t0;
+        toolsInvoked.push({ tool: "todo_write", status: "done", durationMs: dur });
         const step: AgentStepEvent = {
           id: `step-todo-${Date.now()}-${executedSteps.length}`,
           kind: "todo",
@@ -826,7 +1118,7 @@ export async function executeAgentToolBlocksAsync(
           detail: `${action.todos.filter((t) => t.status === "completed").length}/${action.todos.length} completed`,
           outputPreview: summary,
           status: "done",
-          durationMs: Date.now() - t0,
+          durationMs: dur,
         };
         executedSteps.push(step);
         options.onStep(step);
@@ -835,7 +1127,10 @@ export async function executeAgentToolBlocksAsync(
       }
 
       if (action.tool === "repo_map") {
-        const topFiles = readdirSync(root).filter((e) => !IGNORED_FOLDERS.has(e)).slice(0, 50);
+        const targetDir = action.path ? resolveSafeTargetPath(action.path, "repo_map") : root;
+        const topFiles = readdirSync(targetDir).filter((e) => !IGNORED_FOLDERS.has(e)).slice(0, 50);
+        const dur = Date.now() - t0;
+        toolsInvoked.push({ tool: "repo_map", status: "done", durationMs: dur });
         const step: AgentStepEvent = {
           id: `step-repomap-${Date.now()}-${executedSteps.length}`,
           kind: "read",
@@ -845,7 +1140,7 @@ export async function executeAgentToolBlocksAsync(
           detail: `${topFiles.length} modules`,
           outputPreview: topFiles.join("\n"),
           status: "done",
-          durationMs: Date.now() - t0,
+          durationMs: dur,
         };
         executedSteps.push(step);
         options.onStep(step);
@@ -854,26 +1149,52 @@ export async function executeAgentToolBlocksAsync(
       }
 
       if (action.tool === "run_command" && action.command) {
-        const out = execSync(action.command, {
-          cwd: root,
-          encoding: "utf8",
-          timeout: 15_000,
-          windowsHide: true,
+        const cmdRes = await runManagedCommand({
+          command: action.command,
+          cwd: action.path || ".",
+          workspaceRoot: root,
+          timeoutMs: 20_000,
+          mode: options.mode ?? "turbo",
+          signal: options.signal,
+          onApprovalRequired: options.onApprovalRequired,
         });
+
+        commandsExecuted.push({
+          command: action.command,
+          cwd: cmdRes.cwd,
+          exitCode: cmdRes.exitCode,
+          durationMs: cmdRes.durationMs,
+          timedOut: cmdRes.timedOut,
+          cancelled: cmdRes.cancelled,
+          stdoutPreview: cmdRes.stdout.slice(0, 1500),
+          stderrPreview: cmdRes.stderr.slice(0, 1500),
+        });
+
+        toolsInvoked.push({
+          tool: "run_command",
+          target: action.command.slice(0, 80),
+          status: cmdRes.ok ? "done" : "error",
+          durationMs: cmdRes.durationMs,
+        });
+
         const step: AgentStepEvent = {
           id: `step-cmd-${Date.now()}-${executedSteps.length}`,
           kind: "command",
           agentRole: "Builder",
           label: `Ran terminal command: ${action.command.slice(0, 55)}`,
-          plainSummary: `Builder Agent executed command in terminal`,
-          detail: out.trim().slice(0, 140) || "Completed (exit 0)",
-          outputPreview: `$ ${action.command}\n${out.trim().slice(0, 1500)}`,
-          status: "done",
-          durationMs: Date.now() - t0,
+          plainSummary: cmdRes.ok
+            ? `Builder Agent executed command (exit 0)`
+            : `Command exited with ${cmdRes.exitCode ?? (cmdRes.timedOut ? "TIMEOUT" : "CANCELLED")}`,
+          detail: cmdRes.combinedOutput.slice(0, 140) || `exit ${cmdRes.exitCode ?? 0}`,
+          outputPreview: `$ ${action.command}\n[exit=${cmdRes.exitCode}]\n${cmdRes.combinedOutput.slice(0, 1500)}`,
+          status: cmdRes.ok ? "done" : "error",
+          durationMs: cmdRes.durationMs,
         };
         executedSteps.push(step);
         options.onStep(step);
-        toolObservations.push(`[run_command: ${action.command}]\n${out.trim().slice(0, 3000)}`);
+        toolObservations.push(
+          `[run_command: ${action.command} | exit=${cmdRes.exitCode}]\n${cmdRes.combinedOutput.slice(0, 3000)}`,
+        );
         continue;
       }
 
@@ -882,6 +1203,13 @@ export async function executeAgentToolBlocksAsync(
           serverName: action.serverName,
           toolName: action.toolName,
           args: action.args ?? {},
+          signal: options.signal,
+        });
+        toolsInvoked.push({
+          tool: `mcp:${action.serverName}/${action.toolName}`,
+          target: action.serverName,
+          status: mcpRes.ok ? "done" : "error",
+          durationMs: mcpRes.durationMs,
         });
         const step: AgentStepEvent = {
           id: `step-mcp-${Date.now()}-${executedSteps.length}`,
@@ -901,12 +1229,20 @@ export async function executeAgentToolBlocksAsync(
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      const dur = Date.now() - t0;
+      toolsInvoked.push({
+        tool: action.tool,
+        target: action.path || action.command,
+        status: "error",
+        durationMs: dur,
+      });
       const step: AgentStepEvent = {
         id: `step-err-${Date.now()}-${executedSteps.length}`,
         kind: "command",
         agentRole: "Verifier",
         label: `Tool notice: ${msg}`,
         status: "error",
+        durationMs: dur,
       };
       executedSteps.push(step);
       options.onStep(step);
@@ -932,6 +1268,11 @@ export async function executeAgentToolBlocksAsync(
     toolObservations,
     checkpoint,
     checkpointId: checkpoint?.checkpointId,
+    filesInspected: [...filesInspected],
+    filesCreated: [...filesCreated],
+    filesModified: [...filesModified],
+    commandsExecuted,
+    toolsInvoked,
   };
 }
 
@@ -941,7 +1282,7 @@ export function executeAgentToolBlocks(
   onStep: (step: AgentStepEvent) => void,
 ): { cleanedResponse: string; executedSteps: AgentStepEvent[] } {
   const executedSteps: AgentStepEvent[] = [];
-  const root = resolve(workspaceRoot);
+  const root = resolveCanonicalWorkspaceRoot(workspaceRoot);
   const regex = /```apex-action\r?\n([\s\S]*?)```/g;
 
   const cleanedResponse = responseText.replace(regex, (fullMatch, jsonBlock: string) => {
@@ -949,7 +1290,7 @@ export function executeAgentToolBlocks(
       const action = JSON.parse(jsonBlock.trim()) as ToolExecutionAction;
       const t0 = Date.now();
       if (action.tool === "write_file" && action.path && typeof action.content === "string") {
-        const targetPath = resolve(root, action.path);
+        const targetPath = assertCanonicalWorkspacePath(root, action.path, { operation: "write_file" });
         mkdirSync(dirname(targetPath), { recursive: true });
         writeFileSync(targetPath, action.content, "utf8");
         const step: AgentStepEvent = {
@@ -971,7 +1312,7 @@ export function executeAgentToolBlocks(
         typeof action.target === "string" &&
         typeof action.replacement === "string"
       ) {
-        const targetPath = resolve(root, action.path);
+        const targetPath = assertCanonicalWorkspacePath(root, action.path, { operation: "edit_file" });
         const current = readFileSync(targetPath, "utf8");
         if (!current.includes(action.target)) {
           throw new Error(`Target snippet not found in ${action.path}`);
@@ -989,25 +1330,6 @@ export function executeAgentToolBlocks(
         executedSteps.push(step);
         onStep(step);
         return `\n> **Executed File Edit**: \`${relative(root, targetPath) || action.path}\`\n`;
-      }
-      if (action.tool === "run_command" && action.command) {
-        const out = execSync(action.command, {
-          cwd: root,
-          encoding: "utf8",
-          timeout: 15_000,
-          windowsHide: true,
-        });
-        const step: AgentStepEvent = {
-          id: `step-cmd-${Date.now()}-${executedSteps.length}`,
-          kind: "command",
-          label: `Ran ${action.command.slice(0, 60)}`,
-          detail: out.trim().slice(0, 300),
-          status: "done",
-          durationMs: Date.now() - t0,
-        };
-        executedSteps.push(step);
-        onStep(step);
-        return `\n\`\`\`text\n$ ${action.command}\n${out.trim().slice(0, 1200)}\n\`\`\`\n`;
       }
     } catch (err) {
       const step: AgentStepEvent = {
