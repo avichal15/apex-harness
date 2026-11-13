@@ -1,14 +1,16 @@
 /**
  * Universal JSON-RPC 2.0 MCP Client Bridge (`server/harness/mcp-client-bridge.ts`)
  *
- * Connects to any of the 15 discovered MCP servers (from Antigravity, Claude Code,
+ * Connects to any of the discovered MCP servers (from Antigravity, Claude Code,
  * Cursor, and Gemini CLI) over stdio or HTTP JSON-RPC 2.0 to list tools (`tools/list`)
- * and execute tool calls (`tools/call`) with cooperative timeout enforcement.
+ * and execute tool calls (`tools/call`) with cooperative timeout enforcement,
+ * `AbortSignal` cancellation propagation, and process-tree termination.
  */
 
 import { spawn } from "node:child_process";
 import { discoverAllUniversalMcpServers, type UniversalMcpServerEntry } from "./universal-skill-loader.ts";
 import { runWithToolTimeout } from "./deepseek-subsystems.ts";
+import { killProcessTree } from "./process-manager.ts";
 
 export interface McpToolSchema {
   name: string;
@@ -22,6 +24,7 @@ export interface McpToolCallResult {
   toolName: string;
   content: string;
   isError?: boolean;
+  cancelled?: boolean;
   durationMs: number;
 }
 
@@ -34,119 +37,117 @@ async function runStdioMcpRpc(
   method: "tools/list" | "tools/call",
   params: Record<string, unknown> = {},
   timeoutMs = 10_000,
+  parentSignal?: AbortSignal,
 ): Promise<unknown> {
   if (!server.command) {
     throw new Error(`MCP server '${server.name}' has no stdio command configured.`);
   }
 
-  const outcome = await runWithToolTimeout(async (signal) => {
-    return await new Promise<unknown>((resolvePromise, rejectPromise) => {
-      const child = spawn(server.command!, server.args ?? [], {
-        env: {
-          ...process.env,
-          ...(server.env ?? {}),
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-        windowsHide: true,
-        shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(server.command!),
-      });
+  const outcome = await runWithToolTimeout(
+    async (signal) => {
+      return await new Promise<unknown>((resolvePromise, rejectPromise) => {
+        const child = spawn(server.command!, server.args ?? [], {
+          env: {
+            ...process.env,
+            ...(server.env ?? {}),
+          },
+          stdio: ["pipe", "pipe", "pipe"],
+          windowsHide: true,
+          shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(server.command!),
+        });
 
-      let stdoutBuf = "";
-      let settled = false;
+        let stdoutBuf = "";
+        let settled = false;
 
-      const cleanup = () => {
-        if (!child.killed) {
-          try {
-            child.kill();
-          } catch {
-            // Ignore kill race
-          }
-        }
-      };
+        const cleanup = () => {
+          killProcessTree(child.pid);
+        };
 
-      signal.addEventListener(
-        "abort",
-        () => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            cleanup();
+            if (!settled) {
+              settled = true;
+              rejectPromise(new Error("MCP stdio request aborted"));
+            }
+          },
+          { once: true },
+        );
+
+        child.on("error", (err) => {
           cleanup();
           if (!settled) {
             settled = true;
-            rejectPromise(new Error("MCP stdio request aborted by timeout"));
+            rejectPromise(err);
           }
-        },
-        { once: true },
-      );
+        });
 
-      child.on("error", (err) => {
-        cleanup();
-        if (!settled) {
-          settled = true;
-          rejectPromise(err);
-        }
-      });
+        child.stdout.on("data", (chunk: Buffer) => {
+          stdoutBuf += chunk.toString("utf8");
+          const lines = stdoutBuf.split(/\r?\n/);
+          stdoutBuf = lines.pop() ?? "";
 
-      child.stdout.on("data", (chunk: Buffer) => {
-        stdoutBuf += chunk.toString("utf8");
-        const lines = stdoutBuf.split(/\r?\n/);
-        stdoutBuf = lines.pop() ?? "";
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed.startsWith("{")) continue;
-          try {
-            const msg = JSON.parse(trimmed) as {
-              id?: number;
-              result?: unknown;
-              error?: { message?: string };
-            };
-            if (msg.id === 1) {
-              // Initialized; send notifications/initialized + target method (id: 2)
-              const notif = JSON.stringify({
-                jsonrpc: "2.0",
-                method: "notifications/initialized",
-              });
-              const req2 = JSON.stringify({
-                jsonrpc: "2.0",
-                id: 2,
-                method,
-                params,
-              });
-              child.stdin.write(`${notif}\n${req2}\n`);
-            } else if (msg.id === 2) {
-              settled = true;
-              cleanup();
-              if (msg.error) {
-                rejectPromise(new Error(msg.error.message || "MCP RPC error"));
-              } else {
-                resolvePromise(msg.result);
+          for (const line of lines) {
+            const trimmed = line.trim();
+            if (!trimmed.startsWith("{")) continue;
+            try {
+              const msg = JSON.parse(trimmed) as {
+                id?: number;
+                result?: unknown;
+                error?: { message?: string };
+              };
+              if (msg.id === 1) {
+                const notif = JSON.stringify({
+                  jsonrpc: "2.0",
+                  method: "notifications/initialized",
+                });
+                const req2 = JSON.stringify({
+                  jsonrpc: "2.0",
+                  id: 2,
+                  method,
+                  params,
+                });
+                child.stdin.write(`${notif}\n${req2}\n`);
+              } else if (msg.id === 2) {
+                settled = true;
+                cleanup();
+                if (msg.error) {
+                  rejectPromise(new Error(msg.error.message || "MCP RPC error"));
+                } else {
+                  resolvePromise(msg.result);
+                }
+                return;
               }
-              return;
+            } catch {
+              // Ignore non-JSON stdout line
             }
-          } catch {
-            // Ignore non-JSON stdout line
           }
-        }
-      });
+        });
 
-      child.on("close", (code) => {
-        if (!settled) {
-          settled = true;
-          rejectPromise(new Error(`MCP server '${server.name}' exited before responding (code ${code})`));
-        }
-      });
+        child.on("close", (code) => {
+          if (!settled) {
+            settled = true;
+            rejectPromise(new Error(`MCP server '${server.name}' exited before responding (code ${code})`));
+          }
+        });
 
-      const initReq = JSON.stringify({
-        jsonrpc: "2.0",
-        id: 1,
-        method: "initialize",
-        params: {
-          protocolVersion: "2024-11-05",
-          capabilities: {},
-          clientInfo: { name: "apex-harness", version: "2.0.0" },
-        },
+        const initReq = JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "apex-harness", version: "2.0.0" },
+          },
+        });
+        child.stdin.write(`${initReq}\n`);
       });
-      child.stdin.write(`${initReq}\n`);
-    });
-  }, timeoutMs);
+    },
+    timeoutMs,
+    parentSignal,
+  );
 
   if (!outcome.ok) {
     throw new Error(outcome.error?.message ?? `MCP call to '${server.name}' failed`);
@@ -160,6 +161,7 @@ async function runStdioMcpRpc(
 export async function listMcpServerTools(
   serverOrName: string | UniversalMcpServerEntry,
   timeoutMs = 8_000,
+  signal?: AbortSignal,
 ): Promise<{ ok: boolean; serverName: string; tools: McpToolSchema[]; error?: string }> {
   const servers = discoverAllUniversalMcpServers();
   const server =
@@ -182,6 +184,7 @@ export async function listMcpServerTools(
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list", params: {} }),
+        signal,
       });
       const data = (await res.json()) as { result?: { tools?: McpToolSchema[] } };
       return {
@@ -191,7 +194,7 @@ export async function listMcpServerTools(
       };
     }
 
-    const res = (await runStdioMcpRpc(server, "tools/list", {}, timeoutMs)) as {
+    const res = (await runStdioMcpRpc(server, "tools/list", {}, timeoutMs, signal)) as {
       tools?: McpToolSchema[];
     };
     return {
@@ -221,10 +224,12 @@ export async function callMcpServerTool(
         toolName: string;
         args?: Record<string, unknown>;
         timeoutMs?: number;
+        signal?: AbortSignal;
       },
   toolNameArg?: string,
   argsArg?: Record<string, unknown>,
   timeoutMsArg?: number,
+  signalArg?: AbortSignal,
 ): Promise<McpToolCallResult> {
   const t0 = Date.now();
   const servers = discoverAllUniversalMcpServers();
@@ -242,6 +247,9 @@ export async function callMcpServerTool(
   const timeoutMs = isOptionsObj
     ? ((arg1 as { timeoutMs?: number }).timeoutMs ?? 12_000)
     : (timeoutMsArg ?? 12_000);
+  const signal = isOptionsObj
+    ? (arg1 as { signal?: AbortSignal }).signal
+    : signalArg;
 
   const server =
     typeof arg1 === "object" && arg1 !== null && "command" in arg1
@@ -271,6 +279,7 @@ export async function callMcpServerTool(
           method: "tools/call",
           params: { name: toolName, arguments: toolArgs },
         }),
+        signal,
       });
       const json = (await res.json()) as { result?: unknown; error?: { message?: string } };
       if (json.error) throw new Error(json.error.message || "HTTP MCP error");
@@ -281,6 +290,7 @@ export async function callMcpServerTool(
         "tools/call",
         { name: toolName, arguments: toolArgs },
         timeoutMs,
+        signal,
       );
     }
 
@@ -302,12 +312,14 @@ export async function callMcpServerTool(
       durationMs: Date.now() - t0,
     };
   } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
     return {
       ok: false,
       serverName: server.name,
       toolName,
-      content: err instanceof Error ? err.message : String(err),
+      content: msg,
       isError: true,
+      cancelled: msg.toLowerCase().includes("cancel") || msg.toLowerCase().includes("abort"),
       durationMs: Date.now() - t0,
     };
   }
