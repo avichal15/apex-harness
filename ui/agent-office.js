@@ -82,6 +82,7 @@
     executionId: null,
     executionState: "idle",
     pendingApproval: null,
+    selectedDeskId: null,
     activeRole: null,
     completedRoles: new Set(),
     deskStatuses: {},
@@ -98,9 +99,19 @@
 
   for (const d of AGENT_DESKS) {
     officeState.deskStatuses[d.id] = {
-      state: "idle", // "idle" | "working" | "done" | "error"
+      state: "idle", // "idle" | "working" | "done" | "error" | "skipped"
+      rawState: "queued",
       taskText: d.defaultTask,
       modelLabel: d.modelLabel,
+      driverId: "auto-driver",
+      sessionId: "standby",
+      currentTool: "",
+      retryCount: 0,
+      maxRetries: 2,
+      startedAt: "",
+      completedAt: "",
+      durationMs: 0,
+      events: [],
       updatedAt: 0,
     };
   }
@@ -182,11 +193,23 @@
               ? "done"
               : node.state === "failed" || node.state === "cancelled"
                 ? "error"
-                : "idle";
+                : node.state === "skipped"
+                  ? "skipped"
+                  : "idle";
         desk.state = mappedState;
+        desk.rawState = node.state;
         desk.modelLabel = (node.actualModelUsed || node.assignedModelId || node.engineeringRole || "")
           .replace(/^agy-acp\//, "")
           .slice(0, 26);
+        desk.driverId = node.driverId || "auto-driver";
+        desk.sessionId = node.sessionId || payload.executionId || "active";
+        desk.currentTool = node.currentTool || "";
+        desk.retryCount = node.retryCount || 0;
+        desk.maxRetries = node.maxRetries || 2;
+        desk.startedAt = node.startedAt || "";
+        desk.completedAt = node.completedAt || "";
+        desk.durationMs = node.durationMs || 0;
+        desk.events = Array.isArray(node.events) ? node.events : [];
         desk.taskText = node.outputSummary || node.assignedTask || desk.taskText;
       }
 
@@ -194,12 +217,17 @@
         id: node.id,
         label: `${node.role} (${node.engineeringRole}): ${node.assignedTask.slice(0, 56)}`,
         status:
-          node.state === "completed"
+          node.state === "completed" || node.state === "skipped"
             ? "done"
             : node.state === "running"
               ? "working"
               : "pending",
-        liveDetail: node.outputSummary ? node.outputSummary.slice(0, 68) : undefined,
+        liveDetail:
+          node.state === "skipped"
+            ? "Skipped (fast-path topology)"
+            : node.outputSummary
+              ? node.outputSummary.slice(0, 68)
+              : undefined,
       }));
     }
 
@@ -480,16 +508,24 @@
               : "idle";
       const badgeLabel =
         st.state === "working"
-          ? "WORKING"
+          ? st.currentTool
+            ? `TOOL:${st.currentTool.toUpperCase().slice(0, 8)}`
+            : "WORKING"
           : st.state === "done"
-            ? "DONE"
+            ? st.durationMs
+              ? `DONE ${(st.durationMs / 1000).toFixed(1)}s`
+              : "DONE"
             : st.state === "error"
               ? "STOPPED"
-              : "STANDBY";
+              : st.state === "skipped"
+                ? "SKIPPED"
+                : "STANDBY";
       return `
         <div
           class="office-desk-card ${stateCls}"
-          style="left:${d.x}%;top:${d.y}%;--desk-accent:${d.color}"
+          style="left:${d.x}%;top:${d.y}%;--desk-accent:${d.color};cursor:pointer"
+          onclick="window.ApexAgentOffice.selectDesk('${d.id}')"
+          title="Click to inspect ${escapeHtml(d.title)} telemetry (Driver: ${escapeHtml(st.driverId)})"
         >
           <div class="office-desk-top">
             <span class="office-desk-avatar">
@@ -505,6 +541,47 @@
         </div>
       `;
     }).join("");
+
+    const approvalBannerHtml = officeState.pendingApproval
+      ? `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 14px;background:rgba(245,158,11,0.14);border-bottom:1px solid rgba(245,158,11,0.35);font-size:12px;">
+          <div>
+            <strong style="color:#fbbf24;">Approval Required (${escapeHtml(officeState.pendingApproval.tool)}):</strong>
+            <code style="margin-left:6px;color:#f4f4f6;">${escapeHtml(officeState.pendingApproval.commandOrPath)}</code>
+            <span style="color:#9ca3af;margin-left:6px;">(${escapeHtml(officeState.pendingApproval.reason)})</span>
+          </div>
+          <div style="display:flex;gap:6px;">
+            <button class="btn-ghost" style="border-color:#22c55e;color:#4ade80;" onclick="window.resolveActiveApproval && window.resolveActiveApproval(true)">Approve</button>
+            <button class="btn-danger-sm" onclick="window.resolveActiveApproval && window.resolveActiveApproval(false)">Deny</button>
+          </div>
+        </div>
+      `
+      : "";
+
+    const selectedDesk = officeState.selectedDeskId
+      ? officeState.deskStatuses[officeState.selectedDeskId]
+      : null;
+    const selectedDeskMeta = officeState.selectedDeskId
+      ? AGENT_DESKS.find((d) => d.id === officeState.selectedDeskId)
+      : null;
+    const deskInspectorHtml =
+      selectedDesk && selectedDeskMeta
+        ? `
+        <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 14px;background:#111319;border-top:1px solid #222631;font-size:11px;color:#9ca3af;">
+          <div style="display:flex;flex-wrap:wrap;gap:12px;align-items:center;">
+            <strong style="color:#f4f4f6;">${escapeHtml(selectedDeskMeta.title)}</strong>
+            <span>Driver: <code>${escapeHtml(selectedDesk.driverId)}</code></span>
+            <span>Session: <code>${escapeHtml(selectedDesk.sessionId)}</code></span>
+            <span>Model: <code>${escapeHtml(selectedDesk.modelLabel)}</code></span>
+            <span>State: <code>${escapeHtml(selectedDesk.rawState)}</code></span>
+            ${selectedDesk.currentTool ? `<span>Active Tool: <code>${escapeHtml(selectedDesk.currentTool)}</code></span>` : ""}
+            <span>Retries: <code>${selectedDesk.retryCount}/${selectedDesk.maxRetries}</code></span>
+            ${selectedDesk.durationMs ? `<span>Duration: <code>${selectedDesk.durationMs}ms</code></span>` : ""}
+          </div>
+          <button class="btn-ghost" style="padding:2px 6px;font-size:10px;" onclick="window.ApexAgentOffice.selectDesk(null)">Close</button>
+        </div>
+      `
+        : "";
 
     const todoRows = officeState.todos
       .map((t) => {
@@ -542,6 +619,7 @@
             <button class="btn-ghost" onclick="window.ApexAgentOffice.toggleMode()">Minimize Office</button>
           </div>
         </div>
+        ${approvalBannerHtml}
         <div class="office-stage-body">
           <div class="office-floorplan">
             <svg class="office-floorplan-svg" viewBox="0 0 100 100" preserveAspectRatio="none">
@@ -555,8 +633,15 @@
             <div class="office-taskboard-list">${todoRows}</div>
           </div>
         </div>
+        ${deskInspectorHtml}
       </div>
     `;
+  }
+
+  function selectDesk(deskId) {
+    officeState.selectedDeskId =
+      officeState.selectedDeskId === deskId ? null : deskId;
+    renderAgentOffice();
   }
 
   window.ApexAgentOffice = {
@@ -565,6 +650,7 @@
     resetForTurn: resetOfficeForNewTurn,
     runDemo: runDemoSimulation,
     toggleMode: toggleOfficeMode,
+    selectDesk,
     render: renderAgentOffice,
   };
 

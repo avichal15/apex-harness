@@ -1050,6 +1050,60 @@
       }
     }
 
+    async function inspectMcpServerTools(serverName) {
+      state.activeMcpServer = serverName;
+      state.activeMcpToolsStatus = "Discovering MCP tools...";
+      renderInspector();
+      try {
+        const res = await apiFetch("/api/mcp/tools", {
+          method: "POST",
+          body: JSON.stringify({ serverName }),
+        });
+        const data = await res.json();
+        if (data.ok) {
+          state.activeMcpTools = data.tools || [];
+          state.activeMcpToolsStatus = `${state.activeMcpTools.length} tool(s) discovered on ${serverName}`;
+        } else {
+          state.activeMcpTools = [];
+          state.activeMcpToolsStatus = data.error || "Discovery failed";
+        }
+      } catch (err) {
+        state.activeMcpTools = [];
+        state.activeMcpToolsStatus = err.message || "Request error";
+      }
+      renderInspector();
+    }
+
+    async function refreshHermesMemory() {
+      try {
+        const res = await apiFetch("/api/memory");
+        const data = await res.json();
+        state.hermesMemories = data.entries || [];
+        renderInspector();
+      } catch {}
+    }
+
+    async function saveHermesMemoryFromUi() {
+      const titleEl = document.getElementById("hermes-mem-title");
+      const contentEl = document.getElementById("hermes-mem-content");
+      if (!titleEl || !contentEl || !contentEl.value.trim()) return;
+      const res = await apiFetch("/api/memory", {
+        method: "POST",
+        body: JSON.stringify({
+          title: titleEl.value.trim() || "Project Note",
+          content: contentEl.value.trim(),
+          category: "project_architecture",
+          workspacePath: state.activeWorkspace,
+        }),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        titleEl.value = "";
+        contentEl.value = "";
+        await refreshHermesMemory();
+      }
+    }
+
     async function saveSurfaceFile() {
       const textarea = document.getElementById("surface-textarea");
       if (!textarea) return;
@@ -1289,14 +1343,19 @@
 
           <div class="insp-card">
             <div class="insp-card-header">
-              <span class="insp-card-title">DeepSeek-Harness & MCP</span>
+              <span class="insp-card-title">DeepSeek-Harness & MCP Runtime</span>
               <span class="insp-badge ok">${state.mcpServers.length} MCP</span>
             </div>
             <div style="display:flex;flex-wrap:wrap;gap:5px">
               ${state.mcpServers
-                .map((m) => `<span class="meta-tag" title="${escapeHtml(m.sourcePath)}">${escapeHtml(m.name)}</span>`)
+                .map((m) => `<span class="meta-tag" style="cursor:pointer" onclick="inspectMcpServerTools('${escapeHtml(m.name)}')" title="Click to inspect MCP tools (${escapeHtml(m.sourcePath)})">${escapeHtml(m.name)}</span>`)
                 .join("")}
             </div>
+            ${
+              state.activeMcpToolsStatus
+                ? `<div class="insp-mono" style="margin-top:6px;max-height:110px;overflow-y:auto"><strong>${escapeHtml(state.activeMcpToolsStatus)}</strong>\n${(state.activeMcpTools || []).map((t) => `• ${escapeHtml(t.name)}`).join("\n")}</div>`
+                : ""
+            }
           </div>
         `;
         return;
@@ -1422,6 +1481,33 @@
                       <div class="insp-row">
                         <span style="font-family:var(--font-mono);font-size:10.5px">${escapeHtml(s.snapshotId)}</span>
                         <button class="btn-ghost" style="padding:1px 6px;font-size:10px" onclick="rollbackSnapshot('${escapeHtml(s.snapshotId)}')">Rollback</button>
+                      </div>
+                    `,
+                      )
+                      .join("")}
+                  </div>`
+                : ""
+            }
+          </div>
+
+          <div class="insp-card">
+            <div class="insp-card-header">
+              <span class="insp-card-title">Hermes Bounded Memory Store</span>
+              <button class="btn-ghost" style="padding:1px 6px;font-size:10px" onclick="refreshHermesMemory()">Refresh</button>
+            </div>
+            <input id="hermes-mem-title" class="ide-panel-input" placeholder="Memory title (secret-scrubbed before persistence)" />
+            <textarea id="hermes-mem-content" class="surface-editor" style="min-height:52px" placeholder="Persistent project or operator memory..."></textarea>
+            <button class="insp-action-btn" onclick="saveHermesMemoryFromUi()">Save Scrubbed Memory</button>
+            ${
+              (state.hermesMemories || []).length > 0
+                ? `<div class="insp-list" style="max-height:110px;margin-top:6px">
+                    ${(state.hermesMemories || [])
+                      .slice(0, 6)
+                      .map(
+                        (m) => `
+                      <div class="insp-row" style="flex-direction:column;align-items:stretch;gap:2px">
+                        <span style="color:var(--text-primary);font-size:11px;font-weight:500">${escapeHtml(m.title)}</span>
+                        <span style="font-family:var(--font-mono);font-size:10px;color:var(--text-muted)">${escapeHtml(m.content.slice(0, 90))}</span>
                       </div>
                     `,
                       )
