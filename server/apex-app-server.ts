@@ -610,6 +610,9 @@ export function createApexAppServer() {
           res,
           200,
           {
+            ok: true,
+            status: "ok",
+            projectRoot: APEX_PROJECT_ROOT,
             sessionToken: getLocalSessionToken(),
             projects,
             conversations,
