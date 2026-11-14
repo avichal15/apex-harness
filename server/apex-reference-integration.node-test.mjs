@@ -75,8 +75,14 @@ import {
   validateToolCallSchema,
 } from "./harness/protocol-adapters.ts";
 import {
+  MasterVaultKeyCorruptedError,
+  clearMasterKeyCache,
+  decryptSecretWithMasterKey,
+  encryptLegacyV1SecretForMigrationTest,
+  exportMasterKeyBackupHex,
   getMasterKeyFilePath,
   getOrCreateMasterVaultKey,
+  recoverOrResetCorruptedMasterKey,
 } from "./harness/secret-store.ts";
 import { discoverAllUniversalSkills } from "./harness/universal-skill-loader.ts";
 import { getLocalSessionToken } from "./harness/workspace-security.ts";
@@ -1053,20 +1059,31 @@ test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-
   // ==========================================================================
   // V-08: OS/CSPRNG Master Key Store & Chained Shell Command Policy
   // ==========================================================================
-  await t.test("V-08: CSPRNG master key store (no predictable hostname/username key derivation) and chained shell command policy enforcement", async () => {
+  await t.test("V-08: Windows DPAPI / CSPRNG master key store, legacy migration, corruption/missing-key recovery, and chained shell command policy", async () => {
     const tempDir = makeTempDir("apex-v08-");
     try {
       const keyInfo = getOrCreateMasterVaultKey(tempDir);
       assert.equal(keyInfo.key.length, 32);
-      assert.ok(
-        keyInfo.source === "csprng_master_key_file" ||
-          keyInfo.source === "windows_dpapi" ||
-          keyInfo.source === "env_override",
-      );
+      if (process.platform === "win32" && process.env.APEX_DISABLE_DPAPI !== "1") {
+        assert.equal(
+          keyInfo.source,
+          "windows_dpapi",
+          "Windows must use DPAPI-protected master-key storage by default",
+        );
+        const rawKeyFile = readFileSync(getMasterKeyFilePath(tempDir), "utf8");
+        assert.ok(rawKeyFile.startsWith("DPAPI:"), "Master key file on Windows must be DPAPI-wrapped");
+      } else {
+        assert.equal(keyInfo.source, "csprng_master_key_file");
+        assert.ok(keyInfo.fallbackReason, "Fallback reason must be reported when DPAPI is not used");
+      }
       assert.ok(existsSync(getMasterKeyFilePath(tempDir)));
 
+      // Backup the master key hex before testing corruption & missing-key guards
+      const backupHex = exportMasterKeyBackupHex(tempDir);
+      assert.equal(backupHex.length, 64);
+
       storeEncryptedProviderSecret(tempDir, "openai-direct", "sk-live-super-secret-999");
-      const decrypted = resolveProviderSecret(tempDir, {
+      const providerStub = {
         id: "openai-direct",
         name: "OpenAI",
         protocol: "openai-compat",
@@ -1077,8 +1094,67 @@ test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-
         timeoutMs: 10000,
         defaultModels: [],
         updatedAt: new Date().toISOString(),
+      };
+      assert.equal(resolveProviderSecret(tempDir, providerStub), "sk-live-super-secret-999");
+
+      // 1. Legacy v1 secret migration test
+      const legacyRec = encryptLegacyV1SecretForMigrationTest(tempDir, "sk-legacy-v1-migrated-key");
+      const migrated = decryptSecretWithMasterKey(tempDir, legacyRec);
+      assert.ok(migrated);
+      assert.equal(migrated.plaintext, "sk-legacy-v1-migrated-key");
+      assert.equal(migrated.migratedFromLegacy, true);
+
+      // 2. Corrupted .master-key file detection (must NOT silently regenerate key or orphan vault)
+      writeFileSync(getMasterKeyFilePath(tempDir), "DPAPI:CORRUPTED_GARBAGE_PAYLOAD!!!\n", "utf8");
+      clearMasterKeyCache(tempDir);
+      assert.throws(
+        () => getOrCreateMasterVaultKey(tempDir),
+        (err) =>
+          err instanceof MasterVaultKeyCorruptedError &&
+          err.reason === "corrupted_master_key" &&
+          err.existingVaultEntriesCount >= 1,
+        "Corrupted .master-key must throw MasterVaultKeyCorruptedError instead of silently regenerating",
+      );
+      assert.ok(
+        existsSync(`${getMasterKeyFilePath(tempDir)}.corrupt`),
+        "Corrupted .master-key must be backed up to .master-key.corrupt",
+      );
+
+      // 3. Missing .master-key file detection when v2 encrypted secrets already exist
+      rmSync(getMasterKeyFilePath(tempDir), { force: true });
+      clearMasterKeyCache(tempDir);
+      assert.throws(
+        () => getOrCreateMasterVaultKey(tempDir),
+        (err) =>
+          err instanceof MasterVaultKeyCorruptedError &&
+          err.reason === "missing_master_key_with_existing_vault",
+        "Missing .master-key with existing v2 vault must throw MasterVaultKeyCorruptedError",
+      );
+
+      // 4. Backup restoration recovers existing encrypted secrets without data loss
+      const restoredInfo = recoverOrResetCorruptedMasterKey(tempDir, {
+        backupKeyHex: backupHex,
       });
-      assert.equal(decrypted, "sk-live-super-secret-999");
+      assert.equal(restoredInfo.key.toString("hex"), backupHex);
+      assert.equal(
+        resolveProviderSecret(tempDir, providerStub),
+        "sk-live-super-secret-999",
+        "Restoring master key from backupHex must decrypt existing vault secrets",
+      );
+
+      // 5. Fallback reporting when DPAPI is explicitly disabled
+      const fallbackDir = makeTempDir("apex-v08-fallback-");
+      const prevDisable = process.env.APEX_DISABLE_DPAPI;
+      process.env.APEX_DISABLE_DPAPI = "1";
+      try {
+        const fbInfo = getOrCreateMasterVaultKey(fallbackDir);
+        assert.equal(fbInfo.source, "csprng_master_key_file");
+        assert.equal(fbInfo.fallbackReason, "disabled_via_APEX_DISABLE_DPAPI");
+      } finally {
+        if (prevDisable === undefined) delete process.env.APEX_DISABLE_DPAPI;
+        else process.env.APEX_DISABLE_DPAPI = prevDisable;
+        rmSync(fallbackDir, { recursive: true, force: true });
+      }
 
       // Chained shell command policy parser tests
       const chain1 = splitShellCommandChain("echo hello && rm -rf /");
