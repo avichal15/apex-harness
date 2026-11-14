@@ -9,8 +9,9 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { ProviderConfigEntry, ProviderProtocol } from "../../shared/apex-contracts.ts";
-import { revertTurnCheckpoint } from "../apex-llm-engine.ts";
+import { callUnifiedFleetWithFailover, revertTurnCheckpoint } from "../apex-llm-engine.ts";
 import { ensureCleanCarbonHome } from "./apex-fleet-sync.ts";
+import { killProcessTree } from "./process-manager.ts";
 import {
   AnthropicMessagesProtocolAdapter,
   GeminiProtocolAdapter,
@@ -64,6 +65,7 @@ export interface DriverSession {
   createdAt: string;
   updatedAt: string;
   status: "active" | "interrupted" | "cancelled" | "closed";
+  resumedCount?: number;
   messages: Array<{ role: "system" | "user" | "assistant" | "tool"; content: string; toolCallId?: string }>;
 }
 
@@ -532,7 +534,9 @@ export class HttpProtocolDriver implements ApexDriver {
 }
 
 /**
- * Native CLI / ACP Harness Driver (`antigravity-acp`, `claude-cli`, `codex-cli`, `gemini-cli`, `opencode-cli`).
+ * Native CLI Harness Driver (`cli:antigravity-acp`, `cli:claude-cli`, `cli:codex-cli`, `cli:gemini-cli`, `cli:opencode-cli`).
+ * Streams incremental JSONL/stdout chunks line-by-line as they arrive from the child process,
+ * terminates child process trees safely on Windows (`killProcessTree`), and reports honest capabilities.
  */
 export class NativeCliHarnessDriver implements ApexDriver {
   readonly id: string;
@@ -541,6 +545,9 @@ export class NativeCliHarnessDriver implements ApexDriver {
   readonly capabilities: DriverCapabilities;
   private readonly dataDir: string;
   private readonly binaryName: string;
+  private readonly binaryPath?: string;
+  private readonly argsPrefix: string[];
+  private readonly resumeFlag?: string;
   private readonly defaultModels: string[];
   private readonly activeProcesses = new Map<string, ChildProcess>();
 
@@ -548,21 +555,32 @@ export class NativeCliHarnessDriver implements ApexDriver {
     id: string;
     displayName: string;
     binaryName: string;
+    binaryPath?: string;
+    argsPrefix?: string[];
+    resumeFlag?: string;
+    supportsSessionResume?: boolean;
+    supportsNativeApproval?: boolean;
     dataDir: string;
     defaultModels: string[];
   }) {
     this.id = options.id;
     this.displayName = options.displayName;
     this.binaryName = options.binaryName;
+    this.binaryPath = options.binaryPath;
+    this.argsPrefix = options.argsPrefix ?? [];
+    this.resumeFlag =
+      options.resumeFlag ??
+      (options.binaryName === "claude" || options.binaryName === "codex" ? "--resume" : undefined);
     this.dataDir = options.dataDir;
     this.defaultModels = options.defaultModels;
+    const canResume = options.supportsSessionResume ?? Boolean(this.resumeFlag);
     this.capabilities = {
       supportsStreaming: true,
       supportsToolCalls: true,
-      supportsSubagents: true,
-      supportsSessionResume: true,
-      supportsNativeApproval: true,
-      supportsReasoningEffort: true,
+      supportsSubagents: options.binaryName === "claude" || options.binaryName === "codex",
+      supportsSessionResume: canResume,
+      supportsNativeApproval: options.supportsNativeApproval ?? false,
+      supportsReasoningEffort: options.binaryName === "codex" || options.binaryName === "claude",
       maxContextTokens: 200_000,
     };
   }
@@ -573,6 +591,16 @@ export class NativeCliHarnessDriver implements ApexDriver {
 
   async healthCheck(): Promise<DriverHealthStatus> {
     const t0 = Date.now();
+    if (this.binaryPath && existsSync(this.binaryPath)) {
+      return {
+        driverId: this.id,
+        healthy: true,
+        protocol: this.protocol,
+        latencyMs: Date.now() - t0,
+        detail: `Executable verified at ${this.binaryPath}`,
+        binaryPath: this.binaryPath,
+      };
+    }
     try {
       const cmd = process.platform === "win32" ? "where.exe" : "which";
       const out = execFileSync(cmd, [this.binaryName], {
@@ -620,6 +648,7 @@ export class NativeCliHarnessDriver implements ApexDriver {
       createdAt: now,
       updatedAt: now,
       status: "active",
+      resumedCount: 0,
       messages: [],
     };
     savePersistedSession(this.dataDir, session);
@@ -627,18 +656,52 @@ export class NativeCliHarnessDriver implements ApexDriver {
   }
 
   async resumeSession(sessionId: string): Promise<DriverSession> {
+    if (!this.capabilities.supportsSessionResume) {
+      throw new Error(
+        `Driver '${this.id}' (${this.binaryName}) does not support native CLI session resumption.`,
+      );
+    }
     const all = loadPersistedSessions(this.dataDir);
     const existing = all[sessionId];
     if (!existing) {
       throw new Error(`CLI session '${sessionId}' not found.`);
     }
     existing.status = "active";
+    existing.resumedCount = (existing.resumedCount ?? 0) + 1;
     existing.updatedAt = new Date().toISOString();
     savePersistedSession(this.dataDir, existing);
     return existing;
   }
 
+  private buildSpawnArgs(session: DriverSession, prompt: string): string[] {
+    const resumeArgs =
+      this.capabilities.supportsSessionResume &&
+      this.resumeFlag &&
+      (session.resumedCount ?? 0) > 0
+        ? [this.resumeFlag, session.sessionId]
+        : [];
+
+    if (this.argsPrefix.length > 0) {
+      return [...this.argsPrefix, ...resumeArgs, "-p", prompt];
+    }
+    if (this.binaryName === "claude") {
+      return [...resumeArgs, "-p", prompt, "--output-format", "stream-json", "--verbose"];
+    }
+    if (this.binaryName === "codex") {
+      return ["exec", "--skip-git-repo-check", ...resumeArgs, prompt];
+    }
+    return [...resumeArgs, "-p", prompt];
+  }
+
   async sendMessage(sessionId: string, input: DriverTurnInput): Promise<DriverTurnResult> {
+    return this.streamEvents(sessionId, input, () => {});
+  }
+
+  async streamEvents(
+    sessionId: string,
+    input: DriverTurnInput,
+    onEvent: (ev: DriverStreamEvent) => void,
+  ): Promise<DriverTurnResult> {
     const t0 = Date.now();
     const all = loadPersistedSessions(this.dataDir);
     const session =
@@ -650,21 +713,41 @@ export class NativeCliHarnessDriver implements ApexDriver {
       }));
 
     const carbonHome = ensureCleanCarbonHome(this.dataDir);
-    const args =
-      this.binaryName === "claude"
-        ? ["-p", input.prompt, "--output-format", "stream-json", "--verbose"]
-        : this.binaryName === "codex"
-          ? ["exec", "--skip-git-repo-check", input.prompt]
-          : ["-p", input.prompt];
+    const executable = this.binaryPath || this.binaryName;
+    const args = this.buildSpawnArgs(session, input.prompt);
 
     return new Promise<DriverTurnResult>((resolvePromise) => {
-      let stdout = "";
+      let stdoutAll = "";
+      let stdoutRemainder = "";
       let stderr = "";
       let settled = false;
+      let cancelledBySignal = false;
+      const emittedToolCallIds = new Set<string>();
+
+      const emitIncrementalLine = (rawLine: string) => {
+        const trimmed = rawLine.trim();
+        if (!trimmed) return;
+        const parsedLine = NativeCliJsonlProtocolAdapter.parseJsonlLines([trimmed]);
+        if (parsedLine.reasoningText) {
+          onEvent({ type: "reasoning", text: parsedLine.reasoningText });
+        }
+        if (parsedLine.visibleText) {
+          onEvent({ type: "delta", text: parsedLine.visibleText });
+        }
+        for (const tc of parsedLine.toolCalls) {
+          if (!emittedToolCallIds.has(tc.id)) {
+            emittedToolCallIds.add(tc.id);
+            onEvent({
+              type: "tool_call",
+              toolCall: { id: tc.id, name: tc.name, arguments: tc.arguments },
+            });
+          }
+        }
+      };
 
       let child: ChildProcess;
       try {
-        child = spawn(this.binaryName, args, {
+        child = spawn(executable, args, {
           cwd: session.workspaceRoot,
           env: {
             ...process.env,
@@ -673,8 +756,11 @@ export class NativeCliHarnessDriver implements ApexDriver {
           },
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
+          detached: process.platform !== "win32",
         });
       } catch (err) {
+        const errMsg = (err as Error).message;
+        onEvent({ type: "error", error: errMsg });
         resolvePromise({
           ok: false,
           driverId: this.id,
@@ -690,7 +776,7 @@ export class NativeCliHarnessDriver implements ApexDriver {
             finishReason: "error",
           },
           latencyMs: Date.now() - t0,
-          error: (err as Error).message,
+          error: errMsg,
         });
         return;
       }
@@ -698,23 +784,36 @@ export class NativeCliHarnessDriver implements ApexDriver {
       this.activeProcesses.set(sessionId, child);
       const timer = setTimeout(() => {
         if (!settled) {
-          child.kill();
+          killProcessTree(child.pid);
         }
       }, input.timeoutMs ?? 20_000);
 
+      const onAbort = () => {
+        cancelledBySignal = true;
+        killProcessTree(child.pid);
+      };
+
       if (input.signal) {
-        input.signal.addEventListener(
-          "abort",
-          () => {
-            child.kill();
-          },
-          { once: true },
-        );
+        if (input.signal.aborted) {
+          onAbort();
+        } else {
+          input.signal.addEventListener("abort", onAbort, { once: true });
+        }
       }
 
       child.stdout?.on("data", (chunk: Buffer) => {
-        stdout += chunk.toString("utf8");
+        const str = chunk.toString("utf8");
+        stdoutAll += str;
+        stdoutRemainder += str;
+        let newlineIdx = stdoutRemainder.indexOf("\n");
+        while (newlineIdx !== -1) {
+          const line = stdoutRemainder.slice(0, newlineIdx).replace(/\r$/, "");
+          stdoutRemainder = stdoutRemainder.slice(newlineIdx + 1);
+          emitIncrementalLine(line);
+          newlineIdx = stdoutRemainder.indexOf("\n");
+        }
       });
+
       child.stderr?.on("data", (chunk: Buffer) => {
         stderr += chunk.toString("utf8");
       });
@@ -723,7 +822,9 @@ export class NativeCliHarnessDriver implements ApexDriver {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (input.signal) input.signal.removeEventListener("abort", onAbort);
         this.activeProcesses.delete(sessionId);
+        onEvent({ type: "error", error: err.message });
         resolvePromise({
           ok: false,
           driverId: this.id,
@@ -747,40 +848,90 @@ export class NativeCliHarnessDriver implements ApexDriver {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        if (input.signal) input.signal.removeEventListener("abort", onAbort);
         this.activeProcesses.delete(sessionId);
-        const parsed = NativeCliJsonlProtocolAdapter.parseJsonlLines(stdout.split(/\r?\n/));
-        const ok = code === 0 && Boolean(parsed.visibleText || parsed.toolCalls.length > 0);
+
+        if (stdoutRemainder.trim()) {
+          emitIncrementalLine(stdoutRemainder);
+          stdoutRemainder = "";
+        }
+
+        const parsed = NativeCliJsonlProtocolAdapter.parseJsonlLines(stdoutAll.split(/\r?\n/));
+        let combinedText = parsed.visibleText;
+        if (parsed.toolCalls.length > 0 && !parsed.hasIncompleteToolCall) {
+          const rendered = renderProtocolToolCallsAsApexActionBlocks(parsed.toolCalls);
+          if (rendered.actionBlocksText) {
+            combinedText = [combinedText, rendered.actionBlocksText].filter(Boolean).join("\n\n");
+          }
+        }
+
+        const ok =
+          !cancelledBySignal &&
+          code === 0 &&
+          !parsed.hasIncompleteToolCall &&
+          Boolean(combinedText || parsed.toolCalls.length > 0);
+
+        session.messages.push({ role: "user", content: input.prompt });
+        if (combinedText) {
+          session.messages.push({
+            role: "assistant",
+            content: combinedText,
+            toolCallId: parsed.toolCalls[0]?.id,
+          });
+        }
+        if (cancelledBySignal) {
+          session.status = "cancelled";
+        }
+        session.updatedAt = new Date().toISOString();
+        savePersistedSession(this.dataDir, session);
+
+        const errText = ok
+          ? undefined
+          : cancelledBySignal
+            ? "CLI process cancelled via AbortSignal"
+            : stderr.trim() || `CLI exited with code ${code}`;
+
+        onEvent({
+          type: ok ? "complete" : "error",
+          turn: parsed,
+          error: errText,
+        });
+
         resolvePromise({
           ok,
           driverId: this.id,
           sessionId,
           modelId: session.modelId,
-          text: parsed.visibleText,
+          text: combinedText,
           normalizedTurn: parsed,
           latencyMs: Date.now() - t0,
-          error: ok ? undefined : stderr.trim() || `CLI exited with code ${code}`,
+          error: errText,
         });
       });
     });
   }
 
-  async streamEvents(
-    sessionId: string,
-    input: DriverTurnInput,
-    onEvent: (ev: DriverStreamEvent) => void,
-  ): Promise<DriverTurnResult> {
-    const res = await this.sendMessage(sessionId, input);
-    if (res.text) onEvent({ type: "delta", text: res.text });
-    onEvent({ type: res.ok ? "complete" : "error", turn: res.normalizedTurn, error: res.error });
-    return res;
-  }
-
   async interrupt(sessionId: string): Promise<void> {
-    this.activeProcesses.get(sessionId)?.kill("SIGINT");
+    const proc = this.activeProcesses.get(sessionId);
+    if (proc?.pid) {
+      if (process.platform === "win32") {
+        killProcessTree(proc.pid);
+      } else {
+        proc.kill("SIGINT");
+      }
+    }
+    const all = loadPersistedSessions(this.dataDir);
+    if (all[sessionId]) {
+      all[sessionId].status = "interrupted";
+      savePersistedSession(this.dataDir, all[sessionId]);
+    }
   }
 
   async cancel(sessionId: string): Promise<void> {
-    this.activeProcesses.get(sessionId)?.kill();
+    const proc = this.activeProcesses.get(sessionId);
+    if (proc?.pid) {
+      killProcessTree(proc.pid);
+    }
     const all = loadPersistedSessions(this.dataDir);
     if (all[sessionId]) {
       all[sessionId].status = "cancelled";
@@ -799,7 +950,9 @@ export class NativeCliHarnessDriver implements ApexDriver {
 
   async dispose(): Promise<void> {
     for (const proc of this.activeProcesses.values()) {
-      proc.kill();
+      if (proc.pid) {
+        killProcessTree(proc.pid);
+      }
     }
     this.activeProcesses.clear();
   }
@@ -874,32 +1027,44 @@ export class ApexDriverRegistry {
     const cliSpecs = [
       {
         id: "cli:antigravity-acp",
-        displayName: "Antigravity ACP Driver",
+        displayName: "Antigravity CLI Headless Driver (agy -p)",
         binaryName: "agy",
+        supportsSessionResume: false,
+        supportsNativeApproval: false,
         defaultModels: ["agy-acp/gemini-4-argon-high", "agy-acp/claude-opus-4-6-thinking"],
       },
       {
         id: "cli:claude-cli",
         displayName: "Claude Code CLI Driver",
         binaryName: "claude",
+        resumeFlag: "--resume",
+        supportsSessionResume: true,
+        supportsNativeApproval: false,
         defaultModels: ["claude-cli/claude-sonnet-4-6", "claude-cli/claude-opus-4-6"],
       },
       {
         id: "cli:codex-cli",
         displayName: "Codex App-Server Driver",
         binaryName: "codex",
+        resumeFlag: "--resume",
+        supportsSessionResume: true,
+        supportsNativeApproval: false,
         defaultModels: ["codex/gpt-5.4", "codex/gpt-5.3-codex"],
       },
       {
         id: "cli:gemini-cli",
         displayName: "Gemini CLI Driver",
         binaryName: "gemini",
+        supportsSessionResume: false,
+        supportsNativeApproval: false,
         defaultModels: ["gemini-cli/gemini-3.1-pro", "gemini-cli/gemini-3-flash"],
       },
       {
         id: "cli:opencode-cli",
         displayName: "OpenCode CLI Driver",
         binaryName: "opencode",
+        supportsSessionResume: false,
+        supportsNativeApproval: false,
         defaultModels: ["opencode/default"],
       },
     ];
@@ -913,6 +1078,10 @@ export class ApexDriverRegistry {
         }),
       );
     }
+  }
+
+  registerDriver(driver: ApexDriver): void {
+    this.drivers.set(driver.id, driver);
   }
 
   listDrivers(): ApexDriver[] {
@@ -931,8 +1100,148 @@ export class ApexDriverRegistry {
     if (lower.startsWith("gemini-cli/")) return this.drivers.get("cli:gemini-cli");
     if (lower.startsWith("opencode/")) return this.drivers.get("cli:opencode-cli");
     if (lower.includes("claude")) return this.drivers.get("http:anthropic-direct") ?? this.drivers.values().next().value;
-    if (lower.includes("gemini")) return this.drivers.get("http:google-gemini") ?? this.drivers.values().next().value;
+    if (lower.includes("gemini")) return this.drivers.get("http:gemini-direct") ?? this.drivers.values().next().value;
     return this.drivers.get("http:omniroute-local") ?? this.drivers.values().next().value;
+  }
+
+  /**
+   * Unified production driver dispatch with session management, live event streaming,
+   * and idempotent failover protection.
+   */
+  async dispatchTurnWithFailover(options: {
+    sessionId?: string;
+    workspaceRoot: string;
+    preferredModelId: string;
+    prompt: string;
+    messages: Array<{ role: "system" | "user" | "assistant"; content: string }>;
+    signal?: AbortSignal;
+    hasWorkspaceMutatedInTurn?: boolean;
+    checkpointId?: string;
+    autoRollbackOnFailover?: boolean;
+    onStreamEvent?: (ev: DriverStreamEvent) => void;
+  }): Promise<
+    DriverTurnResult & {
+      usedGateway: string;
+       rolledBackCheckpoint?: boolean;
+    }
+  > {
+    const t0 = Date.now();
+    const resolvedDriver =
+      this.resolveDriverForModel(options.preferredModelId) ??
+      this.getDriver("http:omniroute-local") ??
+      this.listDrivers()[0]!;
+    const effectiveSessionId =
+      options.sessionId || `sess-${randomUUID().slice(0, 10)}`;
+
+    const allSessions = loadPersistedSessions(this.dataDir);
+    let session = allSessions[effectiveSessionId];
+    if (!session) {
+      session = await resolvedDriver.createSession({
+        sessionId: effectiveSessionId,
+        workspaceRoot: options.workspaceRoot,
+        modelId: options.preferredModelId,
+      });
+    } else if (resolvedDriver.capabilities.supportsSessionResume) {
+      try {
+        session = await resolvedDriver.resumeSession(effectiveSessionId);
+      } catch {
+        // Keep existing session active
+      }
+    }
+
+    // If a custom CLI driver with an explicit binaryPath was registered, execute it directly via streamEvents
+    const cliDriver =
+      resolvedDriver instanceof NativeCliHarnessDriver ? resolvedDriver : undefined;
+    const health = cliDriver ? await cliDriver.healthCheck() : undefined;
+    if (
+      cliDriver &&
+      health?.healthy &&
+      health.binaryPath &&
+      !process.env.OMNIROUTE_BASE_URL
+    ) {
+      const cliRes = await cliDriver.streamEvents(
+        session.sessionId,
+        {
+          prompt: options.prompt,
+          messages: options.messages,
+          signal: options.signal,
+        },
+        options.onStreamEvent ?? (() => {}),
+      );
+      if (cliRes.ok) {
+        return {
+          ...cliRes,
+          usedGateway: cliDriver.id,
+        };
+      }
+      const failoverCheck = evaluateIdempotentFailoverPolicy({
+        dataDir: this.dataDir,
+        hasWorkspaceMutatedInTurn: Boolean(options.hasWorkspaceMutatedInTurn),
+        checkpointId: options.checkpointId,
+        autoRollbackOnFailover: options.autoRollbackOnFailover,
+      });
+      if (!failoverCheck.allowRetry) {
+        return {
+          ...cliRes,
+          usedGateway: cliDriver.id,
+        };
+      }
+    }
+
+    // Dispatch via HTTP gateway / fleet failover spine and record session + streaming events
+    const fleetRes = await callUnifiedFleetWithFailover({
+      preferredModelId: options.preferredModelId,
+      messages: options.messages,
+      signal: options.signal,
+      hasWorkspaceMutatedInTurn: options.hasWorkspaceMutatedInTurn,
+      checkpointId: options.checkpointId,
+      dataDir: this.dataDir,
+      autoRollbackOnFailover: options.autoRollbackOnFailover,
+    });
+
+    const normalizedTurn = OpenAiChatProtocolAdapter.parseResponse({
+      choices: [
+        {
+          message: { role: "assistant", content: fleetRes.text },
+          finish_reason: fleetRes.ok ? "stop" : "error",
+        },
+      ],
+    });
+
+    if (normalizedTurn.visibleText) {
+      options.onStreamEvent?.({ type: "delta", text: normalizedTurn.visibleText });
+    }
+    options.onStreamEvent?.({
+      type: fleetRes.ok ? "complete" : "error",
+      turn: normalizedTurn,
+      error: fleetRes.error,
+    });
+
+    const actualDriverId =
+      fleetRes.usedGateway && fleetRes.usedGateway !== "local"
+        ? `http:${fleetRes.usedGateway}`
+        : resolvedDriver.id;
+
+    session.driverId = actualDriverId;
+    session.modelId = fleetRes.usedModel || options.preferredModelId;
+    session.messages.push({ role: "user", content: options.prompt });
+    if (fleetRes.text) {
+      session.messages.push({ role: "assistant", content: fleetRes.text });
+    }
+    session.updatedAt = new Date().toISOString();
+    savePersistedSession(this.dataDir, session);
+
+    return {
+      ok: fleetRes.ok,
+      driverId: actualDriverId,
+      sessionId: session.sessionId,
+      modelId: fleetRes.usedModel || options.preferredModelId,
+      usedGateway: fleetRes.usedGateway || actualDriverId,
+      text: fleetRes.text,
+      normalizedTurn,
+      latencyMs: Date.now() - t0,
+      error: fleetRes.error,
+    };
   }
 
   async checkAllDriversHealth(): Promise<DriverHealthStatus[]> {

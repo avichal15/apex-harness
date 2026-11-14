@@ -743,8 +743,15 @@ export class NativeCliJsonlProtocolAdapter {
             rawArgumentsJson: JSON.stringify(parsedArgs),
             protocol: "cli-jsonl",
           });
+        } else if (
+          (type === "reasoning" || type === "thinking") &&
+          (typeof obj.text === "string" || typeof obj.thinking === "string")
+        ) {
+          reasoningParts.push(String(obj.text ?? obj.thinking ?? "").trim());
         } else if (typeof obj.text === "string") {
           visibleParts.push(obj.text.trim());
+        } else if (typeof obj.content === "string") {
+          visibleParts.push(obj.content.trim());
         }
       } catch {
         visibleParts.push(trimmed);

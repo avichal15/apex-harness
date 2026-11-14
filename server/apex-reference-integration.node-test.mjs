@@ -204,22 +204,94 @@ test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-
       assert.ok(drivers.some((d) => d.id === "cli:claude-cli"));
       assert.ok(drivers.some((d) => d.id === "cli:antigravity-acp"));
 
+      // Verify honest capability reporting on one-shot agy -p driver
+      const agyDriver = registry.getDriver("cli:antigravity-acp");
+      assert.equal(agyDriver?.capabilities.supportsSessionResume, false);
+      assert.equal(agyDriver?.capabilities.supportsNativeApproval, false);
+
+      // Build a deterministic fake CLI executable fixture for CI (no paid CLI account required)
+      const fakeCliScript = join(tempDir, "fake-cli-fixture.mjs");
+      writeFileSync(
+        fakeCliScript,
+        [
+          'import { writeFileSync } from "node:fs";',
+          "const args = process.argv.slice(2);",
+          'const resumeIdx = args.indexOf("--resume");',
+          "const resumedSessionId = resumeIdx >= 0 ? args[resumeIdx + 1] : null;",
+          'const prompt = args[args.length - 1] || "";',
+          'if (prompt.includes("SLOW_STREAM_CANCEL_TEST")) {',
+          '  console.log(JSON.stringify({ type: "reasoning", text: "Starting long CLI task..." }));',
+          "  setTimeout(() => {",
+          '    writeFileSync("cli-should-not-exist.txt", "leaked");',
+          "    process.exit(0);",
+          "  }, 5000);",
+          "} else {",
+          '  console.log(JSON.stringify({ type: "reasoning", text: "Analyzing workspace..." }));',
+          "  await new Promise((r) => setTimeout(r, 25));",
+          '  console.log(JSON.stringify({ type: "message", content: resumedSessionId ? `Resumed:${resumedSessionId}:${prompt}` : `Fresh:${prompt}` }));',
+          '  console.log(JSON.stringify({ type: "tool_use", id: "call_cli_fixture_1", name: "read_file", input: { path: "app.ts" } }));',
+          "}",
+        ].join("\n"),
+        "utf8",
+      );
+
       const cliDriver = new NativeCliHarnessDriver({
         id: "cli:codex-cli",
-        displayName: "Codex App-Server Driver",
-        binaryName: "codex",
+        displayName: "Codex App-Server Driver (Fixture)",
+        binaryName: "node",
+        binaryPath: process.execPath,
+        argsPrefix: [fakeCliScript],
+        resumeFlag: "--resume",
+        supportsSessionResume: true,
         defaultModels: ["codex/gpt-5.4"],
         dataDir: tempDir,
       });
+
       const session = await cliDriver.createSession({
         workspaceRoot: tempDir,
         modelId: "codex/gpt-5.4",
       });
       assert.ok(session.sessionId);
       assert.equal(session.status, "active");
+
+      // Stream events incrementally from the fake CLI process
+      const streamedEvents = [];
+      const turn1Res = await cliDriver.streamEvents(
+        session.sessionId,
+        { prompt: "Inspect app.ts" },
+        (ev) => streamedEvents.push({ ...ev, ts: Date.now() }),
+      );
+      assert.equal(turn1Res.ok, true);
+      assert.ok(turn1Res.text.includes("Fresh:Inspect app.ts"));
+      assert.ok(streamedEvents.some((e) => e.type === "reasoning"));
+      assert.ok(streamedEvents.some((e) => e.type === "delta"));
+      assert.ok(streamedEvents.some((e) => e.type === "tool_call" && e.toolCall?.id === "call_cli_fixture_1"));
+      assert.ok(streamedEvents.some((e) => e.type === "complete"));
+
+      // Resume session and verify --resume <sessionId> is passed to the spawned CLI process
       const resumed = await cliDriver.resumeSession(session.sessionId);
       assert.equal(resumed?.sessionId, session.sessionId);
       assert.equal(resumed?.status, "active");
+      const turn2Res = await cliDriver.sendMessage(session.sessionId, {
+        prompt: "Follow-up turn",
+      });
+      assert.equal(turn2Res.ok, true);
+      assert.ok(
+        turn2Res.text.includes(`Resumed:${session.sessionId}:Follow-up turn`),
+        `Expected CLI process to receive --resume ${session.sessionId}, got: ${turn2Res.text}`,
+      );
+
+      // Verify cancellation of an in-flight CLI child process kills the process tree
+      const abortCtrl = new AbortController();
+      setTimeout(() => abortCtrl.abort(), 120);
+      const cancelRes = await cliDriver.streamEvents(
+        session.sessionId,
+        { prompt: "SLOW_STREAM_CANCEL_TEST", signal: abortCtrl.signal },
+        () => {},
+      );
+      assert.equal(cancelRes.ok, false);
+      assert.equal(existsSync(join(tempDir, "cli-should-not-exist.txt")), false);
+
       await cliDriver.cancel(session.sessionId);
       const persistedAfterCancel = JSON.parse(
         readFileSync(join(tempDir, "apex-driver-sessions.json"), "utf8"),

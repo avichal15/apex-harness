@@ -46,6 +46,7 @@ import {
   captureWorkspaceGitDiffSummary,
 } from "./completion-evidence.ts";
 import { applySpillPolicyToText, executePtcProgram } from "./deepseek-subsystems.ts";
+import { ApexDriverRegistry } from "./driver-registry.ts";
 import {
   buildDesk1GroundedManifest,
   runEgmBoardroomConference,
@@ -1032,6 +1033,7 @@ export interface ExecuteTaskDagOptions {
   reviewerProviderId?: string;
   reviewerModelId?: string;
   requireLiveGoldfishModel?: boolean;
+  driverRegistry?: ApexDriverRegistry;
   customBuilderFn?: (context: {
     prompt: string;
     workspaceRoot: string;
@@ -1076,6 +1078,8 @@ async function runBuilderCodingPass(input: {
   workspacePath: string;
   dataDir: string;
   executionId: string;
+  sessionId?: string;
+  driverRegistry?: ApexDriverRegistry;
   preferredModelId: string;
   transpiledSkillsBlock: string;
   systemPromptPrefix?: string;
@@ -1097,6 +1101,8 @@ async function runBuilderCodingPass(input: {
   responseText: string;
   usedModel: string;
   usedGateway: string;
+  driverId: string;
+  sessionId: string;
   checkpointId?: string;
   filesInspected: string[];
   filesCreated: string[];
@@ -1110,6 +1116,15 @@ async function runBuilderCodingPass(input: {
   const commandsExecuted: ExecutedCommandEvidence[] = [];
   const toolsInvoked: Array<{ tool: string; target?: string; status: "done" | "error"; durationMs: number }> = [];
   let checkpointId: string | undefined;
+  const registry =
+    input.driverRegistry ??
+    new ApexDriverRegistry(
+      input.dataDir,
+      loadProviderConfigs(input.dataDir),
+      (p) => resolveProviderSecret(input.dataDir, p),
+    );
+  const builderSessionId = input.sessionId || `sess_${input.executionId.slice(0, 8)}_node-builder`;
+  let usedDriverId = registry.resolveDriverForModel(input.preferredModelId)?.id ?? "http:omniroute-local";
 
   let contextBlock = "Independent General Chat Mode (No project repository bound).";
   if (!input.isIndependent) {
@@ -1162,19 +1177,22 @@ async function runBuilderCodingPass(input: {
       throw new Error("Execution cancelled");
     }
 
-    const llmRes = await callUnifiedFleetWithFailover({
+    const llmRes = await registry.dispatchTurnWithFailover({
+      sessionId: builderSessionId,
+      workspaceRoot: input.workspacePath,
       preferredModelId: input.preferredModelId,
+      prompt: input.prompt,
       messages,
       signal: input.signal,
       hasWorkspaceMutatedInTurn:
         filesCreated.size + filesModified.size > 0 || commandsExecuted.length > 0,
       checkpointId,
-      dataDir: input.dataDir,
     });
 
     if (llmRes.ok) {
-      usedModel = llmRes.usedModel;
+      usedModel = llmRes.modelId;
       usedGateway = llmRes.usedGateway;
+      usedDriverId = llmRes.driverId;
     } else {
       if (narrativeSegments.length === 0) {
         narrativeSegments.push(
@@ -1263,6 +1281,8 @@ async function runBuilderCodingPass(input: {
       "Completed workspace operations. Expand the execution steps above for details.",
     usedModel,
     usedGateway,
+    driverId: usedDriverId,
+    sessionId: builderSessionId,
     checkpointId,
     filesInspected: [...filesInspected],
     filesCreated: [...filesCreated],
@@ -1382,6 +1402,12 @@ export async function executeTaskDag(
   };
   let completionReport!: CompletionEvidenceReport;
 
+  const driverRegistry =
+    options.driverRegistry ??
+    new ApexDriverRegistry(dataDir, loadProviderConfigs(dataDir), (p) =>
+      resolveProviderSecret(dataDir, p),
+    );
+
   // Individual node executors
   const runNode = async (node: AgentExecutionNode): Promise<void> => {
     await executionManager.waitIfPaused(executionId);
@@ -1391,10 +1417,41 @@ export async function executeTaskDag(
 
     const t0 = Date.now();
     const subSignal = executionManager.createSubtaskSignal(executionId, node.id);
+    const resolvedNodeDriver =
+      driverRegistry.resolveDriverForModel(node.assignedModelId) ??
+      driverRegistry.listDrivers()[0];
+    const nodeDriverId = resolvedNodeDriver?.id ?? node.driverId ?? "http:omniroute-local";
+    const nodeSessionId =
+      node.sessionId ?? `sess_${executionId.slice(0, 8)}_${node.id}`;
+    if (resolvedNodeDriver) {
+      try {
+        await resolvedNodeDriver.createSession({
+          sessionId: nodeSessionId,
+          workspaceRoot,
+          modelId: node.assignedModelId,
+        });
+      } catch {
+        // Non-fatal session initialization
+      }
+    }
+    subSignal.addEventListener(
+      "abort",
+      () => {
+        void resolvedNodeDriver?.cancel(nodeSessionId);
+      },
+      { once: true },
+    );
+
     executionManager.updateSubtask(executionId, node.id, {
       state: "running",
+      driverId: nodeDriverId,
+      sessionId: nodeSessionId,
       startedAt: new Date(t0).toISOString(),
-      events: appendNodeEvent(node.id, "started", `Assigned model ${node.assignedModelId}`),
+      events: appendNodeEvent(
+        node.id,
+        "started",
+        `Assigned model ${node.assignedModelId} via ${nodeDriverId} (${nodeSessionId})`,
+      ),
     });
     notifyDag();
 
@@ -1506,6 +1563,8 @@ export async function executeTaskDag(
               workspacePath: workspaceRoot,
               dataDir,
               executionId,
+              sessionId: nodeSessionId,
+              driverRegistry,
               preferredModelId: node.assignedModelId,
               transpiledSkillsBlock: [
                 plan.transpiledSkillsPrompt,
@@ -1554,6 +1613,14 @@ export async function executeTaskDag(
         executionManager.updateSubtask(executionId, node.id, {
           state: "completed",
           actualModelUsed: usedModel,
+          driverId:
+            "driverId" in loopRes && typeof loopRes.driverId === "string"
+              ? loopRes.driverId
+              : nodeDriverId,
+          sessionId:
+            "sessionId" in loopRes && typeof loopRes.sessionId === "string"
+              ? loopRes.sessionId
+              : nodeSessionId,
           currentTool: undefined,
           inputSummary: `Scout (${desk1Manifest.scannedFiles.length} files) + Architect EGM brief`,
           outputSummary: loopRes.responseText.slice(0, 260),
