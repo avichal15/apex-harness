@@ -360,6 +360,9 @@ managed desktop keeps so Firefox can start, with before/after acceptance evidenc
 The [Hetzner launch record](hetzner-launch-2026-09-07.md) is a dated self-hosting
 run on a disposable VPS: what passed, what was corrected, and what it does not prove.
 
+The [Verification & Reference Integration Acceptance Matrix](acceptance-matrix.md)
+tracks the 4-tier verification suite (`V-01..V-09`) and reference-to-production traceability.
+
 Keep the JSON from `wait` and `messages`, the exact command sequence, and the
 fixture's printed log path. Evidence must show both the action and the resulting
 state. A green unit test alone does not prove a user workflow.

@@ -170,10 +170,10 @@ function writeMasterKeyFile(
     } else {
       fallbackReason = dpapiRes.errorReason || "dpapi_unavailable";
     }
-  } else if (process.platform !== "win32") {
-    fallbackReason = `non_windows_platform (${process.platform})`;
-  } else {
+  } else if (process.env.APEX_DISABLE_DPAPI === "1") {
     fallbackReason = "disabled_via_APEX_DISABLE_DPAPI";
+  } else {
+    fallbackReason = `non_windows_platform (${process.platform})`;
   }
 
   mkdirSync(dirname(masterKeyPath), { recursive: true, mode: 0o700 });
