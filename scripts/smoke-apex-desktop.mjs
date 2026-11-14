@@ -27,6 +27,13 @@ assert.match(builderYaml, /productName:\s*ApexHarness/);
 assert.match(builderYaml, /main:\s*electron\/apex-main\.mjs/);
 assert.match(builderYaml, /OpenMausBot-LICENSE\.txt/);
 
+const pkgJson = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf8"));
+assert.equal(
+  pkgJson.main,
+  "electron/apex-main.mjs",
+  "package.json main entry must match electron-builder.apex.yml (electron/apex-main.mjs)",
+);
+
 const spacedRoot = join(tmpdir(), `Apex Harness Desktop Smoke ${Date.now()}`);
 const appDir = join(spacedRoot, "resources", "app");
 mkdirSync(appDir, { recursive: true });

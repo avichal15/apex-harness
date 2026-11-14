@@ -210,6 +210,11 @@ async function runDesktopSmokeTest(electronApp = null) {
 }
 
 async function startDesktopRuntime() {
+  if (process.argv.includes("--openmausbot") || process.env.OMB_DESKTOP === "1") {
+    await import("./main.mjs");
+    return;
+  }
+
   if (IS_SMOKE_TEST && !process.versions.electron) {
     await runDesktopSmokeTest(null);
     return;
@@ -217,6 +222,11 @@ async function startDesktopRuntime() {
 
   const electronMod = await import("electron");
   const { app, BrowserWindow, dialog, ipcMain, shell } = electronMod;
+
+  app.setName("ApexHarness");
+  if (process.platform === "win32" && typeof app.setAppUserModelId === "function") {
+    app.setAppUserModelId("com.avichal.apexharness");
+  }
 
   if (IS_SMOKE_TEST) {
     app.whenReady().then(() => runDesktopSmokeTest(app));

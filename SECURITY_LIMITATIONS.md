@@ -1,0 +1,34 @@
+# Apex Harness — Security Architecture & Explicit Limitations
+
+**Audit Commit Baseline:** `97b7b7e` (plus final production-readiness surgical fixes)
+
+This document records the verified security controls enforced by Apex Harness and explicitly distinguishes **application-level policy enforcement** from **OS-level sandboxing**.
+
+---
+
+## 1. Verified Security Controls (`VERIFIED`)
+
+| Security Domain | Implementation File(s) | Enforcement Mechanism | Verification Evidence | Verdict |
+| :--- | :--- | :--- | :--- | :--- |
+| **Canonical Workspace Path Containment** | `server/harness/workspace-security.ts`, `server/harness/workspace-runtime.ts` | Resolves paths via `realpathSync.native` (normalizing Windows 8.3 short names such as `PROGRA~1` / `RUNNER~1` and resolving existing parent directories for not-yet-created files). Rejects `..` traversal, sibling-prefix attacks (`workspace-evil` vs `workspace`), and symlink/junction escapes outside the canonical workspace root. | `server/apex-master-verification.node-test.mjs` (Scenarios 7 & 8), `server/apex-reference-integration.node-test.mjs` (`V-07`) | **`VERIFIED`** |
+| **Shell Command Chain Policy Parser** | `server/harness/process-manager.ts` (`splitShellCommandChain`, `classifyCommandPolicy`) | Quote-aware parser splits compound shell commands across `;`, `&&`, `||`, `|`, and newlines; detects subshells (`$(...)`, backticks) and file redirections (`>`, `>>`); evaluates every segment and takes the strictest risk tier (`forbidden` > `approval_required` > `mutating` > `safe_read`). Blocks destructive patterns (`rm -rf /`, `git push --force`, `Invoke-Expression`, `curl \| sh`). | `server/apex-reference-integration.node-test.mjs` (`V-07`), `server/apex-master-verification.node-test.mjs` (Scenario 9) | **`VERIFIED`** |
+| **Child Process Tree Isolation & Termination** | `server/harness/process-manager.ts` (`runManagedCommand`, `killProcessTree`) | Spawns child processes with bounded output capture (`maxOutputBytes`), sanitized environment variables (`sanitizeChildProcessEnv`), and kills the entire process tree on timeout or `AbortSignal` (`taskkill /PID <pid> /T /F` on Windows; process-group `kill(-pid, "SIGTERM" -> "SIGKILL")` on POSIX). | `server/apex-master-verification.node-test.mjs` (Scenario 6 on Windows & Ubuntu), `V-02` | **`VERIFIED`** |
+| **Local API Authentication & Origin Validation** | `server/harness/workspace-security.ts` (`validateApiRequestSecurity`), `server/apex-app-server.ts` | Requires per-session 256-bit CSPRNG token (`X-Apex-Token` / `Authorization: Bearer`) on `/api/*` endpoints and validates `Origin` header against loopback (`127.0.0.1` / `localhost`) to block cross-site request forgery (CSRF) and DNS rebinding from browser tabs. | `server/apex-master-verification.node-test.mjs` (Scenario 10) | **`VERIFIED`** |
+| **At-Rest Secret Encryption, Windows DPAPI Wrapping & Corruption Recovery** | `server/harness/secret-store.ts`, `server/harness/agent-dag-orchestrator.ts` | Stores provider API keys in `apex-secrets.vault.json` using AES-256-GCM (`v2:aes256gcm:<iv>:<tag>:<ciphertext>`) keyed by a 32-byte CSPRNG master key (`apex-master.key`, `0600` permissions) wrapped with Windows DPAPI (`ProtectedData::Protect` CurrentUser scope) when running on Windows. Automatically migrates legacy `v1:` secrets and raises `MasterVaultKeyCorruptedError` with explicit backup/reset recovery (`recoverOrResetCorruptedMasterKey`) instead of silently overwriting a corrupted key file. | `server/apex-master-verification.node-test.mjs` (Scenario 1), `server/apex-reference-integration.node-test.mjs` (`V-07`) | **`VERIFIED`** |
+| **Secret Redaction in Memory, Logs & External Reviewer Payloads** | `server/harness/hermes-memory-learning.ts` (`scrubSecrets`), `server/harness/egm-boardroom.ts` (`scrubReviewerSecrets`) | Redacts `sk-...`, `AIza...`, `ghp_...`, `xoxb-...`, `Bearer ...`, and `api_key=...` tokens before persisting Hermes memory entries or transmitting `changedFilesContent` and `gitDiffSummary` to external Goldfish HTTP reviewers. | `server/apex-reference-integration.node-test.mjs` (`V-06`, `V-10`) | **`VERIFIED`** |
+| **Signed Dynamic Plugin Verification & Audit Trail** | `server/harness/deepseek-subsystems.ts` | Verifies SHA-256 + HMAC signatures before executing dynamic plugins, enforces `pure_transform` / `workspace_read` / `workspace_write` permission gates, and appends mount/uninstall/tamper events to `apex-plugin-audit.jsonl`. | `server/apex-master-verification.node-test.mjs` (Scenario 19), `V-04` | **`VERIFIED`** |
+
+---
+
+## 2. Explicit Security Boundaries & Limitations (Command Allowlisting vs. OS Sandboxing)
+
+1. **Command Policy Classification Is NOT an OS-Level Kernel Sandbox:**
+   - `classifyCommandPolicy()` (`server/harness/process-manager.ts`) performs static lexical analysis of shell command strings to classify commands into `safe_read`, `mutating`, `approval_required`, and `forbidden`, and gates execution according to the active execution mode (`ask`, `auto`, `turbo`).
+   - Once a command or test script (e.g., `npm test`, `pytest`, `node script.js`) is approved and spawned via `runManagedCommand()`, the child process runs as the current OS user without Linux `seccomp`/`namespaces`, macOS `sandbox-exec`, Windows AppContainer/JobObject filesystem virtualization, or container isolation.
+   - **Implication:** A malicious `package.json` `test` script or a script invoked by an approved command can access files or network resources available to the local user account. Untrusted third-party repositories should be opened in `"ask"` mode (requiring human approval before command execution) or inside an external VM/container.
+2. **Programmatic Tool Calling (PTC) Runs in Node `vm` Context (`server/harness/deepseek-subsystems.ts`):**
+   - `executePtcProgram()` runs agent-authored orchestration snippets inside a restricted `node:vm` context with a 5-second timeout and exposes only workspace-bounded `apex.*` / `tools.*` helpers (`readFile`, `listFiles`, `search`, `writeFile`, `editFile`), blocking `process`, `require`, `child_process`, `fs`, and `fetch`.
+   - **Implication:** Node.js `node:vm` is an API-surface restriction and timeout boundary, not a V8 isolate security boundary against speculative-execution or prototype-chain escapes. All file mutations inside PTC still pass through `assertCanonicalWorkspacePath()` and pre-edit checkpointing.
+3. **POSIX Non-Root Key Storage Fallback:**
+   - On Windows, `apex-master.key` is encrypted at rest using Windows DPAPI (`CurrentUser` scope).
+   - On Linux/macOS (or when `APEX_DISABLE_DPAPI=1` is set in headless CI), `apex-master.key` is stored as a `raw:` 32-byte CSPRNG key restricted via POSIX file mode `0600` (`rw-------`) rather than D-Bus Secret Service / macOS Keychain to avoid blocking headless daemon startup on GUI keyring prompts.

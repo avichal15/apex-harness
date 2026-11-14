@@ -11,7 +11,7 @@
 // ============================================================================
 
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +27,7 @@ import {
 } from "./harness/agent-dag-orchestrator.ts";
 import {
   buildCompletionEvidenceReport,
+  classifyVerificationFromCommands,
   detectProjectVerificationCommands,
 } from "./harness/completion-evidence.ts";
 import {
@@ -41,6 +42,7 @@ import {
 } from "./harness/deepseek-subsystems.ts";
 import {
   ApexDriverRegistry,
+  HttpProtocolDriver,
   NativeCliHarnessDriver,
   evaluateIdempotentFailoverPolicy,
 } from "./harness/driver-registry.ts";
@@ -1450,6 +1452,332 @@ test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-
       appServer.close();
       mockFleet.close();
       mockGoldfish.close();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  // ==========================================================================
+  // V-10: Production Readiness Audit Regressions (Incremental SSE, Native CLI Session IDs, Goldfish Secret Scrubbing, 7 Verifier Archetypes & Per-Clause Evidence)
+  // ==========================================================================
+  await t.test("V-10: Incremental HTTP SSE streaming, native CLI session ID resumption, Goldfish secret redaction & fenced JSON, and 7 Verifier archetypes", async () => {
+    const tempDir = makeTempDir("apex-v10-");
+
+    // 1. Incremental HTTP SSE streaming test
+    let secondChunkSentAt = 0;
+    const sseServer = http.createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      res.write(
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "CHUNK_ONE_" } }] })}\n\n`,
+      );
+      setTimeout(() => {
+        secondChunkSentAt = Date.now();
+        res.write(
+          `data: ${JSON.stringify({ choices: [{ delta: { content: "CHUNK_TWO" }, finish_reason: "stop" }] })}\n\n`,
+        );
+        res.write("data: [DONE]\n\n");
+        res.end();
+      }, 120);
+    });
+    await new Promise((r) => sseServer.listen(0, "127.0.0.1", r));
+    const ssePort = sseServer.address().port;
+
+    // 2. Goldfish server returning <think> + ```json fenced output and capturing request body
+    let capturedGoldfishRaw = "";
+    const fencedGoldfish = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        capturedGoldfishRaw = body;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content:
+                    '<think>Evaluating diff independently...</think>\n```json\n{"outcome":"approve","comprehensionParaphrase":"Verified math.ts","findings":[]}\n```',
+                },
+              },
+            ],
+          }),
+        );
+      });
+    });
+    await new Promise((r) => fencedGoldfish.listen(0, "127.0.0.1", r));
+    const gfPort = fencedGoldfish.address().port;
+
+    try {
+      const httpDriver = new HttpProtocolDriver({
+        dataDir: tempDir,
+        provider: {
+          id: "sse-test",
+          name: "SSE Test",
+          protocol: "openai-compat",
+          baseUrl: `http://127.0.0.1:${ssePort}/v1`,
+          enabled: true,
+          defaultModels: ["gpt-5.4"],
+        },
+      });
+      assert.equal(httpDriver.capabilities.supportsSubagents, false);
+
+      const deltaTimestamps = [];
+      const streamRes = await httpDriver.streamEvents(
+        "sess-sse-1",
+        { prompt: "Stream chunks" },
+        (ev) => {
+          if (ev.type === "delta") {
+            deltaTimestamps.push({ text: ev.text, ts: Date.now() });
+          }
+        },
+      );
+      assert.equal(streamRes.ok, true);
+      assert.equal(streamRes.text, "CHUNK_ONE_CHUNK_TWO");
+      assert.equal(deltaTimestamps.length, 2);
+      assert.ok(
+        deltaTimestamps[0].ts < secondChunkSentAt,
+        "First SSE delta must be delivered incrementally before the second chunk is sent",
+      );
+
+      // 3. Native CLI JSONL session ID extraction & spawn args
+      const parsedCodex = NativeCliJsonlProtocolAdapter.parseJsonlLines([
+        JSON.stringify({ type: "thread.started", thread_id: "01a1-native-codex-thread" }),
+        JSON.stringify({
+          type: "item.completed",
+          item: { id: "err_meta", type: "error", message: "Model metadata warning" },
+        }),
+        JSON.stringify({
+          type: "item.completed",
+          item: { id: "msg_1", type: "agent_message", text: "CODEX_OK" },
+        }),
+      ]);
+      assert.equal(parsedCodex.nativeSessionId, "01a1-native-codex-thread");
+      assert.equal(parsedCodex.visibleText, "CODEX_OK");
+
+      const parsedOpenCode = NativeCliJsonlProtocolAdapter.parseJsonlLines([
+        JSON.stringify({ type: "step_start", sessionID: "ses_opencode_123" }),
+        JSON.stringify({ type: "text", sessionID: "ses_opencode_123", part: { text: "OPENCODE_OK" } }),
+      ]);
+      assert.equal(parsedOpenCode.nativeSessionId, "ses_opencode_123");
+      assert.equal(parsedOpenCode.visibleText, "OPENCODE_OK");
+
+      const codexCli = new NativeCliHarnessDriver({
+        id: "cli:codex-cli",
+        displayName: "Codex CLI",
+        binaryName: "codex",
+        supportsSessionResume: true,
+        defaultModels: ["codex/gpt-5.4"],
+        dataDir: tempDir,
+      });
+      assert.equal(codexCli.capabilities.supportsSubagents, false);
+      const freshArgs = codexCli.buildSpawnArgs(
+        {
+          sessionId: "local-1",
+          driverId: "cli:codex-cli",
+          workspaceRoot: tempDir,
+          modelId: "codex/gpt-5.4",
+          createdAt: "",
+          updatedAt: "",
+          status: "active",
+          resumedCount: 0,
+          messages: [],
+        },
+        "Hello",
+      );
+      assert.deepEqual(freshArgs, ["exec", "--skip-git-repo-check", "--json", "Hello"]);
+
+      const resumedArgs = codexCli.buildSpawnArgs(
+        {
+          sessionId: "local-1",
+          nativeSessionId: "01a1-native-codex-thread",
+          driverId: "cli:codex-cli",
+          workspaceRoot: tempDir,
+          modelId: "codex/gpt-5.4",
+          createdAt: "",
+          updatedAt: "",
+          status: "active",
+          resumedCount: 1,
+          messages: [],
+        },
+        "Follow up",
+      );
+      assert.deepEqual(resumedArgs, [
+        "exec",
+        "resume",
+        "--skip-git-repo-check",
+        "--json",
+        "01a1-native-codex-thread",
+        "Follow up",
+      ]);
+
+      // 4. Goldfish fenced JSON parsing & secret scrubbing
+      writeFileSync(
+        join(tempDir, "math.ts"),
+        "// Token: sk-secret-should-be-redacted-1234567890123456\nexport const add = (a: number, b: number) => a + b;\n",
+        "utf8",
+      );
+      const gfReview = await runPostImplementationEgmReview({
+        originalRequirement: "Implement add in math.ts. Create docs.md with usage notes.",
+        workspacePath: tempDir,
+        filesCreated: ["math.ts"],
+        filesModified: [],
+        commandsExecuted: [],
+        responseText: "Implemented add in math.ts.",
+        reviewerEndpointUrl: `http://127.0.0.1:${gfPort}/v1`,
+        requireLiveGoldfishModel: true,
+      });
+      assert.equal(gfReview.outcome, "approve");
+      assert.equal(gfReview.reviewerAvailable, true);
+      assert.equal(
+        capturedGoldfishRaw.includes("sk-secret-should-be-redacted-1234567890123456"),
+        false,
+        "Goldfish reviewer request must scrub secret tokens from changedFilesContent",
+      );
+      assert.ok(capturedGoldfishRaw.includes("[REDACTED_SECRET]"));
+
+      // 5. All 7 Verifier repository archetypes
+      // Archetype (c): Default npm init placeholder test script must be ignored
+      const archStub = join(tempDir, "arch-stub");
+      mkdirSync(archStub, { recursive: true });
+      writeFileSync(
+        join(archStub, "package.json"),
+        JSON.stringify({
+          name: "stub-pkg",
+          scripts: { test: 'echo "Error: no test specified" && exit 1' },
+        }),
+        "utf8",
+      );
+      assert.equal(detectProjectVerificationCommands(archStub).testCommands.length, 0);
+
+      // Archetype (f): Package manager detection (pnpm, yarn, bun)
+      const archPnpm = join(tempDir, "arch-pnpm");
+      mkdirSync(archPnpm, { recursive: true });
+      writeFileSync(join(archPnpm, "pnpm-lock.yaml"), "lockfileVersion: '9.0'\n", "utf8");
+      writeFileSync(
+        join(archPnpm, "package.json"),
+        JSON.stringify({
+          name: "pnpm-pkg",
+          scripts: { test: "vitest run", build: "tsc -b", typecheck: "tsc --noEmit" },
+        }),
+        "utf8",
+      );
+      const pnpmDetected = detectProjectVerificationCommands(archPnpm);
+      assert.equal(pnpmDetected.packageManager, "pnpm");
+      assert.deepEqual(pnpmDetected.testCommands, ["pnpm run test"]);
+      assert.deepEqual(pnpmDetected.buildCommands, ["pnpm run build"]);
+      assert.deepEqual(pnpmDetected.typecheckCommands, ["pnpm run typecheck"]);
+
+      const archYarn = join(tempDir, "arch-yarn");
+      mkdirSync(archYarn, { recursive: true });
+      writeFileSync(join(archYarn, "yarn.lock"), "# yarn lockfile v1\n", "utf8");
+      writeFileSync(
+        join(archYarn, "package.json"),
+        JSON.stringify({ name: "yarn-pkg", scripts: { test: "jest" } }),
+        "utf8",
+      );
+      assert.deepEqual(detectProjectVerificationCommands(archYarn).testCommands, ["yarn run test"]);
+
+      const archBun = join(tempDir, "arch-bun");
+      mkdirSync(archBun, { recursive: true });
+      writeFileSync(join(archBun, "bun.lock"), "{}\n", "utf8");
+      writeFileSync(
+        join(archBun, "package.json"),
+        JSON.stringify({ name: "bun-pkg", scripts: { test: "bun test" } }),
+        "utf8",
+      );
+      assert.deepEqual(detectProjectVerificationCommands(archBun).testCommands, ["bun run test"]);
+
+      // Archetype (g): Monorepo workspace detection
+      const archMono = join(tempDir, "arch-mono");
+      mkdirSync(join(archMono, "packages", "core"), { recursive: true });
+      writeFileSync(join(archMono, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n", "utf8");
+      writeFileSync(
+        join(archMono, "package.json"),
+        JSON.stringify({ name: "mono-root", private: true }),
+        "utf8",
+      );
+      writeFileSync(
+        join(archMono, "packages", "core", "package.json"),
+        JSON.stringify({
+          name: "@mono/core",
+          scripts: { test: "vitest run", build: "tsc" },
+        }),
+        "utf8",
+      );
+      const monoDetected = detectProjectVerificationCommands(archMono);
+      assert.equal(monoDetected.isMonorepo, true);
+      assert.deepEqual(monoDetected.testCommands, ["pnpm --filter @mono/core run test"]);
+      assert.deepEqual(monoDetected.buildCommands, ["pnpm --filter @mono/core run build"]);
+
+      // Archetypes (a, b, d, e): Passing test, failing test, build failure, typecheck failure classification
+      const failBuildCheck = classifyVerificationFromCommands([
+        {
+          command: "npm test",
+          exitCode: 0,
+          timedOut: false,
+          cancelled: false,
+          durationMs: 50,
+          stdoutPreview: "ok",
+          stderrPreview: "",
+        },
+        {
+          command: "npm run build",
+          exitCode: 1,
+          timedOut: false,
+          cancelled: false,
+          durationMs: 80,
+          stdoutPreview: "",
+          stderrPreview: "Build failed",
+        },
+        {
+          command: "npm run typecheck",
+          exitCode: 2,
+          timedOut: false,
+          cancelled: false,
+          durationMs: 70,
+          stdoutPreview: "",
+          stderrPreview: "TS2322",
+        },
+      ]);
+      assert.equal(failBuildCheck.testsPassed, true);
+      assert.equal(failBuildCheck.buildPassed, false);
+      assert.equal(failBuildCheck.lintPassed, false);
+
+      // 6. Per-clause requirement verification: `npm test` exiting 0 does NOT mark uncreated `docs.md` clause as verified
+      const multiClauseReport = buildCompletionEvidenceReport({
+        executionId: "exec-v10-clause",
+        originalRequirement: "Implement add in math.ts. Create docs.md with usage notes.",
+        executionPlanSummary: "2-clause requirement test",
+        workspaceRoot: tempDir,
+        subtasks: [],
+        skillsMounted: [],
+        toolsInvoked: ["write_file", "run_command"],
+        filesInspected: [],
+        filesCreated: ["math.ts"],
+        filesModified: [],
+        commandsExecuted: [
+          {
+            command: "npm test",
+            exitCode: 0,
+            timedOut: false,
+            cancelled: false,
+            durationMs: 40,
+            stdoutPreview: "1 passing",
+            stderrPreview: "",
+          },
+        ],
+        egmReview: gfReview,
+        responseText: "Implemented add in math.ts.",
+      });
+      assert.equal(
+        multiClauseReport.status,
+        "partially_completed",
+        "Overall status must downgrade to partially_completed when a clause's target file (docs.md) was never created",
+      );
+      assert.equal(multiClauseReport.requirementMatrix[0].status, "implemented_and_verified");
+      assert.equal(multiClauseReport.requirementMatrix[1].status, "not_implemented");
+    } finally {
+      sseServer.close();
+      fencedGoldfish.close();
       rmSync(tempDir, { recursive: true, force: true });
     }
   });

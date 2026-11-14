@@ -1633,11 +1633,12 @@ export async function executeTaskDag(
         });
         options.onEgmBrief?.(egmPreBrief);
 
+        const isFastDeterministicArchitect = options.effort !== "high";
         emitStep({
           id: `step-arch-${Date.now()}`,
           kind: "route",
           agentRole: "Architect",
-          label: `System Architect completed 4-lens design & boundary review`,
+          label: `${isFastDeterministicArchitect ? "[Deterministic Scan] " : ""}System Architect completed 4-lens design & boundary review`,
           plainSummary: `Architect synthesized 4 specialist lenses (score ${egmPreBrief.desk3Auditor.score}/100)`,
           detail: egmPreBrief.desk2GoldfishLenses.map((l) => l.lens).join(", "),
           status: "done",
@@ -1646,9 +1647,11 @@ export async function executeTaskDag(
 
         executionManager.updateSubtask(executionId, node.id, {
           state: "completed",
-          actualModelUsed: node.assignedModelId,
+          actualModelUsed: isFastDeterministicArchitect
+            ? "deterministic-scanner"
+            : node.assignedModelId,
           inputSummary: `Prompt + Desk 1 symbol manifest`,
-          outputSummary: egmPreBrief.desk3Auditor.comprehensionParaphrase,
+          outputSummary: `${isFastDeterministicArchitect ? "[Deterministic Scan] " : ""}${egmPreBrief.desk3Auditor.comprehensionParaphrase}`,
           completedAt: new Date().toISOString(),
           durationMs: Date.now() - t0,
           verificationPassed: true,
@@ -1990,6 +1993,7 @@ export async function executeTaskDag(
               ...(detected.testCommands.slice(0, 1)),
               ...(detected.typecheckCommands.slice(0, 1)),
               ...(detected.lintCommands.slice(0, 1)),
+              ...(detected.buildCommands.slice(0, 1)),
             ].filter(Boolean);
             if (autoQueue.length > 0) {
               await runDiscoveredVerificationCommands(autoQueue);

@@ -745,13 +745,24 @@ export async function runPostImplementationEgmReview(
   // If reviewerEndpointUrl is provided, invoke the independent Goldfish HTTP reviewer with ONLY fresh-context payload
   if (reviewerEndpointUrl) {
     try {
+      const scrubReviewerSecrets = (text: string): string =>
+        text
+          .replace(/\b(sk-[a-zA-Z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{16,})\b/g, "[REDACTED_SECRET]")
+          .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, "$1[REDACTED_SECRET]")
+          .replace(/((?:api[_-]?key|secret|password|token)\s*[:=]\s*["']?)[^\s"',;]{8,}/gi, "$1[REDACTED_SECRET]");
+
+      const scrubbedChangedFilesContent: Record<string, string> = {};
+      for (const [k, v] of Object.entries(changedFilesContent)) {
+        scrubbedChangedFilesContent[k] = scrubReviewerSecrets(v);
+      }
+
       const freshContextPrompt = JSON.stringify({
         reviewerSessionId,
-        originalRequirement: input.originalRequirement,
+        originalRequirement: scrubReviewerSecrets(input.originalRequirement),
         filesCreated: input.filesCreated,
         filesModified: input.filesModified,
-        changedFilesContent,
-        gitDiffSummary: input.gitDiffSummary ?? "",
+        changedFilesContent: scrubbedChangedFilesContent,
+        gitDiffSummary: scrubReviewerSecrets(input.gitDiffSummary ?? ""),
         commandsExecuted: input.commandsExecuted,
         deterministicChecks,
         independentContextVerified: true,
@@ -769,7 +780,7 @@ export async function runPostImplementationEgmReview(
             {
               role: "system",
               content:
-                "You are a stateless Goldfish Post-Implementation Reviewer. Return JSON: {\"outcome\":\"approve\"|\"request_changes\"|\"decline\",\"comprehensionParaphrase\":\"...\",\"findings\":[]}",
+                "You are a stateless Goldfish Post-Implementation Reviewer. Return ONLY valid JSON: {\"outcome\":\"approve\"|\"request_changes\"|\"decline\",\"comprehensionParaphrase\":\"...\",\"findings\":[]}",
             },
             {
               role: "user",
@@ -777,7 +788,7 @@ export async function runPostImplementationEgmReview(
             },
           ],
         }),
-        signal: input.signal ?? AbortSignal.timeout(8000),
+        signal: input.signal ?? AbortSignal.timeout(30_000),
       });
       if (!resp.ok) {
         return {
@@ -801,7 +812,15 @@ export async function runPostImplementationEgmReview(
         choices?: Array<{ message?: { content?: string } }>;
       };
       const rawContent = data.choices?.[0]?.message?.content ?? "{}";
-      const parsed = JSON.parse(rawContent) as {
+      const withoutThink = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+      const fencedMatch = withoutThink.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      let jsonCandidate = fencedMatch?.[1]?.trim() ?? withoutThink;
+      const firstBrace = jsonCandidate.indexOf("{");
+      const lastBrace = jsonCandidate.lastIndexOf("}");
+      if (firstBrace !== -1 && lastBrace > firstBrace) {
+        jsonCandidate = jsonCandidate.slice(firstBrace, lastBrace + 1);
+      }
+      const parsed = JSON.parse(jsonCandidate) as {
         outcome?: PostImplReviewOutcome;
         comprehensionParaphrase?: string;
         findings?: PostImplReviewReport["findings"];

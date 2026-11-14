@@ -6,7 +6,7 @@
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 import type { ProviderConfigEntry, ProviderProtocol } from "../../shared/apex-contracts.ts";
 import { callUnifiedFleetWithFailover, revertTurnCheckpoint } from "../apex-llm-engine.ts";
@@ -59,6 +59,7 @@ export interface DriverSessionConfig {
 
 export interface DriverSession {
   sessionId: string;
+  nativeSessionId?: string;
   driverId: string;
   workspaceRoot: string;
   modelId: string;
@@ -179,7 +180,7 @@ export class HttpProtocolDriver implements ApexDriver {
     this.capabilities = {
       supportsStreaming: true,
       supportsToolCalls: true,
-      supportsSubagents: true,
+      supportsSubagents: false,
       supportsSessionResume: true,
       supportsNativeApproval: false,
       supportsReasoningEffort: true,
@@ -272,7 +273,11 @@ export class HttpProtocolDriver implements ApexDriver {
     return existing;
   }
 
-  async sendMessage(sessionId: string, input: DriverTurnInput): Promise<DriverTurnResult> {
+  async sendMessage(
+    sessionId: string,
+    input: DriverTurnInput,
+    onIncrementalEvent?: (ev: DriverStreamEvent) => void,
+  ): Promise<DriverTurnResult> {
     const t0 = Date.now();
     const all = loadPersistedSessions(this.dataDir);
     const session =
@@ -327,6 +332,7 @@ export class HttpProtocolDriver implements ApexDriver {
         body = {
           model: cleanModel,
           max_tokens: 4096,
+          ...(onIncrementalEvent ? { stream: true } : {}),
           ...(sysMsg ? { system: sysMsg } : {}),
           messages: turns.length > 0 ? turns : [{ role: "user", content: input.prompt }],
           ...(input.tools && input.tools.length > 0
@@ -358,6 +364,7 @@ export class HttpProtocolDriver implements ApexDriver {
           model: cleanModel,
           messages: effectiveMessages,
           temperature: 0.2,
+          ...(onIncrementalEvent ? { stream: true } : {}),
           ...(input.tools && input.tools.length > 0
             ? {
                 tools: input.tools.map((t) => ({
@@ -380,8 +387,8 @@ export class HttpProtocolDriver implements ApexDriver {
         signal: controller.signal,
       });
 
-      const rawText = await res.text();
       if (!res.ok) {
+        const rawErrText = await res.text();
         return {
           ok: false,
           driverId: this.id,
@@ -397,8 +404,61 @@ export class HttpProtocolDriver implements ApexDriver {
             finishReason: "error",
           },
           latencyMs: Date.now() - t0,
-          error: `HTTP ${res.status}: ${rawText.slice(0, 200)}`,
+          error: `HTTP ${res.status}: ${rawErrText.slice(0, 200)}`,
         };
+      }
+
+      let rawText = "";
+      let emittedIncremental = false;
+
+      if (onIncrementalEvent && res.body) {
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        let lineBuffer = "";
+
+        const processIncrementalSseLine = (line: string) => {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith("data:")) return;
+          const payload = trimmed.slice(5).trim();
+          if (!payload || payload === "[DONE]") return;
+          const singleChunkParsed =
+            this.protocol === "anthropic"
+              ? AnthropicMessagesProtocolAdapter.parseSseStream([trimmed])
+              : OpenAiChatProtocolAdapter.parseSseStream([trimmed]);
+          if (singleChunkParsed.reasoningText) {
+            emittedIncremental = true;
+            onIncrementalEvent({ type: "reasoning", text: singleChunkParsed.reasoningText });
+          }
+          if (singleChunkParsed.visibleText) {
+            emittedIncremental = true;
+            onIncrementalEvent({ type: "delta", text: singleChunkParsed.visibleText });
+          }
+        };
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          const chunkStr = decoder.decode(value, { stream: true });
+          rawText += chunkStr;
+          lineBuffer += chunkStr;
+          let nl = lineBuffer.indexOf("\n");
+          while (nl !== -1) {
+            const line = lineBuffer.slice(0, nl).replace(/\r$/, "");
+            lineBuffer = lineBuffer.slice(nl + 1);
+            processIncrementalSseLine(line);
+            nl = lineBuffer.indexOf("\n");
+          }
+        }
+        const tail = decoder.decode();
+        if (tail) {
+          rawText += tail;
+          lineBuffer += tail;
+        }
+        if (lineBuffer.trim()) {
+          processIncrementalSseLine(lineBuffer);
+        }
+      } else {
+        rawText = await res.text();
       }
 
       // Check if server returned SSE stream or JSON payload
@@ -418,6 +478,15 @@ export class HttpProtocolDriver implements ApexDriver {
           normalized = OpenAiResponsesProtocolAdapter.parseResponse(jsonObj);
         } else {
           normalized = OpenAiChatProtocolAdapter.parseResponse(jsonObj);
+        }
+      }
+
+      if (onIncrementalEvent && !emittedIncremental) {
+        if (normalized.reasoningText) {
+          onIncrementalEvent({ type: "reasoning", text: normalized.reasoningText });
+        }
+        if (normalized.visibleText) {
+          onIncrementalEvent({ type: "delta", text: normalized.visibleText });
         }
       }
 
@@ -477,13 +546,7 @@ export class HttpProtocolDriver implements ApexDriver {
     input: DriverTurnInput,
     onEvent: (ev: DriverStreamEvent) => void,
   ): Promise<DriverTurnResult> {
-    const result = await this.sendMessage(sessionId, input);
-    if (result.normalizedTurn.reasoningText) {
-      onEvent({ type: "reasoning", text: result.normalizedTurn.reasoningText });
-    }
-    if (result.normalizedTurn.visibleText) {
-      onEvent({ type: "delta", text: result.normalizedTurn.visibleText });
-    }
+    const result = await this.sendMessage(sessionId, input, onEvent);
     for (const tc of result.normalizedTurn.toolCalls) {
       onEvent({
         type: "tool_call",
@@ -570,19 +633,77 @@ export class NativeCliHarnessDriver implements ApexDriver {
     this.argsPrefix = options.argsPrefix ?? [];
     this.resumeFlag =
       options.resumeFlag ??
-      (options.binaryName === "claude" || options.binaryName === "codex" ? "--resume" : undefined);
+      (options.binaryName === "claude" || options.binaryName === "codex"
+        ? "--resume"
+        : options.binaryName === "opencode"
+          ? "--session"
+          : undefined);
     this.dataDir = options.dataDir;
     this.defaultModels = options.defaultModels;
     const canResume = options.supportsSessionResume ?? Boolean(this.resumeFlag);
     this.capabilities = {
       supportsStreaming: true,
       supportsToolCalls: true,
-      supportsSubagents: options.binaryName === "claude" || options.binaryName === "codex",
+      supportsSubagents: false,
       supportsSessionResume: canResume,
       supportsNativeApproval: options.supportsNativeApproval ?? false,
       supportsReasoningEffort: options.binaryName === "codex" || options.binaryName === "claude",
       maxContextTokens: 200_000,
     };
+  }
+
+  private resolveCliCommand(rawBinary: string): { command: string; prefixArgs: string[]; resolvedPath?: string } {
+    if (this.binaryPath && existsSync(this.binaryPath)) {
+      return { command: this.binaryPath, prefixArgs: [], resolvedPath: this.binaryPath };
+    }
+    try {
+      const cmd = process.platform === "win32" ? "where.exe" : "which";
+      const lines = execFileSync(cmd, [rawBinary], {
+        encoding: "utf8",
+        timeout: 3000,
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .trim()
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean);
+
+      if (process.platform === "win32") {
+        const exeCandidate = lines.find((l) => l.toLowerCase().endsWith(".exe"));
+        if (exeCandidate && existsSync(exeCandidate)) {
+          return { command: exeCandidate, prefixArgs: [], resolvedPath: exeCandidate };
+        }
+        const cmdCandidate = lines.find(
+          (l) => l.toLowerCase().endsWith(".cmd") || l.toLowerCase().endsWith(".bat"),
+        );
+        if (cmdCandidate && existsSync(cmdCandidate)) {
+          const cmdContent = readFileSync(cmdCandidate, "utf8");
+          const cmdDir = dirname(cmdCandidate);
+          const exeInWrapper = cmdContent.match(/dp0%\\([^\r\n"]+\.exe)/i);
+          if (exeInWrapper?.[1]) {
+            const targetExe = resolve(cmdDir, exeInWrapper[1]);
+            if (existsSync(targetExe)) {
+              return { command: targetExe, prefixArgs: [], resolvedPath: targetExe };
+            }
+          }
+          const jsInWrapper = cmdContent.match(/dp0%\\([^\r\n"]+\.(?:c?js|mjs))/i);
+          if (jsInWrapper?.[1]) {
+            const targetJs = resolve(cmdDir, jsInWrapper[1]);
+            if (existsSync(targetJs)) {
+              return { command: process.execPath, prefixArgs: [targetJs], resolvedPath: targetJs };
+            }
+          }
+          return { command: cmdCandidate, prefixArgs: [], resolvedPath: cmdCandidate };
+        }
+      }
+
+      if (lines[0]) {
+        return { command: lines[0], prefixArgs: [], resolvedPath: lines[0] };
+      }
+    } catch {
+      // Fall back to raw binaryName
+    }
+    return { command: rawBinary, prefixArgs: [] };
   }
 
   async initialize(): Promise<void> {
@@ -591,42 +712,24 @@ export class NativeCliHarnessDriver implements ApexDriver {
 
   async healthCheck(): Promise<DriverHealthStatus> {
     const t0 = Date.now();
-    if (this.binaryPath && existsSync(this.binaryPath)) {
+    const resolved = this.resolveCliCommand(this.binaryName);
+    if (resolved.resolvedPath && existsSync(resolved.resolvedPath)) {
       return {
         driverId: this.id,
         healthy: true,
         protocol: this.protocol,
         latencyMs: Date.now() - t0,
-        detail: `Executable verified at ${this.binaryPath}`,
-        binaryPath: this.binaryPath,
+        detail: `Binary verified at ${resolved.resolvedPath}`,
+        binaryPath: resolved.resolvedPath,
       };
     }
-    try {
-      const cmd = process.platform === "win32" ? "where.exe" : "which";
-      const out = execFileSync(cmd, [this.binaryName], {
-        encoding: "utf8",
-        timeout: 3000,
-        stdio: ["ignore", "pipe", "ignore"],
-      })
-        .trim()
-        .split(/\r?\n/)[0];
-      return {
-        driverId: this.id,
-        healthy: Boolean(out),
-        protocol: this.protocol,
-        latencyMs: Date.now() - t0,
-        detail: out ? `Binary verified at ${out}` : `${this.binaryName} not found`,
-        binaryPath: out,
-      };
-    } catch {
-      return {
-        driverId: this.id,
-        healthy: false,
-        protocol: this.protocol,
-        latencyMs: Date.now() - t0,
-        detail: `CLI binary '${this.binaryName}' not installed on PATH`,
-      };
-    }
+    return {
+      driverId: this.id,
+      healthy: false,
+      protocol: this.protocol,
+      latencyMs: Date.now() - t0,
+      detail: `CLI binary '${this.binaryName}' not installed on PATH`,
+    };
   }
 
   async listModels(): Promise<DriverModelDescriptor[]> {
@@ -673,13 +776,11 @@ export class NativeCliHarnessDriver implements ApexDriver {
     return existing;
   }
 
-  private buildSpawnArgs(session: DriverSession, prompt: string): string[] {
+  buildSpawnArgs(session: DriverSession, prompt: string): string[] {
+    const isResumed = this.capabilities.supportsSessionResume && (session.resumedCount ?? 0) > 0;
+    const targetResumeId = session.nativeSessionId || session.sessionId;
     const resumeArgs =
-      this.capabilities.supportsSessionResume &&
-      this.resumeFlag &&
-      (session.resumedCount ?? 0) > 0
-        ? [this.resumeFlag, session.sessionId]
-        : [];
+      isResumed && this.resumeFlag && targetResumeId ? [this.resumeFlag, targetResumeId] : [];
 
     if (this.argsPrefix.length > 0) {
       return [...this.argsPrefix, ...resumeArgs, "-p", prompt];
@@ -688,7 +789,18 @@ export class NativeCliHarnessDriver implements ApexDriver {
       return [...resumeArgs, "-p", prompt, "--output-format", "stream-json", "--verbose"];
     }
     if (this.binaryName === "codex") {
-      return ["exec", "--skip-git-repo-check", ...resumeArgs, prompt];
+      if (isResumed && targetResumeId) {
+        return ["exec", "resume", "--skip-git-repo-check", "--json", targetResumeId, prompt];
+      }
+      return ["exec", "--skip-git-repo-check", "--json", prompt];
+    }
+    if (this.binaryName === "opencode") {
+      const ocResume = isResumed && targetResumeId ? ["--session", targetResumeId] : [];
+      return ["run", "--format", "json", ...ocResume, prompt];
+    }
+    if (this.binaryName === "agy") {
+      const agyResume = isResumed && targetResumeId ? ["--conversation", targetResumeId] : [];
+      return ["-p", prompt, "--output-format", "stream-json", ...agyResume];
     }
     return [...resumeArgs, "-p", prompt];
   }
@@ -713,8 +825,10 @@ export class NativeCliHarnessDriver implements ApexDriver {
       }));
 
     const carbonHome = ensureCleanCarbonHome(this.dataDir);
-    const executable = this.binaryPath || this.binaryName;
-    const args = this.buildSpawnArgs(session, input.prompt);
+    const isCarbonModel = session.modelId.toLowerCase().includes("carbon");
+    const resolvedCmd = this.resolveCliCommand(this.binaryName);
+    const executable = resolvedCmd.command;
+    const args = [...resolvedCmd.prefixArgs, ...this.buildSpawnArgs(session, input.prompt)];
 
     return new Promise<DriverTurnResult>((resolvePromise) => {
       let stdoutAll = "";
@@ -728,6 +842,9 @@ export class NativeCliHarnessDriver implements ApexDriver {
         const trimmed = rawLine.trim();
         if (!trimmed) return;
         const parsedLine = NativeCliJsonlProtocolAdapter.parseJsonlLines([trimmed]);
+        if (parsedLine.nativeSessionId && !session.nativeSessionId) {
+          session.nativeSessionId = parsedLine.nativeSessionId;
+        }
         if (parsedLine.reasoningText) {
           onEvent({ type: "reasoning", text: parsedLine.reasoningText });
         }
@@ -749,11 +866,13 @@ export class NativeCliHarnessDriver implements ApexDriver {
       try {
         child = spawn(executable, args, {
           cwd: session.workspaceRoot,
-          env: {
-            ...process.env,
-            HOME: carbonHome,
-            USERPROFILE: carbonHome,
-          },
+          env: isCarbonModel
+            ? {
+                ...process.env,
+                HOME: carbonHome,
+                USERPROFILE: carbonHome,
+              }
+            : { ...process.env },
           stdio: ["ignore", "pipe", "pipe"],
           windowsHide: true,
           detached: process.platform !== "win32",
@@ -857,6 +976,9 @@ export class NativeCliHarnessDriver implements ApexDriver {
         }
 
         const parsed = NativeCliJsonlProtocolAdapter.parseJsonlLines(stdoutAll.split(/\r?\n/));
+        if (parsed.nativeSessionId) {
+          session.nativeSessionId = parsed.nativeSessionId;
+        }
         let combinedText = parsed.visibleText;
         if (parsed.toolCalls.length > 0 && !parsed.hasIncompleteToolCall) {
           const rendered = renderProtocolToolCallsAsApexActionBlocks(parsed.toolCalls);
@@ -1063,7 +1185,8 @@ export class ApexDriverRegistry {
         id: "cli:opencode-cli",
         displayName: "OpenCode CLI Driver",
         binaryName: "opencode",
-        supportsSessionResume: false,
+        resumeFlag: "--session",
+        supportsSessionResume: true,
         supportsNativeApproval: false,
         defaultModels: ["opencode/default"],
       },

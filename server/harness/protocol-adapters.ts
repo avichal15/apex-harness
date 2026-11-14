@@ -39,6 +39,7 @@ export interface NormalizedProtocolTurn {
   incompleteToolCalls: IncompleteProtocolToolCall[];
   hasIncompleteToolCall: boolean;
   finishReason: ProtocolFinishReason;
+  nativeSessionId?: string;
   rawUsage?: {
     inputTokens?: number;
     outputTokens?: number;
@@ -701,6 +702,7 @@ export class NativeCliJsonlProtocolAdapter {
     const toolCalls: NormalizedProtocolToolCall[] = [];
     const incompleteToolCalls: IncompleteProtocolToolCall[] = [];
     let finishReason: ProtocolFinishReason = "stop";
+    let nativeSessionId: string | undefined;
 
     for (const rawLine of lines) {
       const trimmed = rawLine.trim();
@@ -711,6 +713,11 @@ export class NativeCliJsonlProtocolAdapter {
       }
       try {
         const obj = JSON.parse(trimmed) as Record<string, unknown>;
+        const candidateSessionId =
+          obj.thread_id ?? obj.session_id ?? obj.sessionID ?? obj.conversation_id;
+        if (typeof candidateSessionId === "string" && candidateSessionId.trim()) {
+          nativeSessionId = candidateSessionId.trim();
+        }
         const type = String(obj.type ?? "");
         if (type === "assistant" && obj.message && typeof obj.message === "object") {
           const parsedAnthropic = AnthropicMessagesProtocolAdapter.parseResponse(
@@ -726,7 +733,14 @@ export class NativeCliJsonlProtocolAdapter {
           }
         } else if (type === "item.completed" && obj.item && typeof obj.item === "object") {
           const item = obj.item as Record<string, unknown>;
-          if (typeof item.text === "string") visibleParts.push(item.text.trim());
+          if (item.type !== "error" && typeof item.text === "string" && item.text.trim()) {
+            visibleParts.push(item.text.trim());
+          }
+        } else if (type === "text" && obj.part && typeof obj.part === "object") {
+          const part = obj.part as Record<string, unknown>;
+          if (typeof part.text === "string" && part.text.trim()) {
+            visibleParts.push(part.text.trim());
+          }
         } else if (
           (type === "tool_use" || type === "function_call" || type === "tool_call") &&
           typeof obj.name === "string"
@@ -766,6 +780,7 @@ export class NativeCliJsonlProtocolAdapter {
       incompleteToolCalls,
       hasIncompleteToolCall: incompleteToolCalls.length > 0,
       finishReason,
+      ...(nativeSessionId ? { nativeSessionId } : {}),
     };
   }
 }

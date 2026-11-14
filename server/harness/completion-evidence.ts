@@ -11,8 +11,8 @@
 // - Honest completion status (`implemented_and_verified`, `implemented_not_verified`, `partially_completed`, `blocked`, `failed`, `skipped`)
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { basename, join, resolve } from "node:path";
 import type {
   AgentExecutionNode,
   AgentOfficeRole,
@@ -24,10 +24,12 @@ import type {
 } from "../../shared/apex-contracts.ts";
 
 /**
- * Inspects project manifest files (`package.json`, `pyproject.toml`, `Cargo.toml`, `go.mod`)
- * in `workspaceRoot` and discovers the repository's native verification commands.
+ * Inspects project manifest files (`package.json`, `pnpm-workspace.yaml`, `pyproject.toml`, `Cargo.toml`, `go.mod`)
+ * in `workspaceRoot` and discovers the repository's native verification commands across `npm`, `pnpm`, `yarn`, `bun`, and monorepos.
  */
 export function detectProjectVerificationCommands(workspaceRoot: string): {
+  packageManager: "npm" | "pnpm" | "yarn" | "bun";
+  isMonorepo: boolean;
   testCommands: string[];
   lintCommands: string[];
   typecheckCommands: string[];
@@ -39,20 +41,161 @@ export function detectProjectVerificationCommands(workspaceRoot: string): {
   const typecheckCommands: string[] = [];
   const buildCommands: string[] = [];
 
+  let packageManager: "npm" | "pnpm" | "yarn" | "bun" = "npm";
+  if (
+    existsSync(join(root, "pnpm-lock.yaml")) ||
+    existsSync(join(root, "pnpm-workspace.yaml"))
+  ) {
+    packageManager = "pnpm";
+  } else if (existsSync(join(root, "yarn.lock"))) {
+    packageManager = "yarn";
+  } else if (existsSync(join(root, "bun.lockb")) || existsSync(join(root, "bun.lock"))) {
+    packageManager = "bun";
+  }
+
+  const isPlaceholderScript = (scriptVal?: string): boolean => {
+    if (!scriptVal || !scriptVal.trim()) return true;
+    return /no test specified/i.test(scriptVal);
+  };
+
+  const formatRunCmd = (pm: "npm" | "pnpm" | "yarn" | "bun", scriptName: string): string => {
+    if (scriptName === "test" && pm === "npm") return "npm test";
+    return `${pm} run ${scriptName}`;
+  };
+
+  let isMonorepo = existsSync(join(root, "pnpm-workspace.yaml"));
+  const workspacePatterns: string[] = [];
+
+  if (existsSync(join(root, "pnpm-workspace.yaml"))) {
+    try {
+      const rawYaml = readFileSync(join(root, "pnpm-workspace.yaml"), "utf8");
+      for (const line of rawYaml.split(/\r?\n/)) {
+        const m = line.match(/^\s*-\s*["']?([^"'\r\n#]+)["']?/);
+        if (m?.[1]?.trim()) {
+          workspacePatterns.push(m[1].trim());
+        }
+      }
+    } catch {
+      // Ignore malformed pnpm-workspace.yaml
+    }
+  }
+
   const pkgPath = join(root, "package.json");
   if (existsSync(pkgPath)) {
     try {
       const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as {
+        packageManager?: string;
+        workspaces?: string[] | { packages?: string[] };
         scripts?: Record<string, string>;
       };
+      if (typeof pkg.packageManager === "string") {
+        const pmLower = pkg.packageManager.toLowerCase();
+        if (pmLower.startsWith("pnpm")) packageManager = "pnpm";
+        else if (pmLower.startsWith("yarn")) packageManager = "yarn";
+        else if (pmLower.startsWith("bun")) packageManager = "bun";
+        else if (pmLower.startsWith("npm")) packageManager = "npm";
+      }
+
+      if (Array.isArray(pkg.workspaces)) {
+        isMonorepo = true;
+        workspacePatterns.push(...pkg.workspaces);
+      } else if (pkg.workspaces && Array.isArray(pkg.workspaces.packages)) {
+        isMonorepo = true;
+        workspacePatterns.push(...pkg.workspaces.packages);
+      }
+
       const scripts = pkg.scripts ?? {};
-      if (scripts["test:apex"]) testCommands.push("npm run test:apex");
-      else if (scripts.test) testCommands.push("npm test");
-      if (scripts.lint) lintCommands.push("npm run lint");
-      if (scripts.typecheck) typecheckCommands.push("npm run typecheck");
-      if (scripts.build) buildCommands.push("npm run build");
+      if (!isPlaceholderScript(scripts["test:apex"])) {
+        testCommands.push(formatRunCmd(packageManager, "test:apex"));
+      } else if (!isPlaceholderScript(scripts.test)) {
+        testCommands.push(formatRunCmd(packageManager, "test"));
+      }
+      if (!isPlaceholderScript(scripts.lint)) {
+        lintCommands.push(formatRunCmd(packageManager, "lint"));
+      }
+      if (!isPlaceholderScript(scripts.typecheck)) {
+        typecheckCommands.push(formatRunCmd(packageManager, "typecheck"));
+      }
+      if (!isPlaceholderScript(scripts.build)) {
+        buildCommands.push(formatRunCmd(packageManager, "build"));
+      }
     } catch {
       // Ignore malformed package.json
+    }
+  }
+
+  // Discover monorepo workspace package scripts if root does not define them directly
+  if (isMonorepo && workspacePatterns.length > 0) {
+    const workspaceDirs: string[] = [];
+    for (const pattern of workspacePatterns) {
+      const clean = pattern.replace(/\/+$/, "");
+      if (clean.endsWith("/*")) {
+        const parentRel = clean.slice(0, -2);
+        const parentAbs = join(root, parentRel);
+        if (existsSync(parentAbs)) {
+          try {
+            for (const entry of readdirSync(parentAbs, { withFileTypes: true })) {
+              if (entry.isDirectory()) {
+                workspaceDirs.push(`${parentRel}/${entry.name}`);
+              }
+            }
+          } catch {
+            // Ignore unreadable directory
+          }
+        }
+      } else if (existsSync(join(root, clean))) {
+        workspaceDirs.push(clean);
+      }
+    }
+
+    const formatWorkspaceRunCmd = (
+      pm: "npm" | "pnpm" | "yarn" | "bun",
+      wsRelDir: string,
+      wsPkgName: string | undefined,
+      scriptName: string,
+    ): string => {
+      if (pm === "pnpm") {
+        return wsPkgName
+          ? `pnpm --filter ${wsPkgName} run ${scriptName}`
+          : `pnpm -C ${wsRelDir} run ${scriptName}`;
+      }
+      if (pm === "yarn") {
+        return wsPkgName
+          ? `yarn workspace ${wsPkgName} run ${scriptName}`
+          : `yarn --cwd ${wsRelDir} run ${scriptName}`;
+      }
+      if (pm === "bun") {
+        return `bun --cwd ${wsRelDir} run ${scriptName}`;
+      }
+      return `npm --prefix ${wsRelDir} run ${scriptName}`;
+    };
+
+    for (const wsRel of workspaceDirs) {
+      const wsPkgPath = join(root, wsRel, "package.json");
+      if (!existsSync(wsPkgPath)) continue;
+      try {
+        const wsPkg = JSON.parse(readFileSync(wsPkgPath, "utf8")) as {
+          name?: string;
+          scripts?: Record<string, string>;
+        };
+        const wsScripts = wsPkg.scripts ?? {};
+        if (testCommands.length === 0 && !isPlaceholderScript(wsScripts.test)) {
+          testCommands.push(formatWorkspaceRunCmd(packageManager, wsRel, wsPkg.name, "test"));
+        }
+        if (lintCommands.length === 0 && !isPlaceholderScript(wsScripts.lint)) {
+          lintCommands.push(formatWorkspaceRunCmd(packageManager, wsRel, wsPkg.name, "lint"));
+        }
+        if (typecheckCommands.length === 0 && !isPlaceholderScript(wsScripts.typecheck)) {
+          typecheckCommands.push(
+            formatWorkspaceRunCmd(packageManager, wsRel, wsPkg.name, "typecheck"),
+          );
+        }
+        if (buildCommands.length === 0 && !isPlaceholderScript(wsScripts.build)) {
+          buildCommands.push(formatWorkspaceRunCmd(packageManager, wsRel, wsPkg.name, "build"));
+        }
+      } catch {
+        // Ignore malformed workspace package.json
+      }
     }
   }
 
@@ -71,6 +214,8 @@ export function detectProjectVerificationCommands(workspaceRoot: string): {
   }
 
   return {
+    packageManager,
+    isMonorepo,
     testCommands,
     lintCommands,
     typecheckCommands,
@@ -327,30 +472,89 @@ export function buildCompletionEvidenceReport(input: {
 
   const reqItemStatus = mapCompletionStatusToRequirementStatus(status);
   const changedFilesList = [...new Set([...input.filesCreated, ...input.filesModified])];
+  const normalizedChangedSet = new Set(
+    changedFilesList.flatMap((f) => [
+      f.replace(/\\/g, "/").toLowerCase(),
+      basename(f.replace(/\\/g, "/")).toLowerCase(),
+    ]),
+  );
   const executedCommandsSummary = input.commandsExecuted.map(
     (c) => `${c.command} (exit=${c.exitCode ?? "null"})`,
   );
 
-  const requirementMatrix: RequirementEvidenceItem[] = (
-    requirementClauses.length > 0 ? requirementClauses : [input.originalRequirement]
-  ).map((clause, idx) => {
-    const evidenceSummary =
+  let hasUnmetRequirementClause = false;
+  const clausesToEvaluate =
+    requirementClauses.length > 0 ? requirementClauses : [input.originalRequirement];
+
+  const requirementMatrix: RequirementEvidenceItem[] = clausesToEvaluate.map((clause, idx) => {
+    const fileTokens = [
+      ...clause.matchAll(
+        /\b([A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|py|rs|go|md|json|yaml|yml|css|html))\b/g,
+      ),
+    ].map((m) => m[1]);
+    const hasMutatingActionVerb =
+      /\b(?:create|write|add|implement|update|modify|edit|generate|fix)\b/i.test(clause);
+
+    let clauseStatus = reqItemStatus;
+    let clauseFiles =
+      changedFilesList.length > 0 ? changedFilesList : [...input.filesInspected];
+    let evidenceSummary =
       changedFilesList.length > 0
         ? `Files changed: ${changedFilesList.join(", ")}${executedCommandsSummary.length > 0 ? ` · Commands: ${executedCommandsSummary.join(", ")}` : ""}`
         : input.filesInspected.length > 0
           ? `Files inspected: ${input.filesInspected.slice(0, 5).join(", ")}`
           : `EGM outcome: ${input.egmReview.outcome}`;
+
+    if (
+      clausesToEvaluate.length > 1 &&
+      hasMutatingActionVerb &&
+      fileTokens.length > 0 &&
+      changedFilesList.length > 0
+    ) {
+      const matchedClauseFiles = fileTokens.filter((ft) => {
+        const norm = ft.replace(/\\/g, "/").toLowerCase();
+        return (
+          normalizedChangedSet.has(norm) ||
+          normalizedChangedSet.has(basename(norm).toLowerCase())
+        );
+      });
+      if (matchedClauseFiles.length === 0) {
+        clauseStatus = "not_implemented";
+        clauseFiles = [];
+        evidenceSummary = `Target file(s) referenced in clause (${fileTokens.join(", ")}) were not created or modified.`;
+        hasUnmetRequirementClause = true;
+      } else {
+        clauseFiles = changedFilesList.filter((cf) => {
+          const normCf = cf.replace(/\\/g, "/").toLowerCase();
+          return matchedClauseFiles.some((mf) => {
+            const normMf = mf.replace(/\\/g, "/").toLowerCase();
+            return normCf === normMf || basename(normCf) === basename(normMf);
+          });
+        });
+      }
+    }
+
     return {
       requirementId: `REQ-${idx + 1}`,
       description: clause,
       requirement: clause,
-      status: reqItemStatus,
-      evidenceFiles: changedFilesList.length > 0 ? changedFilesList : [...input.filesInspected],
+      status: clauseStatus,
+      evidenceFiles: clauseFiles,
       evidenceCommands: executedCommandsSummary,
       evidence: evidenceSummary,
       justification: evidenceSummary,
     };
   });
+
+  if (
+    hasUnmetRequirementClause &&
+    (status === "implemented_and_verified" || status === "implemented_not_verified")
+  ) {
+    status = "partially_completed";
+    remainingIssues.push(
+      "One or more multi-part requirement clauses named target files that were not created or modified.",
+    );
+  }
 
   return {
     executionId: input.executionId,

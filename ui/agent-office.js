@@ -196,12 +196,19 @@
                 : node.state === "skipped"
                   ? "skipped"
                   : "idle";
+        const isDeterministicScan =
+          node.actualModelUsed === "deterministic-scanner" ||
+          String(node.outputSummary || "").startsWith("[Deterministic Scan]");
         desk.state = mappedState;
         desk.rawState = node.state;
-        desk.modelLabel = (node.actualModelUsed || node.assignedModelId || node.engineeringRole || "")
-          .replace(/^agy-acp\//, "")
-          .slice(0, 26);
-        desk.driverId = node.driverId || "auto-driver";
+        desk.modelLabel = isDeterministicScan
+          ? "DETERMINISTIC SCAN"
+          : (node.actualModelUsed || node.assignedModelId || node.engineeringRole || "")
+              .replace(/^agy-acp\//, "")
+              .slice(0, 26);
+        desk.driverId = isDeterministicScan
+          ? "deterministic-scanner"
+          : node.driverId || "auto-driver";
         desk.sessionId = node.sessionId || payload.executionId || "active";
         desk.currentTool = node.currentTool || "";
         desk.retryCount = node.retryCount || 0;
