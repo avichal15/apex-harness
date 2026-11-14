@@ -30,7 +30,7 @@ jobs:
         with:
           node-version: 24
       - name: Run oxlint --deny-warnings Static Verification
-        run: npx --yes oxlint --deny-warnings server scripts shared electron
+        run: npx --yes --bin-links=true --prefer-offline=false oxlint@1.80.0 --deny-warnings server scripts shared electron
       - name: Run Apex Harness 41-Test Security, Engineering & 8-Repo Reference Integration Suite
         run: node --experimental-strip-types --test server/apex-harness.node-test.mjs server/apex-master-verification.node-test.mjs server/apex-reference-integration.node-test.mjs
       - name: Run Apex Desktop Staged Layout & Path-With-Spaces Backend Smoke Test
