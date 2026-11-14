@@ -18,17 +18,15 @@ import { spawn } from "node:child_process";
 import {
   appendFileSync,
   existsSync,
-  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
-  realpathSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { join, relative, resolve, sep } from "node:path";
 import { buildIsolatedEnvironment, killProcessTree } from "./process-manager.ts";
-import { assertCanonicalWorkspacePath, resolveCanonicalWorkspaceRoot } from "./workspace-security.ts";
+import { resolveCanonicalWorkspaceRoot } from "./workspace-security.ts";
 
 // ============================================================================
 // 1. GUARD SUBSYSTEM (`repeat-tool-reminder` + `timeout-policy`)

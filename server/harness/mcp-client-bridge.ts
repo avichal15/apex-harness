@@ -49,7 +49,7 @@ async function runStdioMcpRpc(
         const child = spawn(server.command!, server.args ?? [], {
           env: {
             ...process.env,
-            ...(server.env ?? {}),
+            ...server.env,
           },
           stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,

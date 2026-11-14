@@ -8,7 +8,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, relative, resolve } from "node:path";
+import { dirname, join, relative } from "node:path";
 import type { AgentOfficeRole, ExecutedCommandEvidence } from "../shared/apex-contracts.ts";
 import { callMcpServerTool } from "./harness/mcp-client-bridge.ts";
 import { killProcessTree, runManagedCommand } from "./harness/process-manager.ts";
@@ -642,7 +642,7 @@ export async function callLocalCliDriverFallbackAsync(
 
 export function callLocalCliDriverFallback(
   preferredModelId: string,
-  messages: ReadonlyArray<{ role: string; content: string }>,
+  _messages: ReadonlyArray<{ role: string; content: string }>,
 ): LlmCallResult {
   return {
     ok: false,

@@ -19,26 +19,21 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
-import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type ServerResponse } from "node:http";
 import { homedir } from "node:os";
-import { basename, dirname, join, relative, resolve } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import type {
   AgentExecutionNode,
   CompletionEvidenceReport,
   EngineeringRole10,
-  ExecutedCommandEvidence,
   PostImplReviewReport,
   ProviderConfigEntry,
   RoleRoutingAssignment,
 } from "../shared/apex-contracts.ts";
 import { APEX_DATA_DIR, APEX_PROJECT_ROOT } from "./apex-cli.ts";
 import {
-  callUnifiedFleetWithFailover,
-  executeAgentToolBlocks,
-  executeAgentToolBlocksAsync,
-  gatherGroundedWorkspaceContext,
   revertTurnCheckpoint,
   saveTurnCheckpoint,
   type AgentStepEvent,
@@ -46,12 +41,10 @@ import {
   type FileBackupEntry,
 } from "./apex-llm-engine.ts";
 import {
-  buildOrchestrationPlan,
   evaluateCompletedTurn,
   loadScoreboard,
 } from "./decider/apex-orchestrator-router.ts";
 import {
-  buildExecutionDag,
   deleteProviderConfig,
   executeTaskDag,
   loadProviderConfigs,
@@ -67,12 +60,10 @@ import {
   type DriverBackend,
 } from "./harness/apex-fleet-sync.ts";
 import {
-  buildCompletionEvidenceReport,
   captureWorkspaceGitDiffSummary,
 } from "./harness/completion-evidence.ts";
 import {
   appendSessionGenerationEvent,
-  applySpillPolicyToText,
   executePtcProgram,
   inspectCordisRuntime,
   mountDynamicPlugin,
@@ -81,10 +72,7 @@ import {
   runDynamicPlugin,
 } from "./harness/deepseek-subsystems.ts";
 import {
-  buildDesk1GroundedManifest,
   runEgmBoardroomConference,
-  runPostImplementationEgmReview,
-  type EgmBoardroomBrief,
 } from "./harness/egm-boardroom.ts";
 import { TaskExecutionManager } from "./harness/execution-manager.ts";
 import {
@@ -121,7 +109,6 @@ import {
   detectSkillConflicts,
   discoverAllUniversalMcpServers,
   discoverAllUniversalSkills,
-  estimateSkillTokens,
   loadSkillManagementConfig,
   saveSkillManagementConfig,
   transpileSkillForDriver,
@@ -141,7 +128,6 @@ import {
 
 const repeatGuard = new RepeatToolReminderGuard({ thresholds: [3, 5, 8] });
 
-const HERE = dirname(fileURLToPath(import.meta.url));
 const UI_HTML_PATH = join(APEX_PROJECT_ROOT, "ui", "index.html");
 const CONVERSATIONS_FILE = join(APEX_DATA_DIR, "apex-conversations.json");
 
@@ -260,7 +246,7 @@ function sanitizeLoadedConversations(rawThreads: ConversationThread[]): Conversa
   return cleaned;
 }
 
-function loadConversations(projects: readonly ProjectEntry[]): ConversationThread[] {
+function loadConversations(_projects: readonly ProjectEntry[]): ConversationThread[] {
   mkdirSync(APEX_DATA_DIR, { recursive: true, mode: 0o700 });
   if (existsSync(CONVERSATIONS_FILE)) {
     try {

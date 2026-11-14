@@ -5,12 +5,10 @@
 //    with parallel independent subtask execution, pause/cancel/approval propagation, bounded EGM correction cycles,
 //    and structured CompletionEvidenceReport generation.
 
-import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type {
   AgentExecutionNode,
-  AgentOfficeRole,
   CompletionEvidenceReport,
   DagTopologyMode,
   EngineeringRole10,
@@ -24,7 +22,6 @@ import type {
 } from "../../shared/apex-contracts.ts";
 import {
   callProviderEndpoint,
-  callUnifiedFleetWithFailover,
   executeAgentToolBlocksAsync,
   gatherGroundedWorkspaceContext,
   type AgentStepEvent,
@@ -53,7 +50,6 @@ import {
   buildDesk1GroundedManifest,
   runEgmBoardroomConference,
   runPostImplementationEgmReview,
-  selectIndependentGoldfishModel,
   type EgmBoardroomBrief,
 } from "./egm-boardroom.ts";
 import type { TaskExecutionManager } from "./execution-manager.ts";
@@ -65,7 +61,6 @@ import {
   saveMemoryEntry,
   validateLearnedSkillProposal,
   type SubagentDelegationRequest,
-  type SubagentDelegationResult,
 } from "./hermes-memory-learning.ts";
 import { runManagedCommand } from "./process-manager.ts";
 import {
@@ -394,7 +389,7 @@ export async function testProviderConnection(
         ? `${provider.baseUrl}/models${apiKey ? `?key=${encodeURIComponent(apiKey)}` : ""}`
         : `${provider.baseUrl}/models`;
 
-    const headers: Record<string, string> = { ...(provider.headers ?? {}) };
+    const headers: Record<string, string> = { ...provider.headers };
     if (apiKey && provider.protocol !== "gemini") {
       if (provider.protocol === "anthropic-compat") {
         headers["x-api-key"] = apiKey;
@@ -615,7 +610,7 @@ export function saveRoleRoutingTable(
       fallbackModelIds: patch.fallbackModelIds ?? existing.fallbackModelIds,
       requiredCapabilities: {
         ...existing.requiredCapabilities,
-        ...(patch.requiredCapabilities ?? {}),
+        ...patch.requiredCapabilities,
       },
     });
   }
