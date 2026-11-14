@@ -779,10 +779,21 @@ export function detectDagCycle(nodes: readonly AgentExecutionNode[]): {
  *                              └──> node-verifier
  */
 export function determineDagTopologyMode(
-  prompt: string,
+  promptOrOptions:
+    | string
+    | { prompt: string; isIndependent?: boolean; adaptiveTopology?: boolean },
   options: { isIndependent?: boolean; adaptiveTopology?: boolean } = {},
 ): DagTopologyMode {
-  if (!options.adaptiveTopology && !options.isIndependent) {
+  const prompt =
+    typeof promptOrOptions === "string" ? promptOrOptions : promptOrOptions.prompt;
+  const resolvedOptions =
+    typeof promptOrOptions === "string"
+      ? options
+      : {
+          isIndependent: promptOrOptions.isIndependent,
+          adaptiveTopology: promptOrOptions.adaptiveTopology,
+        };
+  if (!resolvedOptions.adaptiveTopology && !resolvedOptions.isIndependent) {
     return "full_engineering";
   }
   const trimmed = prompt.trim();
@@ -790,11 +801,11 @@ export function determineDagTopologyMode(
     /\b(file|code|repo|project|fix|bug|test|build|refactor|implement|audit|security|function|class|module|server|ui|git|diff|edit|write|create)\b/i.test(
       trimmed,
     );
-  if (options.isIndependent && !hasEngineeringIntent) {
+  if (resolvedOptions.isIndependent && !hasEngineeringIntent) {
     return "fast_path";
   }
   if (
-    options.adaptiveTopology &&
+    resolvedOptions.adaptiveTopology &&
     trimmed.length < 80 &&
     !hasEngineeringIntent &&
     /^(hi|hello|hey|what\s+is|who\s+are|ping|thanks|thank\s+you|\d+\s*[+\-*/]\s*\d+)/i.test(trimmed)
@@ -803,10 +814,11 @@ export function determineDagTopologyMode(
   }
   const classification = classifyTaskPrompt(trimmed);
   if (
-    options.adaptiveTopology &&
+    resolvedOptions.adaptiveTopology &&
     (classification.complexity === "trivial" ||
       (classification.complexity === "moderate" &&
-        !/\b(refactor|implement|rewrite|migrate)\b/i.test(trimmed))) &&
+        !trimmed.includes(";") &&
+        !/\b(refactor|implement|rewrite|migrate|ensure|verify)\b/i.test(trimmed))) &&
     !/\b(architecture|design|boardroom|audit|security|multi-agent)\b/i.test(trimmed)
   ) {
     return "standard";

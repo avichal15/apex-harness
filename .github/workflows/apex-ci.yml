@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   apex-verification:
-    name: Apex Harness 37-Test Suite (${{ matrix.os }})
+    name: Apex Harness 39-Test Suite (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:

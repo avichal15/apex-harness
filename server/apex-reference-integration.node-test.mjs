@@ -1,6 +1,6 @@
 // ============================================================================
 // APEX HARNESS — 8-REPOSITORY REFERENCE ARCHITECTURE INTEGRATION TEST SUITE
-// Verifies V-01 through V-08 across:
+// Verifies V-01 through V-09 across:
 // - OpenHands (WorkspaceRuntime + Trajectory Condenser)
 // - OpenMausBot (Unified Execution Spine + Driver Registry)
 // - DeepSeek-Harness (PTC editFile/tools, Spill pagination, Guard mutation reset & 2-step cycle, Signed Plugin uninstall & audit log)
@@ -95,7 +95,7 @@ function makeTempDir(prefix = "apex-ref-int-") {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-01..V-08)", async (t) => {
+test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-01..V-09)", async (t) => {
   // ==========================================================================
   // V-01: Production Execution Spine & Adaptive DAG Topologies
   // ==========================================================================
@@ -1183,6 +1183,273 @@ test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-
       assert.equal(policyReadOnlyChain.decision, "allow");
       assert.equal(policyReadOnlyChain.tier, "readonly");
     } finally {
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  // ==========================================================================
+  // V-09: Full Engineering Task End-to-End Integration Test
+  // ==========================================================================
+  await t.test("V-09: Full engineering task through /api/chat/stream (full_engineering DAG, parallel Scout+Architect, Builder edit_file + subagent delegation, independent HTTP Goldfish reviewer, Verifier auto-running npm test, requirement matrix, Hermes memory/skill learning, persisted execution & SSE completion)", async () => {
+    const tempDir = makeTempDir("apex-v09-");
+    writeFileSync(
+      join(tempDir, "package.json"),
+      JSON.stringify(
+        {
+          name: "v09-calc-service",
+          version: "1.0.0",
+          type: "module",
+          scripts: {
+            test: "node --test calc.test.mjs",
+          },
+        },
+        null,
+        2,
+      ),
+      "utf8",
+    );
+    writeFileSync(
+      join(tempDir, "calc.mjs"),
+      "export function multiply(a, b) {\n  return a + b;\n}\n",
+      "utf8",
+    );
+    writeFileSync(
+      join(tempDir, "calc.test.mjs"),
+      [
+        'import test from "node:test";',
+        'import assert from "node:assert/strict";',
+        'import { multiply } from "./calc.mjs";',
+        'test("multiply(6, 7) returns 42", () => {',
+        "  assert.equal(multiply(6, 7), 42);",
+        "});",
+      ].join("\n"),
+      "utf8",
+    );
+
+    let goldfishPayloadRaw = "";
+    const mockGoldfish = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        goldfishPayloadRaw = body;
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [
+              {
+                message: {
+                  content: JSON.stringify({
+                    outcome: "approve",
+                    score: 98,
+                    summary: "Independent Goldfish verified multiply(a, b) fix in calc.mjs.",
+                    findings: [],
+                  }),
+                },
+              },
+            ],
+          }),
+        );
+      });
+    });
+    await new Promise((r) => mockGoldfish.listen(0, "127.0.0.1", r));
+    const gfPort = mockGoldfish.address().port;
+
+    let builderRequestBodies = "";
+    const mockFleet = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        const isBuilder = body.includes("You are the Apex Harness Builder Agent.");
+        if (isBuilder) {
+          builderRequestBodies += body;
+        }
+        const isFirstBuilderIteration =
+          isBuilder &&
+          body.includes("Fix multiply bug in calc.mjs") &&
+          !body.includes("Tool results:");
+
+        const content = isFirstBuilderIteration
+          ? [
+              "Delegating Scout subagent and patching `calc.mjs`:",
+              "```apex-action",
+              JSON.stringify({
+                tool: "delegate_subagent",
+                role: "Scout",
+                task: "Inspect calc.test.mjs assertions",
+              }),
+              "```",
+              "```apex-action",
+              JSON.stringify({
+                tool: "edit_file",
+                path: "calc.mjs",
+                target: "return a + b;",
+                replacement: "return a * b;",
+              }),
+              "```",
+            ].join("\n")
+          : "Fixed `multiply(a, b)` in `calc.mjs` so `multiply(6, 7) === 42`.";
+
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [
+              {
+                message: { role: "assistant", content },
+                finish_reason: "stop",
+              },
+            ],
+          }),
+        );
+      });
+    });
+    await new Promise((r) => mockFleet.listen(0, "127.0.0.1", r));
+    const fleetPort = mockFleet.address().port;
+
+    const prevOmni = process.env.OMNIROUTE_BASE_URL;
+    process.env.OMNIROUTE_BASE_URL = `http://127.0.0.1:${fleetPort}/v1`;
+
+    const appServer = createApexAppServer();
+    await new Promise((r) => appServer.listen(0, "127.0.0.1", r));
+    const appPort = appServer.address().port;
+    const baseUrl = `http://127.0.0.1:${appPort}`;
+    const headers = {
+      "Content-Type": "application/json",
+      "X-Apex-Token": getLocalSessionToken(),
+      Origin: baseUrl,
+    };
+
+    try {
+      const projRes = await fetch(`${baseUrl}/api/projects`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ name: "v09-calc-service", path: tempDir }),
+      });
+      const projData = await projRes.json();
+      const projectId = projData.project.id;
+
+      const convRes = await fetch(`${baseUrl}/api/conversations`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          title: "V09 Full Engineering Turn",
+          projectId,
+          forceNew: true,
+        }),
+      });
+      const convData = await convRes.json();
+      const convId = convData.thread.id;
+
+      // Seed Turn 1 private history token
+      const turn1 = await fetch(`${baseUrl}/api/chat/stream`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          conversationId: convId,
+          prompt: "hi — PRIVATE_TURN1_CONTEXT_TOKEN_7741",
+          mode: "turbo",
+          adaptiveTopology: true,
+        }),
+      });
+      await turn1.text();
+
+      // Submit Turn 2 full engineering task
+      const turn2 = await fetch(`${baseUrl}/api/chat/stream`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          conversationId: convId,
+          prompt:
+            "Fix multiply bug in calc.mjs to multiply a * b; ensure project unit tests pass.",
+          mode: "turbo",
+          effort: "high",
+          adaptiveTopology: true,
+          reviewerEndpointUrl: `http://127.0.0.1:${gfPort}/v1`,
+          reviewerProviderId: "v09-goldfish-http",
+          reviewerModelId: "agy-acp/claude-opus-4-6-thinking",
+          requireLiveGoldfishModel: true,
+        }),
+      });
+      assert.equal(turn2.status, 200);
+      const sseText = await turn2.text();
+
+      // 1. Verify final SSE completion event
+      assert.ok(sseText.includes("event: execution"));
+      assert.ok(sseText.includes("event: done"));
+      assert.ok(sseText.includes('"status":"implemented_and_verified"'));
+
+      // 2. Verify file was mutated on disk by Builder edit_file tool call
+      assert.ok(readFileSync(join(tempDir, "calc.mjs"), "utf8").includes("return a * b;"));
+
+      // 3. Verify Goldfish reviewer received changed file content and ZERO Builder conversation history
+      assert.ok(builderRequestBodies.includes("PRIVATE_TURN1_CONTEXT_TOKEN_7741"));
+      assert.ok(goldfishPayloadRaw.length > 0, "Goldfish HTTP endpoint must be invoked");
+      assert.equal(
+        goldfishPayloadRaw.includes("PRIVATE_TURN1_CONTEXT_TOKEN_7741"),
+        false,
+        "Goldfish must never receive Builder conversation history",
+      );
+      assert.ok(goldfishPayloadRaw.includes("return a * b;"));
+
+      // 4. Verify persisted execution record, parallel Scout+Architect, Verifier npm test execution, requirement matrix, and Hermes learning
+      const execsRes = await fetch(`${baseUrl}/api/executions?conversationId=${convId}`, {
+        headers,
+      });
+      const execsData = await execsRes.json();
+      const fullExec = execsData.executions[0];
+      assert.ok(fullExec);
+      assert.equal(fullExec.state, "completed");
+
+      const scoutNode = fullExec.subtasks.find((s) => s.role === "Scout");
+      const archNode = fullExec.subtasks.find((s) => s.role === "Architect");
+      const builderNode = fullExec.subtasks.find((s) => s.role === "Builder");
+      const criticNode = fullExec.subtasks.find((s) => s.role === "Critic");
+      const verifierNode = fullExec.subtasks.find((s) => s.role === "Verifier");
+
+      assert.equal(scoutNode?.state, "completed");
+      assert.equal(archNode?.state, "completed");
+      assert.equal(builderNode?.state, "completed");
+      assert.equal(criticNode?.state, "completed");
+      assert.equal(verifierNode?.state, "completed");
+
+      const report = fullExec.completionReport;
+      assert.ok(report);
+      assert.equal(report.status, "implemented_and_verified");
+      assert.ok(report.filesModified.includes("calc.mjs"));
+
+      // Verify Verifier automatically detected and ran `npm test` from package.json
+      assert.ok(
+        report.commandsExecuted.some((c) => c.command === "npm test" && c.exitCode === 0),
+        "Verifier must automatically detect and execute `npm test` from package.json",
+      );
+      assert.equal(report.verificationResults.testsPassed, true);
+
+      // Verify delegated subagents were recorded with isolated context
+      assert.ok(Array.isArray(report.delegatedSubagents));
+      assert.ok(report.delegatedSubagents.length >= 1);
+      assert.ok(report.delegatedSubagents.every((s) => s.isolatedContextVerified === true));
+
+      // Verify requirement-level verification matrix
+      assert.ok(Array.isArray(report.requirementMatrix));
+      assert.ok(report.requirementMatrix.length >= 2);
+      assert.ok(
+        report.requirementMatrix.every(
+          (r) =>
+            r.status === "implemented_and_verified" &&
+            r.evidenceFiles.includes("calc.mjs") &&
+            r.evidenceCommands.some((cmd) => cmd.includes("npm test")),
+        ),
+      );
+
+      // Verify Hermes persistent memory & validated learned skill proposal
+      assert.ok(report.hermesLearning?.memoryEntryId);
+      assert.ok(report.hermesLearning?.learnedSkillProposalId);
+      assert.equal(report.hermesLearning?.learnedSkillStatus, "validated");
+    } finally {
+      if (prevOmni === undefined) delete process.env.OMNIROUTE_BASE_URL;
+      else process.env.OMNIROUTE_BASE_URL = prevOmni;
+      appServer.close();
+      mockFleet.close();
+      mockGoldfish.close();
       rmSync(tempDir, { recursive: true, force: true });
     }
   });
