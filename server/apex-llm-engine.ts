@@ -787,7 +787,8 @@ export interface ToolExecutionAction {
     | "run_command"
     | "call_mcp_tool"
     | "todo_write"
-    | "repo_map";
+    | "repo_map"
+    | "delegate_subagent";
   path?: string;
   content?: string;
   target?: string;
@@ -802,6 +803,10 @@ export interface ToolExecutionAction {
   toolName?: string;
   args?: Record<string, unknown>;
   todos?: Array<{ content: string; status: "pending" | "in_progress" | "completed" }>;
+  role?: string;
+  task?: string;
+  preferredModelId?: string;
+  tokenBudget?: number;
 }
 
 export interface FileBackupEntry {
@@ -870,6 +875,18 @@ export interface AgentToolExecutionReport {
   filesModified: string[];
   commandsExecuted: ExecutedCommandEvidence[];
   toolsInvoked: Array<{ tool: string; target?: string; status: "done" | "error"; durationMs: number }>;
+  delegatedSubagents?: Array<{
+    subagentId: string;
+    sessionId: string;
+    parentTaskId?: string;
+    role: AgentOfficeRole;
+    engineeringRole: string;
+    assignedModelId: string;
+    status: string;
+    summary: string;
+    isolatedContextVerified: boolean;
+    durationMs: number;
+  }>;
 }
 
 /**
@@ -924,6 +941,7 @@ export async function executeAgentToolBlocksAsync(
   const filesModified = new Set<string>();
   const commandsExecuted: ExecutedCommandEvidence[] = [];
   const toolsInvoked: Array<{ tool: string; target?: string; status: "done" | "error"; durationMs: number }> = [];
+  const delegatedSubagents: NonNullable<AgentToolExecutionReport["delegatedSubagents"]> = [];
 
   const root = resolveCanonicalWorkspaceRoot(options.workspaceRoot);
   const backups = new Map<string, FileBackupEntry>();
@@ -1283,6 +1301,51 @@ export async function executeAgentToolBlocksAsync(
         toolObservations.push(`[call_mcp_tool: ${action.serverName}/${action.toolName}]\n${mcpRes.content.slice(0, 2500)}`);
         continue;
       }
+
+      if (action.tool === "delegate_subagent" && (action.task || action.pattern || action.content)) {
+        const subTask = action.task || action.pattern || action.content || "Inspect workspace";
+        const validRoles = new Set(["Coordinator", "Scout", "Architect", "Builder", "Critic", "Verifier"]);
+        const normalizedRole = (action.role && validRoles.has(action.role) ? action.role : "Scout") as AgentOfficeRole;
+        const { delegateSubagentTask } = await import("./harness/hermes-memory-learning.ts");
+        const subRes = await delegateSubagentTask({
+          dataDir: options.dataDir || join(root, ".apex-data"),
+          workspaceRoot: root,
+          parentExecutionId: extraOpts?.conversationId,
+          parentTaskId: "node-builder",
+          role: normalizedRole,
+          task: subTask,
+          preferredModelId: action.preferredModelId,
+          tokenBudget: action.tokenBudget,
+          mode: options.mode ?? "turbo",
+          signal: options.signal,
+          onStep: options.onStep,
+        });
+        for (const f of subRes.filesInspected) filesInspected.add(f);
+        for (const f of subRes.filesModified) filesModified.add(f);
+        commandsExecuted.push(...subRes.commandsExecuted);
+        delegatedSubagents.push({
+          subagentId: subRes.subagentId,
+          sessionId: subRes.sessionId,
+          parentTaskId: subRes.parentTaskId ?? "node-builder",
+          role: subRes.role,
+          engineeringRole: subRes.engineeringRole,
+          assignedModelId: subRes.assignedModelId,
+          status: subRes.status,
+          summary: subRes.summary,
+          isolatedContextVerified: subRes.isolatedContextVerified,
+          durationMs: subRes.durationMs,
+        });
+        toolsInvoked.push({
+          tool: "delegate_subagent",
+          target: `${subRes.role}:${subRes.subagentId}`,
+          status: subRes.status === "completed" ? "done" : "error",
+          durationMs: subRes.durationMs,
+        });
+        toolObservations.push(
+          `[delegate_subagent: ${subRes.role} (${subRes.subagentId} / ${subRes.sessionId})]\n${subRes.summary.slice(0, 2500)}`,
+        );
+        continue;
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const dur = Date.now() - t0;
@@ -1329,6 +1392,7 @@ export async function executeAgentToolBlocksAsync(
     filesModified: [...filesModified],
     commandsExecuted,
     toolsInvoked,
+    delegatedSubagents,
   };
 }
 

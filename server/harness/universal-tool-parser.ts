@@ -17,7 +17,8 @@ export type CanonicalToolName =
   | "run_command"
   | "call_mcp_tool"
   | "todo_write"
-  | "repo_map";
+  | "repo_map"
+  | "delegate_subagent";
 
 export interface ParsedAgentToolCall {
   rawMatch: string;
@@ -35,6 +36,10 @@ export interface ParsedAgentToolCall {
   toolName?: string;
   args?: Record<string, unknown>;
   todos?: Array<{ id?: string; content: string; status: "pending" | "in_progress" | "completed" }>;
+  role?: string;
+  task?: string;
+  preferredModelId?: string;
+  tokenBudget?: number;
 }
 
 export interface ScrubbedModelOutput {
@@ -106,6 +111,10 @@ const TOOL_NAME_ALIAS_MAP: Record<string, CanonicalToolName> = {
   update_plan: "todo_write",
   repo_map: "repo_map",
   repomap: "repo_map",
+  delegate_subagent: "delegate_subagent",
+  subagent: "delegate_subagent",
+  spawn_subagent: "delegate_subagent",
+  invoke_subagent: "delegate_subagent",
 };
 
 export function normalizeCanonicalToolName(rawName: string): CanonicalToolName | null {
@@ -118,6 +127,7 @@ export function normalizeCanonicalToolName(rawName: string): CanonicalToolName |
   if (snake in TOOL_NAME_ALIAS_MAP) {
     return TOOL_NAME_ALIAS_MAP[snake]!;
   }
+  if (snake.includes("subagent") || snake.includes("delegate")) return "delegate_subagent";
   if (snake.includes("read") || snake.includes("view")) return "read_file";
   if (snake.includes("edit") || snake.includes("replace") || snake.includes("patch")) return "edit_file";
   if (snake.includes("write") || snake.includes("create")) return "write_file";
@@ -203,6 +213,10 @@ function buildParsedCallFromArgs(
     todos: Array.isArray(argsObj.todos)
       ? (argsObj.todos as Array<{ id?: string; content: string; status: "pending" | "in_progress" | "completed" }>)
       : undefined,
+    role: str(["role", "agentRole", "agent_role"]),
+    task: str(["task", "prompt", "description", "instruction"]),
+    preferredModelId: str(["preferredModelId", "model", "modelId", "model_id"]),
+    tokenBudget: num(["tokenBudget", "token_budget", "budget"]),
   };
 }
 

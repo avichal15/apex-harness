@@ -178,6 +178,7 @@ export interface PostImplReviewReport {
 export interface RequirementEvidenceItem {
   requirementId: string;
   description: string;
+  requirement?: string;
   status:
     | "implemented_and_verified"
     | "implemented_not_verified"
@@ -187,6 +188,7 @@ export interface RequirementEvidenceItem {
     | "not_applicable";
   evidenceFiles: string[];
   evidenceCommands: string[];
+  evidence?: string;
   justification?: string;
 }
 
@@ -196,7 +198,26 @@ export interface CompletionEvidenceReport {
   originalRequirement: string;
   executionPlanSummary: string;
   dagTopologyMode?: DagTopologyMode;
+  requirementMatrix?: RequirementEvidenceItem[];
   requirements?: RequirementEvidenceItem[];
+  delegatedSubagents?: Array<{
+    subagentId: string;
+    parentTaskId?: string;
+    sessionId?: string;
+    role: AgentOfficeRole;
+    engineeringRole: EngineeringRole10;
+    assignedModelId: string;
+    status: string;
+    summary: string;
+    isolatedContextVerified: boolean;
+    durationMs: number;
+  }>;
+  hermesLearning?: {
+    memoryEntryId?: string;
+    learnedSkillProposalId?: string;
+    learnedSkillName?: string;
+    learnedSkillStatus?: string;
+  };
   subtasks: Array<{
     id: string;
     role: AgentOfficeRole;

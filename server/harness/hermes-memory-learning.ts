@@ -464,18 +464,23 @@ export interface SubagentDelegationRequest {
   dataDir: string;
   workspaceRoot: string;
   parentExecutionId?: string;
+  parentTaskId?: string;
+  sessionId?: string;
   role: AgentOfficeRole;
   engineeringRole?: EngineeringRole10;
   task: string;
   contextSnippet?: string;
   preferredModelId?: string;
   tokenBudget?: number;
+  timeoutMs?: number;
+  toolPermissions?: Array<"read" | "write" | "command" | "mcp" | "ptc" | "subagent">;
   maxToolIterations?: number;
-  mode?: "ask" | "auto" | "turbo";
+  mode?: "ask" | "auto" | "turbo" | "auto_edit";
   signal?: AbortSignal;
   onStep?: (step: AgentStepEvent) => void;
   customExecutorFn?: (input: {
     subagentId: string;
+    sessionId: string;
     role: AgentOfficeRole;
     task: string;
     workspaceRoot: string;
@@ -490,7 +495,9 @@ export interface SubagentDelegationRequest {
 
 export interface SubagentDelegationResult {
   subagentId: string;
+  sessionId: string;
   parentExecutionId?: string;
+  parentTaskId?: string;
   role: AgentOfficeRole;
   engineeringRole: EngineeringRole10;
   assignedModelId: string;
@@ -500,17 +507,19 @@ export interface SubagentDelegationResult {
   filesModified: string[];
   commandsExecuted: ExecutedCommandEvidence[];
   tokenBudget: number;
+  timeoutMs: number;
+  toolPermissions: Array<"read" | "write" | "command" | "mcp" | "ptc" | "subagent">;
   durationMs: number;
   isolatedContextVerified: boolean;
 }
 
 const ROLE_TO_ENGINEERING_ROLE: Record<AgentOfficeRole, EngineeringRole10> = {
-  Coordinator: "planner_architect",
-  Scout: "repo_scout",
-  Architect: "planner_architect",
+  Coordinator: "main_planning",
+  Scout: "repo_exploration",
+  Architect: "architecture",
   Builder: "backend_impl",
-  Critic: "reviewer_goldfish",
-  Verifier: "debugger_verifier",
+  Critic: "code_review",
+  Verifier: "testing_verification",
 };
 
 /**
@@ -523,18 +532,27 @@ export async function delegateSubagentTask(
 ): Promise<SubagentDelegationResult> {
   const t0 = Date.now();
   const subagentId = `subagent-${req.role.toLowerCase()}-${randomUUID().slice(0, 8)}`;
-  const engRole = req.engineeringRole ?? ROLE_TO_ENGINEERING_ROLE[req.role] ?? "repo_scout";
+  const sessionId = req.sessionId || `sess_${subagentId}`;
+  const engRole = req.engineeringRole ?? ROLE_TO_ENGINEERING_ROLE[req.role] ?? "repo_exploration";
   const tokenBudget = req.tokenBudget ?? 8_000;
+  const timeoutMs = req.timeoutMs ?? 25_000;
+  const toolPermissions =
+    req.toolPermissions ??
+    (req.role === "Builder" || req.role === "Verifier"
+      ? ["read", "write", "command"]
+      : ["read", "mcp"]);
 
   const modelSelection = selectModelForEngineeringRole(req.dataDir, engRole, {
-    explicitModelId: req.preferredModelId,
+    manualOverrideModelId: req.preferredModelId,
   });
   const assignedModelId = modelSelection.primaryModel.id;
 
   if (req.signal?.aborted) {
     return {
       subagentId,
+      sessionId,
       parentExecutionId: req.parentExecutionId,
+      parentTaskId: req.parentTaskId,
       role: req.role,
       engineeringRole: engRole,
       assignedModelId,
@@ -544,6 +562,8 @@ export async function delegateSubagentTask(
       filesModified: [],
       commandsExecuted: [],
       tokenBudget,
+      timeoutMs,
+      toolPermissions,
       durationMs: 0,
       isolatedContextVerified: true,
     };
@@ -554,15 +574,23 @@ export async function delegateSubagentTask(
     kind: "route",
     agentRole: req.role,
     label: `Delegated subagent ${req.role} (${assignedModelId}): ${req.task.slice(0, 72)}`,
-    plainSummary: `${req.role} subagent running isolated task`,
-    detail: `Subagent ID: ${subagentId} · Budget: ${tokenBudget} tokens`,
+    plainSummary: `${req.role} subagent running isolated task (${sessionId})`,
+    detail: `Subagent ID: ${subagentId} · Session: ${sessionId} · Budget: ${tokenBudget} tokens`,
     status: "running",
   });
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  if (req.signal) {
+    if (req.signal.aborted) controller.abort();
+    else req.signal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
 
   try {
     if (req.customExecutorFn) {
       const customOut = await req.customExecutorFn({
         subagentId,
+        sessionId,
         role: req.role,
         task: req.task,
         workspaceRoot: req.workspaceRoot,
@@ -580,7 +608,9 @@ export async function delegateSubagentTask(
       });
       return {
         subagentId,
+        sessionId,
         parentExecutionId: req.parentExecutionId,
+        parentTaskId: req.parentTaskId,
         role: req.role,
         engineeringRole: engRole,
         assignedModelId,
@@ -590,6 +620,8 @@ export async function delegateSubagentTask(
         filesModified: customOut.filesModified ?? [],
         commandsExecuted: customOut.commandsExecuted ?? [],
         tokenBudget,
+        timeoutMs,
+        toolPermissions,
         durationMs,
         isolatedContextVerified: true,
       };
@@ -608,8 +640,9 @@ export async function delegateSubagentTask(
       {
         role: "system",
         content: [
-          `You are an isolated Apex Subagent (${req.role} / ${engRole}).`,
+          `You are an isolated Apex Subagent (${req.role} / ${engRole} / session ${sessionId}).`,
           `Workspace: ${req.workspaceRoot}`,
+          `Allowed Tool Permissions: ${toolPermissions.join(", ")}`,
           req.contextSnippet ? `Parent Context Brief:\n${req.contextSnippet}` : "",
           `Grounded Workspace Files:\n${boundedContext}`,
         ]
@@ -625,7 +658,7 @@ export async function delegateSubagentTask(
     const llmRes = await callUnifiedFleetWithFailover({
       preferredModelId: assignedModelId,
       messages: subagentMessages,
-      signal: req.signal,
+      signal: controller.signal,
     });
 
     const filesInspected = new Set<string>(grounded.inspectedFiles);
@@ -636,7 +669,19 @@ export async function delegateSubagentTask(
       ? llmRes.text
       : `Subagent ${req.role} indexed ${grounded.inspectedFiles.length} workspace file(s) (${grounded.inspectedFiles.slice(0, 5).join(", ") || "root"}) for task: ${req.task}`;
 
-    if (llmRes.ok && llmRes.text.includes("```apex-action") && req.mode !== "ask") {
+    const canMutateOrRun =
+      req.mode !== "ask" &&
+      (toolPermissions.includes("write") || toolPermissions.includes("command"));
+    const effectiveToolMode = canMutateOrRun
+      ? req.mode === "auto" || req.mode === "auto_edit"
+        ? "auto_edit"
+        : "turbo"
+      : "ask";
+
+    if (
+      llmRes.ok &&
+      (llmRes.text.includes("```apex-action") || llmRes.text.includes("<tool_call>"))
+    ) {
       const execRes = await executeAgentToolBlocksAsync(
         llmRes.text,
         req.workspaceRoot,
@@ -644,8 +689,8 @@ export async function delegateSubagentTask(
         {
           dataDir: req.dataDir,
           conversationId: subagentId,
-          mode: req.mode ?? "turbo",
-          signal: req.signal,
+          mode: effectiveToolMode,
+          signal: controller.signal,
         },
       );
       for (const f of execRes.filesInspected) filesInspected.add(f);
@@ -668,16 +713,20 @@ export async function delegateSubagentTask(
 
     return {
       subagentId,
+      sessionId,
       parentExecutionId: req.parentExecutionId,
+      parentTaskId: req.parentTaskId,
       role: req.role,
       engineeringRole: engRole,
       assignedModelId,
-      status: "completed",
+      status: controller.signal.aborted ? "cancelled" : "completed",
       summary,
       filesInspected: [...filesInspected],
       filesModified: [...filesModified],
       commandsExecuted,
       tokenBudget,
+      timeoutMs,
+      toolPermissions,
       durationMs,
       isolatedContextVerified: true,
     };
@@ -685,19 +734,25 @@ export async function delegateSubagentTask(
     const durationMs = Date.now() - t0;
     return {
       subagentId,
+      sessionId,
       parentExecutionId: req.parentExecutionId,
+      parentTaskId: req.parentTaskId,
       role: req.role,
       engineeringRole: engRole,
       assignedModelId,
-      status: req.signal?.aborted ? "cancelled" : "failed",
+      status: controller.signal.aborted || req.signal?.aborted ? "cancelled" : "failed",
       summary: (err as Error).message,
       filesInspected: [],
       filesModified: [],
       commandsExecuted: [],
       tokenBudget,
+      timeoutMs,
+      toolPermissions,
       durationMs,
       isolatedContextVerified: true,
     };
+  } finally {
+    clearTimeout(timer);
   }
 }
 

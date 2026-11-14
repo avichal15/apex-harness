@@ -44,6 +44,8 @@ import {
 import {
   buildCompletionEvidenceReport,
   captureWorkspaceGitDiffSummary,
+  classifyVerificationFromCommands,
+  detectProjectVerificationCommands,
 } from "./completion-evidence.ts";
 import { applySpillPolicyToText, executePtcProgram } from "./deepseek-subsystems.ts";
 import { ApexDriverRegistry } from "./driver-registry.ts";
@@ -55,6 +57,16 @@ import {
   type EgmBoardroomBrief,
 } from "./egm-boardroom.ts";
 import type { TaskExecutionManager } from "./execution-manager.ts";
+import {
+  delegateParallelSubagentSwarm,
+  delegateSubagentTask,
+  promoteLearnedSkillProposal,
+  proposeLearnedSkill,
+  saveMemoryEntry,
+  validateLearnedSkillProposal,
+  type SubagentDelegationRequest,
+  type SubagentDelegationResult,
+} from "./hermes-memory-learning.ts";
 import { runManagedCommand } from "./process-manager.ts";
 import {
   decryptSecretWithMasterKey,
@@ -1033,6 +1045,9 @@ export interface ExecuteTaskDagOptions {
   reviewerProviderId?: string;
   reviewerModelId?: string;
   requireLiveGoldfishModel?: boolean;
+  enableSubagentScout?: boolean;
+  parallelSubagentTasks?: readonly SubagentDelegationRequest[];
+  autoPromoteLearnedSkills?: boolean;
   driverRegistry?: ApexDriverRegistry;
   customBuilderFn?: (context: {
     prompt: string;
@@ -1109,12 +1124,14 @@ async function runBuilderCodingPass(input: {
   filesModified: string[];
   commandsExecuted: ExecutedCommandEvidence[];
   toolsInvoked: Array<{ tool: string; target?: string; status: "done" | "error"; durationMs: number }>;
+  delegatedSubagents: NonNullable<CompletionEvidenceReport["delegatedSubagents"]>;
 }> {
   const filesInspected = new Set<string>();
   const filesCreated = new Set<string>();
   const filesModified = new Set<string>();
   const commandsExecuted: ExecutedCommandEvidence[] = [];
   const toolsInvoked: Array<{ tool: string; target?: string; status: "done" | "error"; durationMs: number }> = [];
+  const delegatedSubagents: NonNullable<CompletionEvidenceReport["delegatedSubagents"]> = [];
   let checkpointId: string | undefined;
   const registry =
     input.driverRegistry ??
@@ -1151,7 +1168,7 @@ async function runBuilderCodingPass(input: {
     input.memorySnippet,
     `--- GROUNDED WORKSPACE CONTEXT ---\n${contextBlock}`,
     input.mode !== "ask"
-      ? `Emit executable tools inside \`\`\`apex-action JSON blocks when reading, editing, writing, or running commands:\n- {"tool":"read_file","path":"rel/path.ts","startLine":1,"endLine":180}\n- {"tool":"list_dir","path":"."}\n- {"tool":"grep_search","query":"pattern","relDir":"."}\n- {"tool":"edit_file","path":"rel/path.ts","target":"old","replacement":"new"}\n- {"tool":"write_file","path":"rel/path.ts","content":"..."}\n- {"tool":"todo_write","todos":[{"content":"Task","status":"in_progress"}]}\n- {"tool":"run_command","command":"node --test"}\n- {"tool":"call_mcp_tool","serverName":"context7","toolName":"resolve-library-id","args":{"libraryName":"react"}}`
+      ? `Emit executable tools inside \`\`\`apex-action JSON blocks when reading, editing, writing, delegating subagents, or running commands:\n- {"tool":"read_file","path":"rel/path.ts","startLine":1,"endLine":180}\n- {"tool":"list_dir","path":"."}\n- {"tool":"grep_search","query":"pattern","relDir":"."}\n- {"tool":"edit_file","path":"rel/path.ts","target":"old","replacement":"new"}\n- {"tool":"write_file","path":"rel/path.ts","content":"..."}\n- {"tool":"todo_write","todos":[{"content":"Task","status":"in_progress"}]}\n- {"tool":"run_command","command":"node --test"}\n- {"tool":"delegate_subagent","role":"Scout","task":"Focused exploration task"}\n- {"tool":"call_mcp_tool","serverName":"context7","toolName":"resolve-library-id","args":{"libraryName":"react"}}`
       : "",
   ]
     .filter(Boolean)
@@ -1237,6 +1254,14 @@ async function runBuilderCodingPass(input: {
       for (const f of execRes.filesModified) filesModified.add(f);
       commandsExecuted.push(...execRes.commandsExecuted);
       toolsInvoked.push(...execRes.toolsInvoked);
+      if (execRes.delegatedSubagents?.length) {
+        delegatedSubagents.push(
+          ...execRes.delegatedSubagents.map((s) => ({
+            ...s,
+            engineeringRole: s.engineeringRole as EngineeringRole10,
+          })),
+        );
+      }
       observations.push(...execRes.toolObservations);
     }
 
@@ -1289,6 +1314,7 @@ async function runBuilderCodingPass(input: {
     filesModified: [...filesModified],
     commandsExecuted,
     toolsInvoked,
+    delegatedSubagents,
   };
 }
 
@@ -1390,6 +1416,7 @@ export async function executeTaskDag(
     status: "done" | "error";
     durationMs: number;
   }> = [];
+  const delegatedSubagents: NonNullable<CompletionEvidenceReport["delegatedSubagents"]> = [];
   let postImplReview: PostImplReviewReport = {
     outcome: "approve",
     reviewerAvailable: true,
@@ -1488,12 +1515,85 @@ export async function executeTaskDag(
         for (const f of desk1Manifest.scannedFiles) {
           filesInspected.add(f.file);
         }
+
+        const shouldRunSubagentScout =
+          Boolean(options.enableSubagentScout) ||
+          Boolean(options.parallelSubagentTasks?.length) ||
+          (dagTopologyMode === "full_engineering" && !options.customBuilderFn);
+
+        let scoutSubagentSummary = "";
+        if (options.parallelSubagentTasks?.length) {
+          const swarmResults = await delegateParallelSubagentSwarm(
+            options.parallelSubagentTasks.map((t) => ({
+              ...t,
+              dataDir,
+              workspaceRoot,
+              parentExecutionId: executionId,
+              parentTaskId: node.id,
+              signal: subSignal,
+              onStep: emitStep,
+            })),
+          );
+          for (const sr of swarmResults) {
+            for (const f of sr.filesInspected) filesInspected.add(f);
+            delegatedSubagents.push({
+              subagentId: sr.subagentId,
+              sessionId: sr.sessionId,
+              parentTaskId: sr.parentTaskId ?? node.id,
+              role: sr.role,
+              engineeringRole: sr.engineeringRole,
+              assignedModelId: sr.assignedModelId,
+              status: sr.status,
+              summary: sr.summary,
+              isolatedContextVerified: sr.isolatedContextVerified,
+              durationMs: sr.durationMs,
+            });
+          }
+          scoutSubagentSummary = ` · Parallel Subagent Swarm: ${swarmResults.length} subagent(s) completed`;
+        } else if (shouldRunSubagentScout) {
+          const scoutSub = await delegateSubagentTask({
+            dataDir,
+            workspaceRoot,
+            parentExecutionId: executionId,
+            parentTaskId: node.id,
+            sessionId: `${nodeSessionId}_subagent`,
+            role: "Scout",
+            engineeringRole: "repo_exploration",
+            preferredModelId: node.assignedModelId,
+            task: `Index workspace symbols and files relevant to: ${prompt.slice(0, 200)}`,
+            tokenBudget: 8_000,
+            timeoutMs: 12_000,
+            toolPermissions: ["read", "mcp"],
+            mode: "ask",
+            signal: subSignal,
+            onStep: emitStep,
+          });
+          for (const f of scoutSub.filesInspected) filesInspected.add(f);
+          delegatedSubagents.push({
+            subagentId: scoutSub.subagentId,
+            sessionId: scoutSub.sessionId,
+            parentTaskId: node.id,
+            role: scoutSub.role,
+            engineeringRole: scoutSub.engineeringRole,
+            assignedModelId: scoutSub.assignedModelId,
+            status: scoutSub.status,
+            summary: scoutSub.summary,
+            isolatedContextVerified: scoutSub.isolatedContextVerified,
+            durationMs: scoutSub.durationMs,
+          });
+          scoutSubagentSummary = ` · Isolated Subagent (${scoutSub.subagentId})`;
+        }
+
+        const scanLabelPrefix = shouldRunSubagentScout
+          ? "Codebase Scout (Deterministic Scan + Isolated Subagent)"
+          : "[Deterministic Scan] Codebase Scout";
+
         emitStep({
           id: `step-scout-${Date.now()}`,
           kind: "search",
           agentRole: "Scout",
-          label: `Codebase Scout indexed ${desk1Manifest.scannedFiles.length} files & ${desk1Manifest.activeAntibodies.length} guardrails`,
-          plainSummary: `Scout mapped ${desk1Manifest.scannedFiles.length} workspace files in parallel`,
+          label: `${scanLabelPrefix} indexed ${desk1Manifest.scannedFiles.length} files & ${desk1Manifest.activeAntibodies.length} guardrails`,
+          plainSummary: `Scout mapped ${desk1Manifest.scannedFiles.length} workspace files${scoutSubagentSummary}`,
           detail: desk1Manifest.scannedFiles.map((f) => f.file).slice(0, 4).join(", ") || "workspace root",
           status: "done",
           durationMs: Date.now() - t0,
@@ -1501,13 +1601,17 @@ export async function executeTaskDag(
 
         executionManager.updateSubtask(executionId, node.id, {
           state: "completed",
-          actualModelUsed: node.assignedModelId,
+          actualModelUsed: shouldRunSubagentScout ? node.assignedModelId : "deterministic-scanner",
           inputSummary: `Workspace: ${workspaceRoot}`,
-          outputSummary: `Indexed ${desk1Manifest.scannedFiles.length} files and ${desk1Manifest.activeAntibodies.length} antibodies`,
+          outputSummary: `[Deterministic Scan] Indexed ${desk1Manifest.scannedFiles.length} files and ${desk1Manifest.activeAntibodies.length} antibodies${scoutSubagentSummary}`,
           completedAt: new Date().toISOString(),
           durationMs: Date.now() - t0,
           verificationPassed: true,
-          events: appendNodeEvent(node.id, "completed", `Indexed ${desk1Manifest.scannedFiles.length} files`),
+          events: appendNodeEvent(
+            node.id,
+            "completed",
+            `[Deterministic Scan] Indexed ${desk1Manifest.scannedFiles.length} files${scoutSubagentSummary}`,
+          ),
         });
         notifyDag();
         return;
@@ -1609,6 +1713,9 @@ export async function executeTaskDag(
         for (const f of loopRes.filesModified ?? []) filesModified.add(f);
         commandsExecuted.push(...(loopRes.commandsExecuted ?? []));
         toolsInvoked.push(...(loopRes.toolsInvoked ?? []));
+        if ("delegatedSubagents" in loopRes && Array.isArray(loopRes.delegatedSubagents)) {
+          delegatedSubagents.push(...loopRes.delegatedSubagents);
+        }
 
         executionManager.updateSubtask(executionId, node.id, {
           state: "completed",
@@ -1798,6 +1905,194 @@ export async function executeTaskDag(
       }
 
       if (node.id === "node-verifier") {
+        const hasCodeChanges = filesCreated.size + filesModified.size > 0;
+        const runDiscoveredVerificationCommands = async (commandsToRun: string[]) => {
+          for (const vCmd of commandsToRun) {
+            if (subSignal.aborted) break;
+            executionManager.updateSubtask(executionId, node.id, {
+              currentTool: "run_command",
+            });
+            notifyDag();
+
+            const cmdRes = await runManagedCommand({
+              command: vCmd,
+              cwd: ".",
+              workspaceRoot,
+              timeoutMs: 25_000,
+              mode: options.mode ?? "turbo",
+              signal: subSignal,
+              onApprovalRequired:
+                options.mode === "ask"
+                  ? async (command, reason) =>
+                      executionManager.requestUserApproval(executionId, {
+                        tool: "run_command",
+                        commandOrPath: command,
+                        reason,
+                      })
+                  : undefined,
+            });
+            executionManager.updateSubtask(executionId, node.id, {
+              currentTool: undefined,
+            });
+            notifyDag();
+
+            commandsExecuted.push({
+              command: vCmd,
+              cwd: cmdRes.cwd,
+              exitCode: cmdRes.exitCode,
+              durationMs: cmdRes.durationMs,
+              timedOut: cmdRes.timedOut,
+              cancelled: cmdRes.cancelled,
+              stdoutPreview: cmdRes.stdout.slice(0, 1500),
+              stderrPreview: cmdRes.stderr.slice(0, 1500),
+            });
+            toolsInvoked.push({
+              tool: "run_command",
+              target: vCmd,
+              status: cmdRes.ok ? "done" : "error",
+              durationMs: cmdRes.durationMs,
+            });
+            emitStep({
+              id: `step-verifier-cmd-${Date.now()}-${commandsExecuted.length}`,
+              kind: "command",
+              agentRole: "Verifier",
+              label: `Verifier executed project verification command: ${vCmd}`,
+              plainSummary: cmdRes.ok
+                ? `Verifier passed \`${vCmd}\` (exit 0)`
+                : `Verifier command \`${vCmd}\` exited with ${cmdRes.exitCode ?? "error"}`,
+              detail: cmdRes.combinedOutput.slice(0, 160) || `exit ${cmdRes.exitCode ?? 0}`,
+              outputPreview: `$ ${vCmd}\n[exit=${cmdRes.exitCode}]\n${cmdRes.combinedOutput.slice(0, 1200)}`,
+              status: cmdRes.ok ? "done" : "error",
+              durationMs: cmdRes.durationMs,
+            });
+          }
+        };
+
+        // Group 5: Automatically detect & run project verification commands when code was mutated
+        // and no verification command has been executed yet.
+        if (
+          !options.isIndependent &&
+          hasCodeChanges &&
+          options.mode !== "ask" &&
+          resolve(workspaceRoot) !== resolve(process.cwd())
+        ) {
+          const initialVerif = classifyVerificationFromCommands(commandsExecuted);
+          if (!initialVerif.ranVerificationCommands) {
+            const detected = detectProjectVerificationCommands(workspaceRoot);
+            const autoQueue = [
+              ...(detected.testCommands.slice(0, 1)),
+              ...(detected.typecheckCommands.slice(0, 1)),
+              ...(detected.lintCommands.slice(0, 1)),
+            ].filter(Boolean);
+            if (autoQueue.length > 0) {
+              await runDiscoveredVerificationCommands(autoQueue);
+            }
+          }
+
+          // Bounded Verifier -> Builder repair loop if any verification command failed
+          const maxRepairCycles = options.maxCorrectionCycles ?? 1;
+          const postVerif = classifyVerificationFromCommands(commandsExecuted);
+          const hasVerifFailure =
+            postVerif.testsPassed === false ||
+            postVerif.buildPassed === false ||
+            postVerif.lintPassed === false;
+
+          if (
+            hasVerifFailure &&
+            postImplReview.correctionCyclesRun < maxRepairCycles &&
+            !subSignal.aborted
+          ) {
+            const repairCycle = postImplReview.correctionCyclesRun + 1;
+            const failedCmds = commandsExecuted.filter(
+              (c) => c.exitCode !== 0 || c.timedOut || c.cancelled,
+            );
+            const failureDigest = failedCmds
+              .map(
+                (c) =>
+                  `$ ${c.command} (exit=${c.exitCode})\n${c.stderrPreview || c.stdoutPreview}`,
+              )
+              .join("\n\n");
+
+            emitStep({
+              id: `step-verifier-repair-${Date.now()}`,
+              kind: "judge",
+              agentRole: "Verifier",
+              label: `Verifier triggered bounded Builder repair cycle #${repairCycle}`,
+              plainSummary: `Verification command failed; Builder is repairing and re-running checks`,
+              detail: failureDigest.slice(0, 180),
+              status: "running",
+            });
+
+            const repairPrompt = `${plan.effectivePrompt}\n\n[VERIFIER COMMAND FAILURE — REPAIR CYCLE #${repairCycle}]\nFix the code so the project verification command(s) pass:\n${failureDigest}`;
+            const repairRes = options.customBuilderFn
+              ? await options.customBuilderFn({
+                  prompt: repairPrompt,
+                  workspaceRoot,
+                  correctionCycle: repairCycle,
+                  signal: subSignal,
+                })
+              : await runBuilderCodingPass({
+                  prompt: repairPrompt,
+                  workspacePath: workspaceRoot,
+                  dataDir,
+                  executionId,
+                  preferredModelId: usedModel,
+                  transpiledSkillsBlock: plan.transpiledSkillsPrompt,
+                  memorySnippet: options.memorySnippet ?? "",
+                  systemPromptPrefix: options.systemPromptPrefix,
+                  isIndependent: options.isIndependent,
+                  conversationHistory: [
+                    ...options.conversationHistory,
+                    { role: "assistant", content: responseText },
+                  ],
+                  maxToolIterations: 2,
+                  mode: options.mode ?? "turbo",
+                  signal: subSignal,
+                  onStep: emitStep,
+                });
+
+            if (repairRes.responseText.trim()) {
+              responseText = repairRes.responseText;
+            }
+            for (const f of repairRes.filesInspected ?? []) filesInspected.add(f);
+            for (const f of repairRes.filesCreated ?? []) filesCreated.add(f);
+            for (const f of repairRes.filesModified ?? []) filesModified.add(f);
+            commandsExecuted.push(...(repairRes.commandsExecuted ?? []));
+            toolsInvoked.push(...(repairRes.toolsInvoked ?? []));
+            if ("delegatedSubagents" in repairRes && Array.isArray(repairRes.delegatedSubagents)) {
+              delegatedSubagents.push(...repairRes.delegatedSubagents);
+            }
+            postImplReview = {
+              ...postImplReview,
+              correctionCyclesRun: repairCycle,
+            };
+
+            // Re-run failed verification commands after repair
+            const retryCmdNames = [...new Set(failedCmds.map((c) => c.command))];
+            await runDiscoveredVerificationCommands(retryCmdNames);
+
+            // Re-evaluate post-implementation review with updated commandsExecuted & repaired files
+            postImplReview = await runPostImplementationEgmReview({
+              originalRequirement: prompt,
+              workspacePath: workspaceRoot,
+              responseText,
+              filesCreated: [...filesCreated],
+              filesModified: [...filesModified],
+              commandsExecuted,
+              gitDiffSummary: captureWorkspaceGitDiffSummary(workspaceRoot),
+              builderModelId: usedModel,
+              candidateReviewerModels: [postImplReview.reviewerModel].filter(Boolean),
+              reviewerProviderId: postImplReview.reviewerProviderId,
+              reviewerEndpointUrl: postImplReview.reviewerEndpointUrl,
+              reviewerSessionId: `${postImplReview.reviewerSessionId || nodeSessionId}_r${repairCycle}`,
+              requireLiveGoldfishModel: Boolean(postImplReview.reviewerEndpointUrl),
+              correctionCycle: repairCycle,
+              simulateReviewerUnavailable: options.simulateReviewerUnavailable,
+              signal: subSignal,
+            });
+          }
+        }
+
         const allSkills = discoverAllUniversalSkills({ workspaceRoot });
         const skillsWithTokens = plan.mountedSkills.map((ms) => {
           const found = allSkills.find((s) => s.name === ms.name);
@@ -1836,7 +2131,73 @@ export async function executeTaskDag(
           egmReview: postImplReview,
           responseText,
           wasCancelled: Boolean(signal?.aborted),
+          delegatedSubagents,
         });
+
+        // Group 6: Hermes Persistent Memory & Validated Learned Skill Proposal on verified multi-step completion
+        if (
+          completionReport.status === "implemented_and_verified" &&
+          !options.isIndependent &&
+          (hasCodeChanges || toolsInvoked.length >= 2)
+        ) {
+          try {
+            const changedSummary = [...filesCreated, ...filesModified].join(", ") || "workspace";
+            const cmdSummary = commandsExecuted.map((c) => c.command).join(", ") || "deterministic checks";
+            const savedMem = saveMemoryEntry(dataDir, {
+              scope: "project",
+              workspaceRoot,
+              category: "lesson_learned",
+              title: `Verified Task (${plan.classification.primaryDomain}): ${prompt.slice(0, 64)}`,
+              content: `Verified implementation in ${workspaceRoot}. Changed files: ${changedSummary}. Verification commands: ${cmdSummary}. Reviewer: ${postImplReview.reviewerModel} (${postImplReview.outcome}).`,
+              tags: [
+                plan.classification.primaryDomain,
+                ...plan.mountedSkills.map((s) => s.name),
+              ],
+              provenance: {
+                executionId,
+                sourceModel: usedModel,
+              },
+            });
+
+            const rawSlug = prompt
+              .toLowerCase()
+              .replace(/[^a-z0-9]+/g, "-")
+              .replace(/^-+|-+$/g, "")
+              .slice(0, 28);
+            const proposedSkillName = `learned-${rawSlug || "workflow"}-${executionId.slice(-6).toLowerCase()}`;
+            const rawProposal = proposeLearnedSkill(dataDir, {
+              skillName: proposedSkillName,
+              description: `Verified procedural workflow for ${prompt.slice(0, 90)}`,
+              triggers: [plan.classification.primaryDomain.replace(/_/g, " "), rawSlug.replace(/-/g, " ")].filter(Boolean),
+              instructions: [
+                "## Grounded Workflow",
+                `1. Inspect workspace target files (${[...filesInspected].slice(0, 4).join(", ") || changedSummary}).`,
+                `2. Apply surgical edits to ${changedSummary} with a pre-edit safety checkpoint.`,
+                `3. Execute project verification commands (${cmdSummary}) and confirm independent Goldfish review approval.`,
+              ].join("\n"),
+              sourceExecutionId: executionId,
+            });
+            const validatedProposal = validateLearnedSkillProposal(
+              dataDir,
+              rawProposal.proposalId,
+              workspaceRoot,
+            );
+            if (options.autoPromoteLearnedSkills && validatedProposal.status === "validated") {
+              promoteLearnedSkillProposal(dataDir, validatedProposal.proposalId);
+            }
+
+            completionReport.hermesLearning = {
+              memoryEntryId: savedMem.entry.id,
+              learnedSkillProposalId: validatedProposal.proposalId,
+              learnedSkillName: validatedProposal.skillName,
+              learnedSkillStatus: options.autoPromoteLearnedSkills && validatedProposal.status === "validated"
+                ? "promoted"
+                : validatedProposal.status,
+            };
+          } catch {
+            // Non-fatal post-completion Hermes learning hook
+          }
+        }
 
         evaluateCompletedTurn({
           dataDir,

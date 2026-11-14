@@ -126,10 +126,27 @@ export function classifyVerificationFromCommands(commands: readonly ExecutedComm
   let lintPassed: boolean | null = null;
   const details: string[] = [];
 
+  // Track latest outcome per normalized command string so a successful retry/repair
+  // pass supersedes an earlier failed attempt of the same verification command.
+  const latestByCommand = new Map<
+    string,
+    {
+      cmd: ExecutedCommandEvidence;
+      isTest: boolean;
+      isBuild: boolean;
+      isLint: boolean;
+      passed: boolean;
+    }
+  >();
+
   for (const cmd of commands) {
-    const c = cmd.command.toLowerCase();
+    const c = cmd.command.trim().toLowerCase();
+    // Never classify a pure echo/printf/write-host output command as a real verification run
+    if (/^(?:echo|printf|write-host|write-output)\b/i.test(c)) {
+      continue;
+    }
     const isTest = /\b(test|vitest|pytest|jest|cargo\s+test|go\s+test|node\s+--test)\b/.test(c);
-    const isBuild = /\b(build|tsc|vite\s+build|cargo\s+build|go\s+build)\b/.test(c);
+    const isBuild = /\b(build|tsc|vite\s+build|cargo\s+build|cargo\s+check|go\s+build)\b/.test(c);
     const isLint = /\b(lint|oxlint|eslint|ruff|pyright|typecheck)\b/.test(c);
 
     if (isTest || isBuild || isLint) {
@@ -138,9 +155,19 @@ export function classifyVerificationFromCommands(commands: readonly ExecutedComm
       details.push(
         `[${passed ? "PASS" : "FAIL"}] \`${cmd.command}\` (exit=${cmd.exitCode ?? "null"}, ${cmd.durationMs}ms)`,
       );
-      if (isTest) testsPassed = testsPassed === null ? passed : testsPassed && passed;
-      if (isBuild) buildPassed = buildPassed === null ? passed : buildPassed && passed;
-      if (isLint) lintPassed = lintPassed === null ? passed : lintPassed && passed;
+      latestByCommand.set(c, { cmd, isTest, isBuild, isLint, passed });
+    }
+  }
+
+  for (const entry of latestByCommand.values()) {
+    if (entry.isTest) {
+      testsPassed = testsPassed === null ? entry.passed : testsPassed && entry.passed;
+    }
+    if (entry.isBuild) {
+      buildPassed = buildPassed === null ? entry.passed : buildPassed && entry.passed;
+    }
+    if (entry.isLint) {
+      lintPassed = lintPassed === null ? entry.passed : lintPassed && entry.passed;
     }
   }
 
@@ -151,6 +178,26 @@ export function classifyVerificationFromCommands(commands: readonly ExecutedComm
     lintPassed,
     details,
   };
+}
+
+function mapCompletionStatusToRequirementStatus(
+  status: CompletionStatus,
+): RequirementEvidenceItem["status"] {
+  switch (status) {
+    case "implemented_and_verified":
+      return "implemented_and_verified";
+    case "implemented_not_verified":
+      return "implemented_not_verified";
+    case "partially_completed":
+      return "partially_implemented";
+    case "blocked":
+      return "blocked";
+    case "skipped":
+      return "not_applicable";
+    case "failed":
+    default:
+      return "not_implemented";
+  }
 }
 
 /**
@@ -175,6 +222,8 @@ export function buildCompletionEvidenceReport(input: {
   wasBlocked?: boolean;
   explicitTestFailures?: readonly string[];
   explicitLinterErrors?: readonly string[];
+  delegatedSubagents?: CompletionEvidenceReport["delegatedSubagents"];
+  hermesLearning?: CompletionEvidenceReport["hermesLearning"];
 }): CompletionEvidenceReport {
   const remainingIssues: string[] = [];
 
@@ -201,7 +250,12 @@ export function buildCompletionEvidenceReport(input: {
     verificationResults.lintPassed = false;
   }
 
+  // Only flag a command as a remaining issue if its LATEST execution failed or aborted
+  const latestCmdRuns = new Map<string, ExecutedCommandEvidence>();
   for (const cmd of input.commandsExecuted) {
+    latestCmdRuns.set(cmd.command.trim().toLowerCase(), cmd);
+  }
+  for (const cmd of latestCmdRuns.values()) {
     if (cmd.exitCode !== 0 || cmd.timedOut || cmd.cancelled) {
       remainingIssues.push(
         `Command failed or aborted: \`${cmd.command}\` (exit=${cmd.exitCode ?? "null"}, timedOut=${cmd.timedOut}, cancelled=${cmd.cancelled})`,
@@ -271,18 +325,32 @@ export function buildCompletionEvidenceReport(input: {
     .filter((s) => s.length >= 6)
     .slice(0, 8);
 
+  const reqItemStatus = mapCompletionStatusToRequirementStatus(status);
+  const changedFilesList = [...new Set([...input.filesCreated, ...input.filesModified])];
+  const executedCommandsSummary = input.commandsExecuted.map(
+    (c) => `${c.command} (exit=${c.exitCode ?? "null"})`,
+  );
+
   const requirementMatrix: RequirementEvidenceItem[] = (
     requirementClauses.length > 0 ? requirementClauses : [input.originalRequirement]
-  ).map((clause) => ({
-    requirement: clause,
-    status,
-    evidence:
-      input.filesCreated.length + input.filesModified.length > 0
-        ? `Files changed: ${[...input.filesCreated, ...input.filesModified].join(", ")}`
+  ).map((clause, idx) => {
+    const evidenceSummary =
+      changedFilesList.length > 0
+        ? `Files changed: ${changedFilesList.join(", ")}${executedCommandsSummary.length > 0 ? ` · Commands: ${executedCommandsSummary.join(", ")}` : ""}`
         : input.filesInspected.length > 0
           ? `Files inspected: ${input.filesInspected.slice(0, 5).join(", ")}`
-          : `EGM outcome: ${input.egmReview.outcome}`,
-  }));
+          : `EGM outcome: ${input.egmReview.outcome}`;
+    return {
+      requirementId: `REQ-${idx + 1}`,
+      description: clause,
+      requirement: clause,
+      status: reqItemStatus,
+      evidenceFiles: changedFilesList.length > 0 ? changedFilesList : [...input.filesInspected],
+      evidenceCommands: executedCommandsSummary,
+      evidence: evidenceSummary,
+      justification: evidenceSummary,
+    };
+  });
 
   return {
     executionId: input.executionId,
@@ -290,6 +358,9 @@ export function buildCompletionEvidenceReport(input: {
     originalRequirement: input.originalRequirement,
     executionPlanSummary: input.executionPlanSummary,
     requirementMatrix,
+    requirements: requirementMatrix,
+    delegatedSubagents: input.delegatedSubagents,
+    hermesLearning: input.hermesLearning,
     subtasks: input.subtasks.map((s) => ({
       id: s.id,
       role: s.role,
@@ -297,6 +368,8 @@ export function buildCompletionEvidenceReport(input: {
       task: s.assignedTask,
       state: s.state,
       modelUsed: s.actualModelUsed || s.assignedModelId,
+      driverId: s.driverId,
+      sessionId: s.sessionId,
       durationMs: s.durationMs ?? 0,
     })),
     agentsInvolved,
