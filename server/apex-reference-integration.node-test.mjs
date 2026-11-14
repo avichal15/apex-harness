@@ -666,6 +666,164 @@ test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-
       assert.ok(Array.isArray(evidence.requirementMatrix));
       assert.ok(evidence.requirementMatrix.length >= 1);
       assert.ok(evidence.requirementMatrix.every((r) => r.status === "implemented_and_verified"));
+
+      // End-to-End Production /api/chat/stream -> Critic -> Independent Goldfish HTTP Endpoint Test
+      capturedGoldfishRequestBody = null;
+      let capturedBuilderMessages = "";
+      const mockBuilderServer = http.createServer((req, res) => {
+        let body = "";
+        req.on("data", (c) => (body += c));
+        req.on("end", () => {
+          const isBuilderCall = body.includes("You are the Apex Harness Builder Agent.");
+          if (isBuilderCall) {
+            capturedBuilderMessages += body;
+          }
+          const shouldEmitEditTool =
+            isBuilderCall &&
+            body.includes("Implement computeTotal multiplier update") &&
+            !body.includes("Tool results:");
+          const reply = shouldEmitEditTool
+            ? [
+                "Updating feature.ts now:",
+                "```apex-action",
+                JSON.stringify({
+                  tool: "edit_file",
+                  path: "feature.ts",
+                  target: "return x * 2;",
+                  replacement: "return x * 3;",
+                }),
+                "```",
+              ].join("\n")
+            : "Updated computeTotal in feature.ts to multiply by 3.";
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(
+            JSON.stringify({
+              choices: [
+                {
+                  message: { role: "assistant", content: reply },
+                  finish_reason: "stop",
+                },
+              ],
+            }),
+          );
+        });
+      });
+      await new Promise((r) => mockBuilderServer.listen(0, "127.0.0.1", r));
+      const builderPort = mockBuilderServer.address().port;
+      const prevOmni = process.env.OMNIROUTE_BASE_URL;
+      process.env.OMNIROUTE_BASE_URL = `http://127.0.0.1:${builderPort}/v1`;
+
+      const appServer = createApexAppServer();
+      await new Promise((r) => appServer.listen(0, "127.0.0.1", r));
+      const appPort = appServer.address().port;
+      const baseUrl = `http://127.0.0.1:${appPort}`;
+      const headers = {
+        "Content-Type": "application/json",
+        "X-Apex-Token": getLocalSessionToken(),
+        Origin: baseUrl,
+      };
+
+      try {
+        // Register tempDir as a project and create a conversation
+        const projRes = await fetch(`${baseUrl}/api/projects`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ name: "v05-live-critic-proj", path: tempDir }),
+        });
+        const projData = await projRes.json();
+        const projectId = projData.project.id;
+
+        const convRes = await fetch(`${baseUrl}/api/conversations`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            title: "V05 Production Goldfish Critic Test",
+            projectId,
+            forceNew: true,
+          }),
+        });
+        const convData = await convRes.json();
+        const convId = convData.thread.id;
+
+        // Turn 1: Seed private Elephant conversation history
+        const turn1Res = await fetch(`${baseUrl}/api/chat/stream`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            conversationId: convId,
+            prompt: "hi — PRIVATE_ELEPHANT_HISTORY_MARKER_99182",
+            mode: "turbo",
+            adaptiveTopology: true,
+          }),
+        });
+        await turn1Res.text();
+
+        // Turn 2: Code modification turn that triggers full_engineering DAG + live Goldfish HTTP Critic
+        capturedGoldfishRequestBody = null;
+        const turn2Res = await fetch(`${baseUrl}/api/chat/stream`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            conversationId: convId,
+            prompt: "Implement computeTotal multiplier update in feature.ts",
+            mode: "turbo",
+            effort: "medium",
+            reviewerEndpointUrl: `http://127.0.0.1:${gfPort}/v1`,
+            reviewerProviderId: "mock-goldfish-provider",
+            reviewerModelId: "agy-acp/claude-opus-4-6-thinking",
+            requireLiveGoldfishModel: true,
+          }),
+        });
+        assert.equal(turn2Res.status, 200);
+        const turn2Sse = await turn2Res.text();
+        assert.ok(turn2Sse.includes("event: done"));
+
+        // Verify Builder received the private history marker, while Goldfish NEVER received it!
+        assert.ok(
+          capturedBuilderMessages.includes("PRIVATE_ELEPHANT_HISTORY_MARKER_99182"),
+          "Builder must receive conversation history",
+        );
+        assert.ok(
+          capturedGoldfishRequestBody,
+          "Production Critic node must invoke the configured Goldfish HTTP endpoint during /api/chat/stream",
+        );
+        const goldfishRawPayload = JSON.stringify(capturedGoldfishRequestBody);
+        assert.equal(
+          goldfishRawPayload.includes("PRIVATE_ELEPHANT_HISTORY_MARKER_99182"),
+          false,
+          "Goldfish reviewer must NEVER receive Builder's private conversation history",
+        );
+        assert.ok(
+          goldfishRawPayload.includes("return x * 3;"),
+          "Goldfish reviewer must receive actual modified file content from disk",
+        );
+        assert.ok(
+          goldfishRawPayload.includes("changed_files_exist_and_non_empty"),
+          "Goldfish reviewer payload must preserve deterministicChecks",
+        );
+
+        // Verify execution record persisted reviewer identity, endpoint, model, session, and outcome
+        const execsRes = await fetch(`${baseUrl}/api/executions?conversationId=${convId}`, {
+          headers,
+        });
+        const execsData = await execsRes.json();
+        const latestExec = execsData.executions[0];
+        assert.ok(latestExec, "Execution record must be persisted");
+        const criticNode = latestExec.subtasks.find((s) => s.role === "Critic");
+        assert.equal(criticNode?.actualModelUsed, "agy-acp/claude-opus-4-6-thinking");
+        assert.equal(criticNode?.driverId, "mock-goldfish-provider");
+        assert.ok(criticNode?.sessionId?.includes("_c0"));
+        assert.equal(
+          latestExec.completionReport?.egmReview?.reviewerEndpointUrl,
+          `http://127.0.0.1:${gfPort}/v1`,
+        );
+        assert.equal(latestExec.completionReport?.egmReview?.outcome, "approve");
+      } finally {
+        if (prevOmni === undefined) delete process.env.OMNIROUTE_BASE_URL;
+        else process.env.OMNIROUTE_BASE_URL = prevOmni;
+        appServer.close();
+        mockBuilderServer.close();
+      }
     } finally {
       mockGoldfishServer.close();
       rmSync(tempDir, { recursive: true, force: true });

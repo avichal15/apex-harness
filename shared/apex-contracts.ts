@@ -150,16 +150,18 @@ export interface PostImplReviewReport {
   outcome: PostImplReviewOutcome;
   reviewerAvailable: boolean;
   reviewerModel: string;
+  reviewerProviderId?: string;
+  reviewerEndpointUrl?: string;
   reviewerSessionId?: string;
+  source?: "goldfish_fresh_session" | "deterministic_static_check" | "unavailable";
   independentContextVerified?: boolean;
   comprehensionParaphrase: string;
   score: number;
   correctionCyclesRun: number;
   deterministicChecks?: Array<{
-    id: string;
-    severity: "BLOCKER" | "MAJOR" | "NIT";
-    file?: string;
-    description: string;
+    check: string;
+    passed: boolean;
+    detail?: string;
   }>;
   findings: Array<{
     id: string;

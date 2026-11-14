@@ -41,12 +41,16 @@ import {
   type ModelDomain,
   type UnifiedModelEntry,
 } from "./apex-fleet-sync.ts";
-import { buildCompletionEvidenceReport } from "./completion-evidence.ts";
+import {
+  buildCompletionEvidenceReport,
+  captureWorkspaceGitDiffSummary,
+} from "./completion-evidence.ts";
 import { applySpillPolicyToText, executePtcProgram } from "./deepseek-subsystems.ts";
 import {
   buildDesk1GroundedManifest,
   runEgmBoardroomConference,
   runPostImplementationEgmReview,
+  selectIndependentGoldfishModel,
   type EgmBoardroomBrief,
 } from "./egm-boardroom.ts";
 import type { TaskExecutionManager } from "./execution-manager.ts";
@@ -1024,6 +1028,10 @@ export interface ExecuteTaskDagOptions {
   memorySnippet?: string;
   maxCorrectionCycles?: number;
   simulateReviewerUnavailable?: boolean;
+  reviewerEndpointUrl?: string;
+  reviewerProviderId?: string;
+  reviewerModelId?: string;
+  requireLiveGoldfishModel?: boolean;
   customBuilderFn?: (context: {
     prompt: string;
     workspaceRoot: string;
@@ -1562,17 +1570,68 @@ export async function executeTaskDag(
         const maxCycles = options.maxCorrectionCycles ?? 1;
         let cycle = 0;
 
-        postImplReview = await runPostImplementationEgmReview({
-          originalRequirement: prompt,
-          workspacePath: workspaceRoot,
-          responseText,
-          filesCreated: [...filesCreated],
-          filesModified: [...filesModified],
-          commandsExecuted,
-          correctionCycle: cycle,
-          simulateReviewerUnavailable: options.simulateReviewerUnavailable,
-          signal: subSignal,
-        });
+        const roleTable = loadRoleRoutingTable(dataDir);
+        const criticRoleEntry =
+          roleTable.find((r) => r.role === node.engineeringRole) ??
+          roleTable.find((r) => r.role === "code_review");
+        const candidateReviewerModels = [
+          ...(options.reviewerModelId ? [options.reviewerModelId] : []),
+          node.assignedModelId,
+          ...(criticRoleEntry?.fallbackModelIds ?? []),
+        ].filter(Boolean);
+
+        const configuredProviders = loadProviderConfigs(dataDir);
+        const explicitReviewerProviderId =
+          options.reviewerProviderId ||
+          process.env.APEX_EGM_REVIEWER_PROVIDER_ID ||
+          undefined;
+        const matchedReviewerProvider = configuredProviders.find(
+          (p) =>
+            p.enabled &&
+            ((explicitReviewerProviderId && p.id === explicitReviewerProviderId) ||
+              p.id === "egm-reviewer"),
+        );
+        const resolvedReviewerEndpointUrl =
+          options.reviewerEndpointUrl ||
+          process.env.APEX_EGM_REVIEWER_BASE_URL ||
+          matchedReviewerProvider?.baseUrl ||
+          undefined;
+        const resolvedReviewerProviderId =
+          explicitReviewerProviderId ||
+          matchedReviewerProvider?.id ||
+          (resolvedReviewerEndpointUrl ? "egm-http-reviewer" : "egm-goldfish-independent");
+        const hasCodeChanges = filesCreated.size + filesModified.size > 0;
+        const requireLiveGoldfish =
+          options.requireLiveGoldfishModel ??
+          (Boolean(resolvedReviewerEndpointUrl) ||
+            (hasCodeChanges && process.env.APEX_EGM_REQUIRE_LIVE_GOLDFISH === "1"));
+
+        const invokeProductionGoldfishCritic = async (cycleNum: number) => {
+          const freshReviewerSessionId = `${node.sessionId || `sess_${executionId.slice(0, 8)}_critic`}_c${cycleNum}`;
+          const gitDiffSummary = hasCodeChanges
+            ? captureWorkspaceGitDiffSummary(workspaceRoot)
+            : "";
+          return runPostImplementationEgmReview({
+            originalRequirement: prompt,
+            workspacePath: workspaceRoot,
+            responseText,
+            filesCreated: [...filesCreated],
+            filesModified: [...filesModified],
+            commandsExecuted,
+            gitDiffSummary,
+            builderModelId: usedModel,
+            candidateReviewerModels,
+            reviewerProviderId: resolvedReviewerProviderId,
+            reviewerEndpointUrl: resolvedReviewerEndpointUrl,
+            reviewerSessionId: freshReviewerSessionId,
+            requireLiveGoldfishModel: requireLiveGoldfish,
+            correctionCycle: cycleNum,
+            simulateReviewerUnavailable: options.simulateReviewerUnavailable,
+            signal: subSignal,
+          });
+        };
+
+        postImplReview = await invokeProductionGoldfishCritic(cycle);
 
         // Bounded correction loop when Critic requests changes on concrete code defects
         while (
@@ -1631,17 +1690,7 @@ export async function executeTaskDag(
           commandsExecuted.push(...(fixRes.commandsExecuted ?? []));
           toolsInvoked.push(...(fixRes.toolsInvoked ?? []));
 
-          postImplReview = await runPostImplementationEgmReview({
-            originalRequirement: prompt,
-            workspacePath: workspaceRoot,
-            responseText,
-            filesCreated: [...filesCreated],
-            filesModified: [...filesModified],
-            commandsExecuted,
-            correctionCycle: cycle,
-            simulateReviewerUnavailable: options.simulateReviewerUnavailable,
-            signal: subSignal,
-          });
+          postImplReview = await invokeProductionGoldfishCritic(cycle);
         }
 
         emitStep({
@@ -1650,11 +1699,11 @@ export async function executeTaskDag(
           agentRole: "Critic",
           label: `Post-Implementation EGM Critic: ${postImplReview.outcome.toUpperCase()} (${postImplReview.score}/100)`,
           plainSummary: postImplReview.summary,
-          detail: `Outcome: ${postImplReview.outcome} · Cycles: ${postImplReview.correctionCyclesRun}`,
+          detail: `Outcome: ${postImplReview.outcome} · Reviewer: ${postImplReview.reviewerModel} · Cycles: ${postImplReview.correctionCyclesRun}`,
           status:
             postImplReview.outcome === "approve"
               ? "done"
-              : postImplReview.outcome === "decline"
+              : postImplReview.outcome === "decline" || postImplReview.outcome === "unavailable"
                 ? "error"
                 : "done",
           durationMs: Date.now() - t0,
@@ -1663,13 +1712,19 @@ export async function executeTaskDag(
         executionManager.updateSubtask(executionId, node.id, {
           state: "completed",
           actualModelUsed: postImplReview.reviewerModel,
+          driverId: postImplReview.reviewerProviderId || node.driverId,
+          sessionId: postImplReview.reviewerSessionId || node.sessionId,
           retryCount: cycle,
-          inputSummary: `Changed files: ${filesCreated.size + filesModified.size}, Commands: ${commandsExecuted.length}`,
+          inputSummary: `Changed files: ${filesCreated.size + filesModified.size}, Commands: ${commandsExecuted.length}, Endpoint: ${postImplReview.reviewerEndpointUrl || "local"}`,
           outputSummary: postImplReview.summary,
           completedAt: new Date().toISOString(),
           durationMs: Date.now() - t0,
           verificationPassed: postImplReview.outcome === "approve",
-          events: appendNodeEvent(node.id, "completed", `Outcome: ${postImplReview.outcome}`),
+          events: appendNodeEvent(
+            node.id,
+            "completed",
+            `Outcome: ${postImplReview.outcome} (model=${postImplReview.reviewerModel}, session=${postImplReview.reviewerSessionId || "local"})`,
+          ),
         });
         notifyDag();
         return;

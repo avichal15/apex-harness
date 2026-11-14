@@ -447,7 +447,9 @@ export interface PostImplReviewInput {
   gitDiffSummary?: string;
   builderModelId?: string;
   candidateReviewerModels?: readonly string[];
+  reviewerProviderId?: string;
   reviewerEndpointUrl?: string;
+  reviewerSessionId?: string;
   requireLiveGoldfishModel?: boolean;
   explicitTestFailures?: readonly string[];
   explicitLinterErrors?: readonly string[];
@@ -582,12 +584,19 @@ export async function runPostImplementationEgmReview(
     input.builderModelId ?? "builder-default",
     input.candidateReviewerModels,
   );
+  const reviewerSessionId =
+    input.reviewerSessionId ?? `egm-goldfish-c${cycle}-${Date.now().toString(36)}`;
+  const reviewerProviderId = input.reviewerProviderId ?? "egm-goldfish-independent";
+  const reviewerEndpointUrl = input.reviewerEndpointUrl;
 
   if (input.simulateReviewerUnavailable) {
     return {
       outcome: "unavailable",
       reviewerAvailable: false,
       reviewerModel: "offline/unavailable",
+      reviewerProviderId,
+      reviewerEndpointUrl,
+      reviewerSessionId,
       comprehensionParaphrase: `Post-implementation review requested for "${input.originalRequirement.slice(0, 80)}", but independent reviewer is unavailable.`,
       score: 0,
       correctionCyclesRun: cycle,
@@ -595,6 +604,7 @@ export async function runPostImplementationEgmReview(
         {
           id: "EGM-UNAVAILABLE",
           severity: "MAJOR",
+          source: "deterministic_static_check",
           description: "Independent EGM reviewer model was unreachable; automatic approval is forbidden.",
           resolution: "ESCALATE",
         },
@@ -620,6 +630,7 @@ export async function runPostImplementationEgmReview(
           id: `EGM-MISSING-${findings.length + 1}`,
           severity: "BLOCKER",
           file: relFile,
+          source: "deterministic_static_check",
           description: `Claimed modified/created file "${relFile}" does not exist on disk.`,
           resolution: "PROPOSE_FIX",
         });
@@ -633,6 +644,7 @@ export async function runPostImplementationEgmReview(
           id: `EGM-EMPTY-${findings.length + 1}`,
           severity: "BLOCKER",
           file: relFile,
+          source: "deterministic_static_check",
           description: `Modified file "${relFile}" is empty (0 bytes).`,
           resolution: "PROPOSE_FIX",
         });
@@ -644,6 +656,7 @@ export async function runPostImplementationEgmReview(
             id: `${pattern.id}-${findings.length + 1}`,
             severity: pattern.severity,
             file: relFile,
+            source: "deterministic_static_check",
             description: `${pattern.description} in ${relFile}`,
             resolution: "PROPOSE_FIX",
           });
@@ -654,6 +667,7 @@ export async function runPostImplementationEgmReview(
         id: `EGM-SEC-${findings.length + 1}`,
         severity: "BLOCKER",
         file: relFile,
+        source: "deterministic_static_check",
         description: `Security boundary violation inspecting "${relFile}": ${err instanceof Error ? err.message : String(err)}`,
         resolution: "DECLINE",
       });
@@ -666,6 +680,7 @@ export async function runPostImplementationEgmReview(
       findings.push({
         id: `${pattern.id}-RESP-${findings.length + 1}`,
         severity: pattern.severity,
+        source: "deterministic_static_check",
         description: `${pattern.description} in assistant response`,
         resolution: "PROPOSE_FIX",
       });
@@ -678,6 +693,7 @@ export async function runPostImplementationEgmReview(
       findings.push({
         id: `EGM-CMD-FAIL-${findings.length + 1}`,
         severity: "BLOCKER",
+        source: "deterministic_static_check",
         description: `Command "${cmd.command}" failed (exit=${cmd.exitCode ?? "null"}, timedOut=${cmd.timedOut}, cancelled=${cmd.cancelled}).`,
         resolution: "PROPOSE_FIX",
       });
@@ -689,6 +705,7 @@ export async function runPostImplementationEgmReview(
       findings.push({
         id: `EGM-TEST-FAIL-${findings.length + 1}`,
         severity: "BLOCKER",
+        source: "deterministic_static_check",
         description: `Test suite failure: ${tf.trim()}`,
         resolution: "PROPOSE_FIX",
       });
@@ -700,6 +717,7 @@ export async function runPostImplementationEgmReview(
       findings.push({
         id: `EGM-LINT-FAIL-${findings.length + 1}`,
         severity: "MAJOR",
+        source: "deterministic_static_check",
         description: `Linter/compiler error: ${le.trim()}`,
         resolution: "PROPOSE_FIX",
       });
@@ -725,16 +743,24 @@ export async function runPostImplementationEgmReview(
   ];
 
   // If reviewerEndpointUrl is provided, invoke the independent Goldfish HTTP reviewer with ONLY fresh-context payload
-  if (input.reviewerEndpointUrl) {
+  if (reviewerEndpointUrl) {
     try {
       const freshContextPrompt = JSON.stringify({
+        reviewerSessionId,
         originalRequirement: input.originalRequirement,
+        filesCreated: input.filesCreated,
+        filesModified: input.filesModified,
         changedFilesContent,
         gitDiffSummary: input.gitDiffSummary ?? "",
         commandsExecuted: input.commandsExecuted,
+        deterministicChecks,
         independentContextVerified: true,
       });
-      const resp = await fetch(`${input.reviewerEndpointUrl.replace(/\/$/, "")}/chat/completions`, {
+      const cleanEndpoint = reviewerEndpointUrl.replace(/\/+$/, "");
+      const targetUrl = cleanEndpoint.endsWith("/chat/completions")
+        ? cleanEndpoint
+        : `${cleanEndpoint}/chat/completions`;
+      const resp = await fetch(targetUrl, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -758,6 +784,9 @@ export async function runPostImplementationEgmReview(
           outcome: "unavailable",
           reviewerAvailable: false,
           reviewerModel: selectedReviewerModel,
+          reviewerProviderId,
+          reviewerEndpointUrl,
+          reviewerSessionId,
           comprehensionParaphrase: "Independent HTTP Goldfish reviewer returned non-200 status.",
           score: 0,
           correctionCyclesRun: cycle,
@@ -778,7 +807,14 @@ export async function runPostImplementationEgmReview(
         findings?: PostImplReviewReport["findings"];
         summary?: string;
       };
-      if (parsed.findings) findings.push(...parsed.findings);
+      if (parsed.findings) {
+        for (const gf of parsed.findings) {
+          findings.push({
+            ...gf,
+            source: gf.source ?? "goldfish_fresh_session",
+          });
+        }
+      }
       const finalOutcome =
         findings.some((f) => f.severity === "BLOCKER" || f.severity === "MAJOR") &&
         parsed.outcome === "approve"
@@ -788,6 +824,9 @@ export async function runPostImplementationEgmReview(
         outcome: finalOutcome,
         reviewerAvailable: true,
         reviewerModel: selectedReviewerModel,
+        reviewerProviderId,
+        reviewerEndpointUrl,
+        reviewerSessionId,
         comprehensionParaphrase:
           parsed.comprehensionParaphrase ??
           `Fresh-context Goldfish review of "${input.originalRequirement.slice(0, 80)}".`,
@@ -804,6 +843,9 @@ export async function runPostImplementationEgmReview(
         outcome: "unavailable",
         reviewerAvailable: false,
         reviewerModel: selectedReviewerModel,
+        reviewerProviderId,
+        reviewerEndpointUrl,
+        reviewerSessionId,
         comprehensionParaphrase: "Independent HTTP Goldfish reviewer unreachable.",
         score: 0,
         correctionCyclesRun: cycle,
@@ -833,6 +875,9 @@ export async function runPostImplementationEgmReview(
           outcome: "unavailable",
           reviewerAvailable: false,
           reviewerModel: customRes.model ?? "custom-reviewer-offline",
+          reviewerProviderId,
+          reviewerEndpointUrl,
+          reviewerSessionId,
           comprehensionParaphrase: `Post-implementation review could not complete because reviewer "${customRes.model ?? "custom"}" was unavailable.`,
           score: 0,
           correctionCyclesRun: cycle,
@@ -841,6 +886,7 @@ export async function runPostImplementationEgmReview(
             {
               id: "EGM-CUSTOM-UNAVAILABLE",
               severity: "MAJOR",
+              source: "goldfish_fresh_session",
               description: "Custom independent reviewer reported unavailable; refusing automatic approval.",
               resolution: "ESCALATE",
             },
@@ -853,7 +899,12 @@ export async function runPostImplementationEgmReview(
       }
 
       if (customRes.findings) {
-        findings.push(...customRes.findings);
+        for (const cf of customRes.findings) {
+          findings.push({
+            ...cf,
+            source: "goldfish_fresh_session",
+          });
+        }
       }
 
       if (customRes.outcome) {
@@ -861,6 +912,9 @@ export async function runPostImplementationEgmReview(
           outcome: customRes.outcome,
           reviewerAvailable: true,
           reviewerModel: customRes.model ?? selectedReviewerModel,
+          reviewerProviderId,
+          reviewerEndpointUrl,
+          reviewerSessionId,
           comprehensionParaphrase: `Audited "${input.originalRequirement.slice(0, 80)}" across ${allChangedFiles.length} changed file(s) and ${input.commandsExecuted.length} command(s).`,
           score: customRes.outcome === "approve" ? 95 : 40,
           correctionCyclesRun: cycle,
@@ -876,6 +930,9 @@ export async function runPostImplementationEgmReview(
         outcome: "unavailable",
         reviewerAvailable: false,
         reviewerModel: "custom-reviewer-error",
+        reviewerProviderId,
+        reviewerEndpointUrl,
+        reviewerSessionId,
         comprehensionParaphrase: "Independent reviewer threw an exception during evaluation.",
         score: 0,
         correctionCyclesRun: cycle,
@@ -884,6 +941,7 @@ export async function runPostImplementationEgmReview(
           {
             id: "EGM-REVIEWER-ERR",
             severity: "MAJOR",
+            source: "goldfish_fresh_session",
             description: `Reviewer error: ${err instanceof Error ? err.message : String(err)}`,
             resolution: "ESCALATE",
           },
@@ -901,6 +959,9 @@ export async function runPostImplementationEgmReview(
       outcome: "unavailable",
       reviewerAvailable: false,
       reviewerModel: selectedReviewerModel,
+      reviewerProviderId,
+      reviewerEndpointUrl,
+      reviewerSessionId,
       comprehensionParaphrase: `Live Goldfish model required for "${input.originalRequirement.slice(0, 80)}", but no live endpoint was configured.`,
       score: 0,
       correctionCyclesRun: cycle,
@@ -925,6 +986,7 @@ export async function runPostImplementationEgmReview(
     findings.push({
       id: "EGM-EMPTY-RESPONSE",
       severity: "MAJOR",
+      source: "deterministic_static_check",
       description: "Assistant response is empty or truncated (< 10 chars).",
       resolution: "PROPOSE_FIX",
     });
@@ -945,6 +1007,9 @@ export async function runPostImplementationEgmReview(
     outcome,
     reviewerAvailable: true,
     reviewerModel: selectedReviewerModel,
+    reviewerProviderId,
+    reviewerEndpointUrl,
+    reviewerSessionId,
     comprehensionParaphrase: `Audited requirement "${input.originalRequirement.slice(0, 80)}" against ${allChangedFiles.length} modified file(s) and ${input.commandsExecuted.length} executed command(s).`,
     score,
     correctionCyclesRun: cycle,

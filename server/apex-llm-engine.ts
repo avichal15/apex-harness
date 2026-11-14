@@ -232,6 +232,7 @@ export async function callProviderEndpoint(options: {
       };
     }
 
+    const proto = options.protocol;
     let normalized: NormalizedProtocolTurn;
     if (rawText.trim().startsWith("data:") || rawText.includes("\ndata:")) {
       normalized =
@@ -380,12 +381,13 @@ export async function callUnifiedFleetWithFailover(options: {
     .replace(/^agy-acp\//, "")
     .replace(/^models\//, "");
 
-  if (options.preferredBaseUrl && !options.preferredBaseUrl.includes("local-gcm:")) {
-    const gwMatch = options.preferredBaseUrl.includes(":20128")
+  const effectivePreferredBaseUrl = options.preferredBaseUrl || process.env.OMNIROUTE_BASE_URL;
+  if (effectivePreferredBaseUrl && !effectivePreferredBaseUrl.includes("local-gcm:")) {
+    const gwMatch = effectivePreferredBaseUrl.includes(":20128")
       ? gateways.omniroute
-      : options.preferredBaseUrl.includes(":8765")
+      : effectivePreferredBaseUrl.includes(":8765")
         ? gateways.gemini_web
-        : options.preferredBaseUrl.includes(":3001")
+        : effectivePreferredBaseUrl.includes(":3001")
           ? gateways.freellmapi
           : undefined;
     const resolvedKey =
@@ -394,7 +396,7 @@ export async function callUnifiedFleetWithFailover(options: {
         : gwMatch?.default_api_key ?? "";
     attempts.push({
       gatewayName: "preferred",
-      baseUrl: options.preferredBaseUrl,
+      baseUrl: effectivePreferredBaseUrl,
       apiKey: resolvedKey,
       model: cleanModelId,
     });

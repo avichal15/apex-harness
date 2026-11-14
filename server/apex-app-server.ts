@@ -1477,6 +1477,11 @@ export function createApexAppServer() {
           selectedModelId?: string;
           effort?: "high" | "medium" | "low";
           mode?: "turbo" | "auto_edit" | "ask";
+          adaptiveTopology?: boolean;
+          reviewerEndpointUrl?: string;
+          reviewerProviderId?: string;
+          reviewerModelId?: string;
+          requireLiveGoldfishModel?: boolean;
         }>(req);
 
         const thread = conversations.find((c) => c.id === body.conversationId);
@@ -1621,9 +1626,11 @@ export function createApexAppServer() {
             mode: thread.mode,
             effort: thread.effort,
             isIndependent,
-            adaptiveTopology: Boolean(
-              (body as { adaptiveTopology?: boolean }).adaptiveTopology,
-            ),
+            adaptiveTopology: Boolean(body.adaptiveTopology),
+            reviewerEndpointUrl: body.reviewerEndpointUrl,
+            reviewerProviderId: body.reviewerProviderId,
+            reviewerModelId: body.reviewerModelId,
+            requireLiveGoldfishModel: body.requireLiveGoldfishModel,
             memorySnippet: buildGroundedMemoryPromptSnippet(APEX_DATA_DIR, {
               prompt: promptText,
               projectId: project.id,
