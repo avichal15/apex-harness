@@ -1051,6 +1051,7 @@ export interface ExecuteTaskDagOptions {
   reviewerEndpointUrl?: string;
   reviewerProviderId?: string;
   reviewerModelId?: string;
+  reviewerTimeoutMs?: number;
   requireLiveGoldfishModel?: boolean;
   enableSubagentScout?: boolean;
   parallelSubagentTasks?: readonly SubagentDelegationRequest[];
@@ -1809,6 +1810,7 @@ export async function executeTaskDag(
             reviewerEndpointUrl: resolvedReviewerEndpointUrl,
             reviewerSessionId: freshReviewerSessionId,
             requireLiveGoldfishModel: requireLiveGoldfish,
+            reviewerTimeoutMs: options.reviewerTimeoutMs,
             correctionCycle: cycleNum,
             simulateReviewerUnavailable: options.simulateReviewerUnavailable,
             signal: subSignal,
@@ -1907,7 +1909,7 @@ export async function executeTaskDag(
           events: appendNodeEvent(
             node.id,
             "completed",
-            `Outcome: ${postImplReview.outcome} (model=${postImplReview.reviewerModel}, session=${postImplReview.reviewerSessionId || "local"})`,
+            `Outcome: ${postImplReview.outcome} (model=${postImplReview.reviewerModel}, session=${postImplReview.reviewerSessionId || "local"}, timedOut=${Boolean(postImplReview.timedOut)}, cancelled=${Boolean(postImplReview.cancelled)})`,
           ),
         });
         notifyDag();

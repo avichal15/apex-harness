@@ -22,6 +22,7 @@ import { saveTurnCheckpoint } from "./apex-llm-engine.ts";
 import {
   buildExecutionDag,
   determineDagTopologyMode,
+  executeTaskDag,
   resolveProviderSecret,
   storeEncryptedProviderSecret,
 } from "./harness/agent-dag-orchestrator.ts";
@@ -48,9 +49,12 @@ import {
 } from "./harness/driver-registry.ts";
 import {
   runPostImplementationEgmReview,
+  scrubReviewerSecrets,
   selectIndependentGoldfishModel,
   validateEgmResolutionLedger,
+  validateGoldfishReviewerJson,
 } from "./harness/egm-boardroom.ts";
+import { TaskExecutionManager } from "./harness/execution-manager.ts";
 import {
   buildGroundedMemoryPromptSnippet,
   delegateParallelSubagentSwarm,
@@ -97,7 +101,7 @@ function makeTempDir(prefix = "apex-ref-int-") {
   return mkdtempSync(join(tmpdir(), prefix));
 }
 
-test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-01..V-09)", async (t) => {
+test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-01..V-11)", async (t) => {
   // ==========================================================================
   // V-01: Production Execution Spine & Adaptive DAG Topologies
   // ==========================================================================
@@ -1778,6 +1782,382 @@ test("Apex Harness — 8-Repository Reference Integration Verification Suite (V-
     } finally {
       sseServer.close();
       fencedGoldfish.close();
+      rmSync(tempDir, { recursive: true, force: true });
+    }
+  });
+
+  // ==========================================================================
+  // V-11: Production Gate Integrity (P0-1 12-case strict Goldfish schema validation, P0-2 outbound secret redaction, P1-3 combined timeout + caller cancellation)
+  // ==========================================================================
+  await t.test("V-11: P0-1 strict Goldfish response validation (12 cases), P0-2 outbound secret redaction across commands/stdout/stderr/diffs/files, and P1-3 combined reviewer timeout + caller cancellation in direct & DAG paths", async () => {
+    const tempDir = makeTempDir("apex-v11-");
+    writeFileSync(
+      join(tempDir, "auth.ts"),
+      [
+        'export const GOOGLE_KEY = "AIzaSyD-GoogleSecretKey123456789012345";',
+        'export const GH_PAT = "github_pat_11AABBCCDDEEFF001122334455";',
+        "export function checkAuth(user: string): boolean { return Boolean(user); }",
+      ].join("\n"),
+      "utf8",
+    );
+
+    let nextStatus = 200;
+    let nextDelayMs = 0;
+    let nextContent = JSON.stringify({
+      outcome: "approve",
+      comprehensionParaphrase: "Verified auth.ts",
+      findings: [],
+    });
+    const capturedBodies = [];
+
+    const gfServer = http.createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        capturedBodies.push(body);
+        const respond = () => {
+          if (res.writableEnded) return;
+          res.writeHead(nextStatus, { "Content-Type": "application/json" });
+          if (nextStatus !== 200) {
+            res.end(JSON.stringify({ error: "Upstream reviewer error" }));
+            return;
+          }
+          res.end(
+            JSON.stringify({
+              choices: [{ message: { content: nextContent } }],
+            }),
+          );
+        };
+        if (nextDelayMs > 0) {
+          const timer = setTimeout(respond, nextDelayMs);
+          req.on("close", () => clearTimeout(timer));
+        } else {
+          respond();
+        }
+      });
+    });
+    await new Promise((r) => gfServer.listen(0, "127.0.0.1", r));
+    const gfPort = gfServer.address().port;
+    const endpointUrl = `http://127.0.0.1:${gfPort}/v1`;
+
+    const invokeCase = async (overrides = {}) =>
+      runPostImplementationEgmReview({
+        originalRequirement: "Verify checkAuth in auth.ts",
+        workspacePath: tempDir,
+        filesCreated: [],
+        filesModified: ["auth.ts"],
+        commandsExecuted: [
+          {
+            command: "npm test",
+            cwd: tempDir,
+            exitCode: 0,
+            durationMs: 35,
+            timedOut: false,
+            cancelled: false,
+            stdoutPreview: "1 passing",
+            stderrPreview: "",
+          },
+        ],
+        responseText: "Implemented checkAuth in auth.ts.",
+        reviewerEndpointUrl: endpointUrl,
+        requireLiveGoldfishModel: true,
+        ...overrides,
+      });
+
+    try {
+      // ----------------------------------------------------------------------
+      // P0-1: All 12 Reviewer Validation Cases
+      // ----------------------------------------------------------------------
+      // Case 1: Valid approval
+      nextStatus = 200;
+      nextDelayMs = 0;
+      nextContent = JSON.stringify({
+        outcome: "approve",
+        comprehensionParaphrase: "Valid approval",
+        findings: [],
+      });
+      const c1 = await invokeCase();
+      assert.equal(c1.outcome, "approve");
+      assert.equal(c1.reviewerAvailable, true);
+      assert.equal(c1.source, "goldfish_fresh_session");
+
+      // Case 2: Valid request_changes
+      nextContent = JSON.stringify({
+        outcome: "request_changes",
+        comprehensionParaphrase: "Missing null guard",
+        findings: [
+          {
+            id: "GF-1",
+            severity: "MAJOR",
+            file: "auth.ts",
+            description: "Handle empty whitespace usernames",
+            resolution: "PROPOSE_FIX",
+          },
+        ],
+      });
+      const c2 = await invokeCase();
+      assert.equal(c2.outcome, "request_changes");
+      assert.equal(c2.reviewerAvailable, true);
+      assert.ok(c2.findings.some((f) => f.id === "GF-1" && f.severity === "MAJOR"));
+
+      // Case 3: Valid decline
+      nextContent = JSON.stringify({
+        outcome: "decline",
+        comprehensionParaphrase: "Unsafe change",
+        findings: [
+          {
+            id: "GF-SEC-1",
+            severity: "BLOCKER",
+            description: "Rejecting unsafe authentication bypass",
+            resolution: "DECLINE",
+          },
+        ],
+      });
+      const c3 = await invokeCase();
+      assert.equal(c3.outcome, "decline");
+      assert.equal(c3.reviewerAvailable, true);
+
+      // Case 4: Valid escalate
+      nextContent = JSON.stringify({
+        outcome: "escalate",
+        comprehensionParaphrase: "Ambiguous spec",
+        findings: [
+          {
+            id: "GF-ESC-1",
+            severity: "MAJOR",
+            description: "Ambiguous session expiry requirement",
+            resolution: "ESCALATE",
+          },
+        ],
+      });
+      const c4 = await invokeCase();
+      assert.equal(c4.outcome, "escalate");
+      assert.equal(c4.reviewerAvailable, true);
+
+      // Case 5: Empty JSON `{}` -> MUST NOT approve!
+      nextContent = "{}";
+      const c5 = await invokeCase();
+      assert.equal(c5.outcome, "unavailable");
+      assert.equal(c5.reviewerAvailable, false);
+      assert.equal(c5.source, "unavailable");
+      assert.equal(c5.deterministicChecks?.length, 3);
+
+      // Case 6: JSON with no outcome -> MUST NOT approve!
+      nextContent = JSON.stringify({
+        comprehensionParaphrase: "Reviewed files",
+        findings: [],
+      });
+      const c6 = await invokeCase();
+      assert.equal(c6.outcome, "unavailable");
+      assert.equal(c6.reviewerAvailable, false);
+      assert.equal(c6.source, "unavailable");
+
+      // Case 7: Invalid outcome string -> MUST NOT approve!
+      nextContent = JSON.stringify({
+        outcome: "approved_with_nits",
+        comprehensionParaphrase: "Looks fine",
+        findings: [],
+      });
+      const c7 = await invokeCase();
+      assert.equal(c7.outcome, "unavailable");
+      assert.equal(c7.reviewerAvailable, false);
+
+      // Case 8: Missing findings field -> MUST NOT approve!
+      nextContent = JSON.stringify({
+        outcome: "approve",
+        comprehensionParaphrase: "Missing findings array",
+      });
+      const c8 = await invokeCase();
+      assert.equal(c8.outcome, "unavailable");
+      assert.equal(c8.reviewerAvailable, false);
+
+      // Case 9: Findings with invalid structure -> MUST NOT approve!
+      nextContent = JSON.stringify({
+        outcome: "approve",
+        comprehensionParaphrase: "Malformed finding item",
+        findings: [{ id: 123, severity: "CRITICAL_INVALID", description: "" }],
+      });
+      const c9 = await invokeCase();
+      assert.equal(c9.outcome, "unavailable");
+      assert.equal(c9.reviewerAvailable, false);
+      assert.equal(
+        validateGoldfishReviewerJson(
+          JSON.stringify({ outcome: "approve", findings: ["not-an-object"] }),
+        ).valid,
+        false,
+      );
+
+      // Case 10: Malformed JSON -> MUST NOT approve!
+      nextContent = '{"outcome": "approve", "findings": [unterminated';
+      const c10 = await invokeCase();
+      assert.equal(c10.outcome, "unavailable");
+      assert.equal(c10.reviewerAvailable, false);
+      assert.equal(c10.deterministicChecks?.length, 3);
+
+      // Case 11: Reviewer timeout -> MUST NOT approve!
+      nextDelayMs = 2000;
+      nextContent = JSON.stringify({ outcome: "approve", findings: [] });
+      const c11 = await invokeCase({ reviewerTimeoutMs: 100 });
+      nextDelayMs = 0;
+      assert.equal(c11.outcome, "unavailable");
+      assert.equal(c11.reviewerAvailable, false);
+      assert.equal(c11.timedOut, true);
+      assert.equal(c11.cancelled, false);
+      assert.equal(c11.deterministicChecks?.length, 3);
+
+      // Case 12: HTTP error (502 Bad Gateway) -> MUST NOT approve!
+      nextStatus = 502;
+      const c12 = await invokeCase();
+      nextStatus = 200;
+      assert.equal(c12.outcome, "unavailable");
+      assert.equal(c12.reviewerAvailable, false);
+      assert.equal(c12.deterministicChecks?.length, 3);
+
+      // ----------------------------------------------------------------------
+      // P0-2: Outbound Secret Redaction Across All Properties
+      // ----------------------------------------------------------------------
+      capturedBodies.length = 0;
+      nextContent = JSON.stringify({
+        outcome: "approve",
+        comprehensionParaphrase: "Checked redaction",
+        findings: [],
+      });
+
+      const rawSecrets = [
+        "sk-live-stdoutSecretKey1234567890",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secretBearerPayload",
+        "ghp_githubPersonalAccessToken9876543210",
+        "SuperSecretStderrPass99!",
+        "sk-proj-cmdArgSecret1234567890",
+        "CmdArgPassword123",
+        "UrlEmbeddedPass99",
+        "AIzaSyD-GoogleSecretKey123456789012345",
+        "github_pat_11AABBCCDDEEFF001122334455",
+        "ReqSecretToken12345678",
+        "DiffSecretPassword123456",
+      ];
+
+      const redactRes = await invokeCase({
+        originalRequirement: "Audit auth with token=ReqSecretToken12345678",
+        gitDiffSummary: '+const DB_PASSWORD = "DiffSecretPassword123456";',
+        commandsExecuted: [
+          {
+            command:
+              "curl --api-key sk-proj-cmdArgSecret1234567890 --password=CmdArgPassword123 https://admin:UrlEmbeddedPass99@internal.example.com/api",
+            cwd: tempDir,
+            exitCode: 0,
+            durationMs: 142,
+            timedOut: false,
+            cancelled: false,
+            stdoutPreview:
+              "Connected with key sk-live-stdoutSecretKey1234567890 and Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.secretBearerPayload",
+            stderrPreview:
+              "Warning: ghp_githubPersonalAccessToken9876543210 and password=SuperSecretStderrPass99!",
+          },
+        ],
+      });
+      assert.equal(redactRes.outcome, "approve");
+      assert.equal(capturedBodies.length, 1);
+      const sentPayloadStr = capturedBodies[0];
+
+      for (const secretVal of rawSecrets) {
+        assert.equal(
+          sentPayloadStr.includes(secretVal),
+          false,
+          `Outbound Goldfish payload leaked secret value: ${secretVal}`,
+        );
+      }
+      assert.ok(sentPayloadStr.includes("[REDACTED_SECRET]"));
+      const sentOuter = JSON.parse(sentPayloadStr);
+      const sentReviewPayload = JSON.parse(sentOuter.messages[1].content);
+      assert.equal(sentReviewPayload.commandsExecuted.length, 1);
+      assert.equal(sentReviewPayload.commandsExecuted[0].exitCode, 0);
+      assert.equal(sentReviewPayload.commandsExecuted[0].durationMs, 142);
+      assert.equal(sentReviewPayload.commandsExecuted[0].timedOut, false);
+      assert.equal(sentReviewPayload.commandsExecuted[0].cancelled, false);
+      assert.ok(sentReviewPayload.commandsExecuted[0].command.includes("[REDACTED_SECRET]"));
+      assert.ok(sentReviewPayload.commandsExecuted[0].stdoutPreview.includes("[REDACTED_SECRET]"));
+      assert.ok(sentReviewPayload.commandsExecuted[0].stderrPreview.includes("[REDACTED_SECRET]"));
+      assert.ok(sentReviewPayload.originalRequirement.includes("[REDACTED_SECRET]"));
+      assert.ok(sentReviewPayload.gitDiffSummary.includes("[REDACTED_SECRET]"));
+      assert.ok(sentReviewPayload.changedFilesContent["auth.ts"].includes("[REDACTED_SECRET]"));
+      assert.equal(scrubReviewerSecrets("Bearer mySecretBearerToken12345"), "Bearer [REDACTED_SECRET]");
+
+      // ----------------------------------------------------------------------
+      // P1-3: Reviewer Timeout vs Caller Cancellation (Direct + Production DAG)
+      // ----------------------------------------------------------------------
+      // 1. Direct call where caller supplies an active (non-aborted) AbortSignal, and reviewer hangs
+      const nonAbortedCallerCtrl = new AbortController();
+      nextDelayMs = 3000;
+      const tStart = Date.now();
+      const timeoutWithCallerSignalRes = await invokeCase({
+        signal: nonAbortedCallerCtrl.signal,
+        reviewerTimeoutMs: 120,
+      });
+      const elapsedTimeoutMs = Date.now() - tStart;
+      nextDelayMs = 0;
+      assert.ok(
+        elapsedTimeoutMs < 1500,
+        `Expected reviewer timeout to fire even when caller signal is provided (took ${elapsedTimeoutMs}ms)`,
+      );
+      assert.equal(timeoutWithCallerSignalRes.outcome, "unavailable");
+      assert.equal(timeoutWithCallerSignalRes.reviewerAvailable, false);
+      assert.equal(timeoutWithCallerSignalRes.timedOut, true);
+      assert.equal(timeoutWithCallerSignalRes.cancelled, false);
+
+      // 2. Direct call where caller aborts at 60ms while reviewer timeout is 5000ms
+      const callerAbortCtrl = new AbortController();
+      setTimeout(() => callerAbortCtrl.abort(), 60);
+      nextDelayMs = 3000;
+      const callerCancelledRes = await invokeCase({
+        signal: callerAbortCtrl.signal,
+        reviewerTimeoutMs: 5000,
+      });
+      nextDelayMs = 0;
+      assert.equal(callerCancelledRes.outcome, "unavailable");
+      assert.equal(callerCancelledRes.reviewerAvailable, false);
+      assert.equal(callerCancelledRes.timedOut, false);
+      assert.equal(callerCancelledRes.cancelled, true);
+      assert.ok(callerCancelledRes.summary.includes("cancelled by caller signal"));
+
+      // 3. Production executeTaskDag path: Critic timeout fires even when subSignal is active
+      const execMgr = new TaskExecutionManager(tempDir);
+      const { record } = execMgr.createExecution({
+        conversationId: "conv-v11-dag-timeout",
+        projectId: "proj-v11",
+        workspaceRoot: tempDir,
+        requirement: "Implement checkAuth in auth.ts and run tests",
+      });
+      nextDelayMs = 3000;
+      const dagTimeoutRes = await executeTaskDag({
+        executionManager: execMgr,
+        executionId: record.executionId,
+        dataDir: tempDir,
+        workspaceRoot: tempDir,
+        prompt: "Implement checkAuth in auth.ts and run tests",
+        conversationHistory: [],
+        effort: "low",
+        reviewerEndpointUrl: endpointUrl,
+        reviewerTimeoutMs: 140,
+        requireLiveGoldfishModel: true,
+        customBuilderFn: async () => ({
+          responseText: "Updated auth.ts cleanly.",
+          filesModified: ["auth.ts"],
+        }),
+      });
+      nextDelayMs = 0;
+      assert.equal(dagTimeoutRes.postImplReview.outcome, "unavailable");
+      assert.equal(dagTimeoutRes.postImplReview.reviewerAvailable, false);
+      assert.equal(dagTimeoutRes.postImplReview.timedOut, true);
+      assert.equal(dagTimeoutRes.postImplReview.cancelled, false);
+      assert.equal(dagTimeoutRes.completionReport.status, "implemented_not_verified");
+      assert.ok(
+        dagTimeoutRes.completionReport.remainingIssues.some((i) =>
+          i.includes("Independent EGM reviewer timed out"),
+        ),
+      );
+    } finally {
+      gfServer.close();
       rmSync(tempDir, { recursive: true, force: true });
     }
   });

@@ -455,6 +455,7 @@ export interface PostImplReviewInput {
   explicitLinterErrors?: readonly string[];
   correctionCycle?: number;
   simulateReviewerUnavailable?: boolean;
+  reviewerTimeoutMs?: number;
   customReviewerFn?: (context: {
     requirement: string;
     changedFilesContent: Record<string, string>;
@@ -561,6 +562,218 @@ export function validateEgmResolutionLedger(
   return {
     valid: violations.length === 0,
     violations,
+  };
+}
+
+const VALID_GOLDFISH_DECISION_OUTCOMES = new Set<PostImplReviewOutcome>([
+  "approve",
+  "request_changes",
+  "escalate",
+  "decline",
+]);
+
+const VALID_GOLDFISH_FINDING_SEVERITIES = new Set(["BLOCKER", "MAJOR", "NIT"]);
+const VALID_GOLDFISH_FINDING_RESOLUTIONS = new Set<EgmResolutionAction>([
+  "PROPOSE_FIX",
+  "CONTEST",
+  "ESCALATE",
+  "DECLINE",
+]);
+
+/**
+ * Redacts credentials, API keys, bearer tokens, GitHub PATs, URL credentials, and password/secret assignments
+ * before any payload is serialized or transmitted to an external Goldfish reviewer.
+ */
+export function scrubReviewerSecrets(text: string): string {
+  if (!text) return "";
+  return String(text)
+    .replace(
+      /\b(sk-(?:proj-|ant-|live-|test-)?[a-zA-Z0-9_-]{10,}|AIza[0-9A-Za-z_-]{20,}|AKIA[0-9A-Z]{16}|gh[pousr]_[A-Za-z0-9_]{12,}|github_pat_[A-Za-z0-9_]{16,}|xox[baprs]-[A-Za-z0-9-]{10,}|rk_(?:live|test)_[A-Za-z0-9]{10,})\b/g,
+      "[REDACTED_SECRET]",
+    )
+    .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, "$1[REDACTED_SECRET]")
+    .replace(/(Basic\s+)[A-Za-z0-9+/=]{8,}/gi, "$1[REDACTED_SECRET]")
+    .replace(/(https?:\/\/[^/\s:@]+:)[^/\s@]+(@)/gi, "$1[REDACTED_SECRET]$2")
+    .replace(
+      /((?:--?(?:api[-_]?key|secret[-_]?key|client[-_]?secret|access[-_]?token|auth[-_]?token|secret|password|passwd|token)\b\s*(?:[:=]|\s+)\s*["']?))[^\s"',;}{]+/gi,
+      "$1[REDACTED_SECRET]",
+    )
+    .replace(
+      /(\b(?:[A-Z0-9_]*?(?:API_KEY|SECRET_KEY|ACCESS_TOKEN|AUTH_TOKEN|CLIENT_SECRET|PASSWORD|PASSWD|PRIVATE_KEY|SECRET|TOKEN)|api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|password|passwd|secret|token)\s*[:=]\s*["']?)[^\s"',;}{]{6,}/gi,
+      "$1[REDACTED_SECRET]",
+    );
+}
+
+/**
+ * Strictly validates the JSON response returned by an independent Goldfish reviewer before
+ * setting `reviewerAvailable: true` or accepting any review verdict.
+ */
+export function validateGoldfishReviewerJson(rawContent: unknown):
+  | {
+      valid: true;
+      outcome: Exclude<PostImplReviewOutcome, "unavailable">;
+      comprehensionParaphrase?: string;
+      summary?: string;
+      findings: PostImplReviewReport["findings"];
+    }
+  | {
+      valid: false;
+      reason: string;
+    } {
+  if (typeof rawContent !== "string" || !rawContent.trim()) {
+    return { valid: false, reason: "Reviewer response content is empty or non-string." };
+  }
+
+  const withoutThink = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  const fencedMatch = withoutThink.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const jsonCandidate = (fencedMatch ? fencedMatch[1] : withoutThink).trim();
+  if (!jsonCandidate.startsWith("{") || !jsonCandidate.endsWith("}")) {
+    return {
+      valid: false,
+      reason: "Reviewer response is not a complete JSON object.",
+    };
+  }
+
+  let parsedUnknown: unknown;
+  try {
+    parsedUnknown = JSON.parse(jsonCandidate);
+  } catch (err) {
+    return {
+      valid: false,
+      reason: `Malformed reviewer JSON: ${(err as Error).message}`,
+    };
+  }
+
+  if (
+    typeof parsedUnknown !== "object" ||
+    parsedUnknown === null ||
+    Array.isArray(parsedUnknown)
+  ) {
+    return { valid: false, reason: "Reviewer JSON root must be an object." };
+  }
+
+  const parsed = parsedUnknown as Record<string, unknown>;
+  if (typeof parsed.outcome !== "string" || ! parsed.outcome.trim()) {
+    return {
+      valid: false,
+      reason: "Missing required 'outcome' field in reviewer JSON.",
+    };
+  }
+
+  if (!VALID_GOLDFISH_DECISION_OUTCOMES.has(parsed.outcome as PostImplReviewOutcome)) {
+    return {
+      valid: false,
+      reason: `Unsupported reviewer outcome '${parsed.outcome}'; must be approve | request_changes | escalate | decline.`,
+    };
+  }
+
+  if (!Array.isArray(parsed.findings)) {
+    return {
+      valid: false,
+      reason: "Missing or non-array 'findings' field in reviewer JSON.",
+    };
+  }
+
+  const validatedFindings: PostImplReviewReport["findings"] = [];
+  for (let idx = 0; idx < parsed.findings.length; idx++) {
+    const item = parsed.findings[idx];
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      return {
+        valid: false,
+        reason: `Invalid finding at findings[${idx}]: expected object.`,
+      };
+    }
+    const fObj = item as Record<string, unknown>;
+    if (
+      typeof fObj.severity !== "string" ||
+      !VALID_GOLDFISH_FINDING_SEVERITIES.has(fObj.severity)
+    ) {
+      return {
+        valid: false,
+        reason: `Invalid finding at findings[${idx}]: 'severity' must be BLOCKER | MAJOR | NIT.`,
+      };
+    }
+    if (typeof fObj.description !== "string" || !fObj.description.trim()) {
+      return {
+        valid: false,
+        reason: `Invalid finding at findings[${idx}]: 'description' must be a non-empty string.`,
+      };
+    }
+    if (fObj.id !== undefined && (typeof fObj.id !== "string" || !fObj.id.trim())) {
+      return {
+        valid: false,
+        reason: `Invalid finding at findings[${idx}]: 'id' must be a non-empty string when provided.`,
+      };
+    }
+    if (fObj.file !== undefined && typeof fObj.file !== "string") {
+      return {
+        valid: false,
+        reason: `Invalid finding at findings[${idx}]: 'file' must be a string when provided.`,
+      };
+    }
+    if (
+      fObj.line !== undefined &&
+      (typeof fObj.line !== "number" || !Number.isFinite(fObj.line))
+    ) {
+      return {
+        valid: false,
+        reason: `Invalid finding at findings[${idx}]: 'line' must be a finite number when provided.`,
+      };
+    }
+    if (
+      fObj.resolution !== undefined &&
+      (typeof fObj.resolution !== "string" ||
+        !VALID_GOLDFISH_FINDING_RESOLUTIONS.has(fObj.resolution as EgmResolutionAction))
+    ) {
+      return {
+        valid: false,
+        reason: `Invalid finding at findings[${idx}]: 'resolution' must be PROPOSE_FIX | CONTEST | ESCALATE | DECLINE.`,
+      };
+    }
+
+    validatedFindings.push({
+      id: typeof fObj.id === "string" ? fObj.id.trim() : `GF-FINDING-${idx + 1}`,
+      severity: fObj.severity as "BLOCKER" | "MAJOR" | "NIT",
+      ...(typeof fObj.file === "string" ? { file: fObj.file } : {}),
+      ...(typeof fObj.line === "number" ? { line: fObj.line } : {}),
+      source: "goldfish_fresh_session",
+      description: fObj.description.trim(),
+      resolution:
+        typeof fObj.resolution === "string"
+          ? (fObj.resolution as EgmResolutionAction)
+          : "PROPOSE_FIX",
+    });
+  }
+
+  if (
+    parsed.comprehensionParaphrase !== undefined &&
+    typeof parsed.comprehensionParaphrase !== "string"
+  ) {
+    return {
+      valid: false,
+      reason: "Invalid 'comprehensionParaphrase' field: must be a string when provided.",
+    };
+  }
+  if (parsed.summary !== undefined && typeof parsed.summary !== "string") {
+    return {
+      valid: false,
+      reason: "Invalid 'summary' field: must be a string when provided.",
+    };
+  }
+
+  return {
+    valid: true,
+    outcome: parsed.outcome as Exclude<PostImplReviewOutcome, "unavailable">,
+    comprehensionParaphrase:
+      typeof parsed.comprehensionParaphrase === "string" &&
+      parsed.comprehensionParaphrase.trim()
+        ? parsed.comprehensionParaphrase.trim()
+        : undefined,
+    summary:
+      typeof parsed.summary === "string" && parsed.summary.trim()
+        ? parsed.summary.trim()
+        : undefined,
+    findings: validatedFindings,
   };
 }
 
@@ -694,7 +907,7 @@ export async function runPostImplementationEgmReview(
         id: `EGM-CMD-FAIL-${findings.length + 1}`,
         severity: "BLOCKER",
         source: "deterministic_static_check",
-        description: `Command "${cmd.command}" failed (exit=${cmd.exitCode ?? "null"}, timedOut=${cmd.timedOut}, cancelled=${cmd.cancelled}).`,
+        description: `Command "${scrubReviewerSecrets(cmd.command)}" failed (exit=${cmd.exitCode ?? "null"}, timedOut=${cmd.timedOut}, cancelled=${cmd.cancelled}).`,
         resolution: "PROPOSE_FIX",
       });
     }
@@ -706,7 +919,7 @@ export async function runPostImplementationEgmReview(
         id: `EGM-TEST-FAIL-${findings.length + 1}`,
         severity: "BLOCKER",
         source: "deterministic_static_check",
-        description: `Test suite failure: ${tf.trim()}`,
+        description: `Test suite failure: ${scrubReviewerSecrets(tf.trim())}`,
         resolution: "PROPOSE_FIX",
       });
     }
@@ -718,7 +931,7 @@ export async function runPostImplementationEgmReview(
         id: `EGM-LINT-FAIL-${findings.length + 1}`,
         severity: "MAJOR",
         source: "deterministic_static_check",
-        description: `Linter/compiler error: ${le.trim()}`,
+        description: `Linter/compiler error: ${scrubReviewerSecrets(le.trim())}`,
         resolution: "PROPOSE_FIX",
       });
     }
@@ -742,29 +955,65 @@ export async function runPostImplementationEgmReview(
     },
   ];
 
+  const scrubbedChangedFilesContent: Record<string, string> = {};
+  for (const [k, v] of Object.entries(changedFilesContent)) {
+    scrubbedChangedFilesContent[scrubReviewerSecrets(k)] = scrubReviewerSecrets(v);
+  }
+
+  const sanitizedCommandsExecuted: ExecutedCommandEvidence[] = input.commandsExecuted.map((cmd) => ({
+    command: scrubReviewerSecrets(cmd.command),
+    cwd: scrubReviewerSecrets(cmd.cwd || "."),
+    exitCode: cmd.exitCode,
+    durationMs: cmd.durationMs,
+    timedOut: Boolean(cmd.timedOut),
+    cancelled: Boolean(cmd.cancelled),
+    stdoutPreview: scrubReviewerSecrets(cmd.stdoutPreview ?? "").slice(0, 240),
+    stderrPreview: scrubReviewerSecrets(cmd.stderrPreview ?? "").slice(0, 240),
+  }));
+
+  const sanitizedDeterministicChecks = deterministicChecks.map((dc) => ({
+    check: dc.check,
+    passed: dc.passed,
+    ...(dc.detail ? { detail: scrubReviewerSecrets(dc.detail) } : {}),
+  }));
+
   // If reviewerEndpointUrl is provided, invoke the independent Goldfish HTTP reviewer with ONLY fresh-context payload
   if (reviewerEndpointUrl) {
-    try {
-      const scrubReviewerSecrets = (text: string): string =>
-        text
-          .replace(/\b(sk-[a-zA-Z0-9_-]{12,}|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{16,})\b/g, "[REDACTED_SECRET]")
-          .replace(/(Bearer\s+)[A-Za-z0-9._~+/=-]{12,}/gi, "$1[REDACTED_SECRET]")
-          .replace(/((?:api[_-]?key|secret|password|token)\s*[:=]\s*["']?)[^\s"',;]{8,}/gi, "$1[REDACTED_SECRET]");
+    const effectiveTimeoutMs = input.reviewerTimeoutMs ?? 30_000;
+    const requestController = new AbortController();
+    let timedOut = false;
+    let callerCancelled = Boolean(input.signal?.aborted);
 
-      const scrubbedChangedFilesContent: Record<string, string> = {};
-      for (const [k, v] of Object.entries(changedFilesContent)) {
-        scrubbedChangedFilesContent[k] = scrubReviewerSecrets(v);
+    const onCallerAbort = () => {
+      callerCancelled = true;
+      requestController.abort(new Error("Caller aborted Goldfish review"));
+    };
+
+    if (callerCancelled) {
+      requestController.abort(new Error("Caller aborted Goldfish review"));
+    } else if (input.signal) {
+      input.signal.addEventListener("abort", onCallerAbort, { once: true });
+    }
+
+    const timeoutHandle = setTimeout(() => {
+      if (!callerCancelled) {
+        timedOut = true;
+        requestController.abort(
+          new Error(`Goldfish reviewer timed out after ${effectiveTimeoutMs}ms`),
+        );
       }
+    }, effectiveTimeoutMs);
 
+    try {
       const freshContextPrompt = JSON.stringify({
         reviewerSessionId,
         originalRequirement: scrubReviewerSecrets(input.originalRequirement),
-        filesCreated: input.filesCreated,
-        filesModified: input.filesModified,
+        filesCreated: input.filesCreated.map((f) => scrubReviewerSecrets(f)),
+        filesModified: input.filesModified.map((f) => scrubReviewerSecrets(f)),
         changedFilesContent: scrubbedChangedFilesContent,
         gitDiffSummary: scrubReviewerSecrets(input.gitDiffSummary ?? ""),
-        commandsExecuted: input.commandsExecuted,
-        deterministicChecks,
+        commandsExecuted: sanitizedCommandsExecuted,
+        deterministicChecks: sanitizedDeterministicChecks,
         independentContextVerified: true,
       });
       const cleanEndpoint = reviewerEndpointUrl.replace(/\/+$/, "");
@@ -780,7 +1029,7 @@ export async function runPostImplementationEgmReview(
             {
               role: "system",
               content:
-                "You are a stateless Goldfish Post-Implementation Reviewer. Return ONLY valid JSON: {\"outcome\":\"approve\"|\"request_changes\"|\"decline\",\"comprehensionParaphrase\":\"...\",\"findings\":[]}",
+                "You are a stateless Goldfish Post-Implementation Reviewer. Return ONLY valid JSON: {\"outcome\":\"approve\"|\"request_changes\"|\"escalate\"|\"decline\",\"comprehensionParaphrase\":\"...\",\"findings\":[]}",
             },
             {
               role: "user",
@@ -788,12 +1037,14 @@ export async function runPostImplementationEgmReview(
             },
           ],
         }),
-        signal: input.signal ?? AbortSignal.timeout(30_000),
+        signal: requestController.signal,
       });
       if (!resp.ok) {
         return {
           outcome: "unavailable",
           reviewerAvailable: false,
+          timedOut: false,
+          cancelled: false,
           reviewerModel: selectedReviewerModel,
           reviewerProviderId,
           reviewerEndpointUrl,
@@ -809,58 +1060,103 @@ export async function runPostImplementationEgmReview(
         };
       }
       const data = (await resp.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
+        choices?: Array<{ message?: { content?: unknown } }>;
       };
-      const rawContent = data.choices?.[0]?.message?.content ?? "{}";
-      const withoutThink = rawContent.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-      const fencedMatch = withoutThink.match(/```(?:json)?\s*([\s\S]*?)```/i);
-      let jsonCandidate = fencedMatch?.[1]?.trim() ?? withoutThink;
-      const firstBrace = jsonCandidate.indexOf("{");
-      const lastBrace = jsonCandidate.lastIndexOf("}");
-      if (firstBrace !== -1 && lastBrace > firstBrace) {
-        jsonCandidate = jsonCandidate.slice(firstBrace, lastBrace + 1);
+      const rawContent = data.choices?.[0]?.message?.content;
+      const validation = validateGoldfishReviewerJson(rawContent);
+      if (!validation.valid) {
+        return {
+          outcome: "unavailable",
+          reviewerAvailable: false,
+          timedOut: false,
+          cancelled: false,
+          reviewerModel: selectedReviewerModel,
+          reviewerProviderId,
+          reviewerEndpointUrl,
+          reviewerSessionId,
+          comprehensionParaphrase: `Independent HTTP Goldfish reviewer returned an invalid response: ${validation.reason}`,
+          score: 0,
+          correctionCyclesRun: cycle,
+          findings,
+          deterministicChecks,
+          source: "unavailable",
+          independentContextVerified: true,
+          summary: `Goldfish reviewer response failed schema validation (${validation.reason}) — refusing automatic approval.`,
+        };
       }
-      const parsed = JSON.parse(jsonCandidate) as {
-        outcome?: PostImplReviewOutcome;
-        comprehensionParaphrase?: string;
-        findings?: PostImplReviewReport["findings"];
-        summary?: string;
-      };
-      if (parsed.findings) {
-        for (const gf of parsed.findings) {
-          findings.push({
-            ...gf,
-            source: gf.source ?? "goldfish_fresh_session",
-          });
-        }
-      }
+
+      findings.push(...validation.findings);
       const finalOutcome =
         findings.some((f) => f.severity === "BLOCKER" || f.severity === "MAJOR") &&
-        parsed.outcome === "approve"
+        validation.outcome === "approve"
           ? "request_changes"
-          : parsed.outcome ?? "approve";
+          : validation.outcome;
       return {
         outcome: finalOutcome,
         reviewerAvailable: true,
+        timedOut: false,
+        cancelled: false,
         reviewerModel: selectedReviewerModel,
         reviewerProviderId,
         reviewerEndpointUrl,
         reviewerSessionId,
         comprehensionParaphrase:
-          parsed.comprehensionParaphrase ??
-          `Fresh-context Goldfish review of "${input.originalRequirement.slice(0, 80)}".`,
+          validation.comprehensionParaphrase ??
+          `Fresh-context Goldfish review of "${scrubReviewerSecrets(input.originalRequirement).slice(0, 80)}".`,
         score: finalOutcome === "approve" ? 96 : 45,
         correctionCyclesRun: cycle,
         findings,
         deterministicChecks,
         source: "goldfish_fresh_session",
         independentContextVerified: true,
-        summary: parsed.summary ?? `Fresh-session Goldfish review outcome: ${finalOutcome}`,
+        summary: validation.summary ?? `Fresh-session Goldfish review outcome: ${finalOutcome}`,
       };
     } catch (err) {
+      if (callerCancelled || input.signal?.aborted) {
+        return {
+          outcome: "unavailable",
+          reviewerAvailable: false,
+          timedOut: false,
+          cancelled: true,
+          reviewerModel: selectedReviewerModel,
+          reviewerProviderId,
+          reviewerEndpointUrl,
+          reviewerSessionId,
+          comprehensionParaphrase: "Independent HTTP Goldfish review was cancelled by caller signal.",
+          score: 0,
+          correctionCyclesRun: cycle,
+          findings,
+          deterministicChecks,
+          source: "unavailable",
+          independentContextVerified: true,
+          summary: "Goldfish review cancelled by caller signal — refusing to default to approval.",
+        };
+      }
+      if (timedOut) {
+        return {
+          outcome: "unavailable",
+          reviewerAvailable: false,
+          timedOut: true,
+          cancelled: false,
+          reviewerModel: selectedReviewerModel,
+          reviewerProviderId,
+          reviewerEndpointUrl,
+          reviewerSessionId,
+          comprehensionParaphrase: `Independent HTTP Goldfish reviewer timed out after ${effectiveTimeoutMs}ms.`,
+          score: 0,
+          correctionCyclesRun: cycle,
+          findings,
+          deterministicChecks,
+          source: "unavailable",
+          independentContextVerified: true,
+          summary: `Goldfish reviewer timed out after ${effectiveTimeoutMs}ms — refusing to default to approval.`,
+        };
+      }
       return {
         outcome: "unavailable",
         reviewerAvailable: false,
+        timedOut: false,
+        cancelled: false,
         reviewerModel: selectedReviewerModel,
         reviewerProviderId,
         reviewerEndpointUrl,
@@ -874,6 +1170,11 @@ export async function runPostImplementationEgmReview(
         independentContextVerified: true,
         summary: `Goldfish reviewer unreachable (${(err as Error).message}) — refusing to default to approval.`,
       };
+    } finally {
+      clearTimeout(timeoutHandle);
+      if (input.signal) {
+        input.signal.removeEventListener("abort", onCallerAbort);
+      }
     }
   }
 
@@ -881,11 +1182,11 @@ export async function runPostImplementationEgmReview(
   if (input.customReviewerFn) {
     try {
       const customRes = await input.customReviewerFn({
-        requirement: input.originalRequirement,
-        changedFilesContent,
-        gitDiffSummary: input.gitDiffSummary,
-        commands: input.commandsExecuted,
-        responseText: input.responseText,
+        requirement: scrubReviewerSecrets(input.originalRequirement),
+        changedFilesContent: scrubbedChangedFilesContent,
+        gitDiffSummary: scrubReviewerSecrets(input.gitDiffSummary ?? ""),
+        commands: sanitizedCommandsExecuted,
+        responseText: scrubReviewerSecrets(input.responseText),
         independentContextVerified: true,
       });
 
@@ -917,6 +1218,29 @@ export async function runPostImplementationEgmReview(
         };
       }
 
+      if (
+        !customRes.outcome ||
+        !VALID_GOLDFISH_DECISION_OUTCOMES.has(customRes.outcome) ||
+        (customRes.findings !== undefined && !Array.isArray(customRes.findings))
+      ) {
+        return {
+          outcome: "unavailable",
+          reviewerAvailable: false,
+          reviewerModel: customRes.model ?? selectedReviewerModel,
+          reviewerProviderId,
+          reviewerEndpointUrl,
+          reviewerSessionId,
+          comprehensionParaphrase: "Custom independent reviewer returned an invalid or missing outcome.",
+          score: 0,
+          correctionCyclesRun: cycle,
+          findings,
+          deterministicChecks,
+          source: "unavailable",
+          independentContextVerified: true,
+          summary: "Custom reviewer response rejected by schema validation — refusing automatic approval.",
+        };
+      }
+
       if (customRes.findings) {
         for (const cf of customRes.findings) {
           findings.push({
@@ -926,24 +1250,22 @@ export async function runPostImplementationEgmReview(
         }
       }
 
-      if (customRes.outcome) {
-        return {
-          outcome: customRes.outcome,
-          reviewerAvailable: true,
-          reviewerModel: customRes.model ?? selectedReviewerModel,
-          reviewerProviderId,
-          reviewerEndpointUrl,
-          reviewerSessionId,
-          comprehensionParaphrase: `Audited "${input.originalRequirement.slice(0, 80)}" across ${allChangedFiles.length} changed file(s) and ${input.commandsExecuted.length} command(s).`,
-          score: customRes.outcome === "approve" ? 95 : 40,
-          correctionCyclesRun: cycle,
-          findings,
-          deterministicChecks,
-          source: "goldfish_fresh_session",
-          independentContextVerified: true,
-          summary: customRes.summary ?? `Independent review returned ${customRes.outcome}.`,
-        };
-      }
+      return {
+        outcome: customRes.outcome,
+        reviewerAvailable: true,
+        reviewerModel: customRes.model ?? selectedReviewerModel,
+        reviewerProviderId,
+        reviewerEndpointUrl,
+        reviewerSessionId,
+        comprehensionParaphrase: `Audited "${scrubReviewerSecrets(input.originalRequirement).slice(0, 80)}" across ${allChangedFiles.length} changed file(s) and ${input.commandsExecuted.length} command(s).`,
+        score: customRes.outcome === "approve" ? 95 : 40,
+        correctionCyclesRun: cycle,
+        findings,
+        deterministicChecks,
+        source: "goldfish_fresh_session",
+        independentContextVerified: true,
+        summary: customRes.summary ?? `Independent review returned ${customRes.outcome}.`,
+      };
     } catch (err) {
       return {
         outcome: "unavailable",

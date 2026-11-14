@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   apex-verification:
-    name: Apex Harness 39-Test Suite (${{ matrix.os }})
+    name: Apex Harness 41-Test Verification Suite (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
     strategy:
@@ -29,9 +29,11 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
-      - name: Run Apex Harness Security, Engineering & 8-Repo Reference Integration Suite
+      - name: Run oxlint --deny-warnings Static Verification
+        run: npx --yes oxlint --deny-warnings server scripts shared electron
+      - name: Run Apex Harness 41-Test Security, Engineering & 8-Repo Reference Integration Suite
         run: node --experimental-strip-types --test server/apex-harness.node-test.mjs server/apex-master-verification.node-test.mjs server/apex-reference-integration.node-test.mjs
-      - name: Run Apex Desktop Packaging & Path-With-Spaces Smoke Test
+      - name: Run Apex Desktop Staged Layout & Path-With-Spaces Backend Smoke Test
         run: node scripts/smoke-apex-desktop.mjs
       - name: Run Harness² Python Substrate Check
         run: python -c "import sys; sys.path.insert(0, 'harness2'); import apex_maus_substrate as s; r = s.validate_all_surfaces(); assert r['valid'], r; print('Harness2 surfaces valid:', r['surface_count'])"

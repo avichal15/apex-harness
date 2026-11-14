@@ -414,8 +414,18 @@ export function buildCompletionEvidenceReport(input: {
     }
   }
 
-  if (!input.egmReview.reviewerAvailable || input.egmReview.outcome === "unavailable") {
-    remainingIssues.push("Independent EGM reviewer was unavailable; task cannot be marked verified by reviewer.");
+  if (input.egmReview.cancelled) {
+    remainingIssues.push(
+      "Independent EGM review was cancelled by caller signal; task cannot be marked verified by reviewer.",
+    );
+  } else if (input.egmReview.timedOut) {
+    remainingIssues.push(
+      "Independent EGM reviewer timed out; task cannot be marked verified by reviewer.",
+    );
+  } else if (!input.egmReview.reviewerAvailable || input.egmReview.outcome === "unavailable") {
+    remainingIssues.push(
+      "Independent EGM reviewer was unavailable; task cannot be marked verified by reviewer.",
+    );
   }
 
   const agentsInvolved = [...new Set(input.subtasks.map((s) => s.role))] as AgentOfficeRole[];

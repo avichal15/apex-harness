@@ -149,6 +149,8 @@ export type PostImplReviewOutcome =
 export interface PostImplReviewReport {
   outcome: PostImplReviewOutcome;
   reviewerAvailable: boolean;
+  timedOut?: boolean;
+  cancelled?: boolean;
   reviewerModel: string;
   reviewerProviderId?: string;
   reviewerEndpointUrl?: string;
