@@ -1,6 +1,7 @@
 // End-to-End Automated Verification Suite for Apex-Harness (Phases 1-8).
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
@@ -88,42 +89,162 @@ test("Phase 1: Unified Model Fleet loads models, redacts API keys on disk, and b
   assert.ok(sanitized.redactionsCount >= 3);
 });
 
-test("Phase 2: Universal Skill & MCP Loader discovers cross-IDE skills and transpiles tool aliases", () => {
-  const skills = discoverAllUniversalSkills({ workspaceRoot: APEX_PROJECT_ROOT });
-  assert.ok(skills.length >= 10, `Expected >= 10 universal skills, got ${skills.length}`);
+function createIsolatedSkillTestFixture(prefix = "apex-skill-fixture-") {
+  const root = mkdtempSync(join(tmpdir(), prefix));
+  const userHome = join(root, "home");
+  const workspaceRoot = join(root, "workspace");
 
-  const mcpServers = discoverAllUniversalMcpServers();
-  assert.ok(Array.isArray(mcpServers), "MCP server list must be an array");
-
-  const dummyClaudeSkill = {
-    id: "claude-code:skill:demo",
-    name: "demo-skill",
-    description: "Run Bash and Edit on $ARGUMENTS",
-    ecosystem: "claude-code",
-    kind: "skill",
-    sourcePath: join(APEX_PROJECT_ROOT, "SKILL.md"),
-    sensitiveDualUse: false,
-    sha256: "0".repeat(64),
-    rawBody: "Use `Bash` and `Edit` to inspect $ARGUMENTS.",
+  const writeSkill = (dirPath, name, description, body) => {
+    mkdirSync(dirPath, { recursive: true });
+    writeFileSync(
+      join(dirPath, "SKILL.md"),
+      `---\nname: ${name}\nversion: 1.0.0\ndescription: ${description}\n---\n\n# ${name}\n\n${body}\n`,
+      "utf8",
+    );
   };
 
-  const forAntigravity = transpileSkillForDriver(dummyClaudeSkill, "antigravity", "src/index.ts");
-  assert.ok(forAntigravity.includes("`run_command`"));
-  assert.ok(forAntigravity.includes("`edit_file`"));
-  assert.ok(forAntigravity.includes("src/index.ts"));
+  // Canonical winners in isolated Antigravity home fixture
+  writeSkill(
+    join(userHome, ".gemini", "config", "skills", "no-ai-slop"),
+    "no-ai-slop",
+    "Eliminate AI-slop filler and tighten technical prose.",
+    "Write direct technical prose with concrete evidence.",
+  );
+  writeSkill(
+    join(userHome, ".gemini", "config", "skills", "frontend-craft"),
+    "frontend-craft",
+    "Design and implement responsive React Vite dashboards and Stitch UI tokens.",
+    "Enforce intentional typography, layout tokens, and responsive geometry.",
+  );
+  writeSkill(
+    join(userHome, ".gemini", "config", "skills", "adversarial-review"),
+    "adversarial-review",
+    "Audit code diffs and security boundaries for concrete defects.",
+    "Report reproducible findings with exact file citations.",
+  );
+  writeSkill(
+    join(userHome, ".gemini", "config", "skills", "karpathy-guidelines"),
+    "karpathy-guidelines",
+    "Make surgical code changes and verify assumptions before coding.",
+    "Prefer minimal, direct code changes over speculative abstractions.",
+  );
+  writeSkill(
+    join(userHome, ".gemini", "config", "skills", "exhaustive-testing-architecture"),
+    "exhaustive-testing-architecture",
+    "Design deterministic automated test suites and negative security controls.",
+    "Synchronize tests on explicit events and verify artifacts deterministically.",
+  );
+  writeSkill(
+    join(userHome, ".gemini", "config", "skills", "pentest-wireless-audit"),
+    "pentest-wireless-audit",
+    "Execute red-team exploit and aircrack-ng wireless security audits.",
+    "Run offensive and defensive wireless penetration testing workflows.",
+  );
 
-  const forCodex = transpileSkillForDriver(dummyClaudeSkill, "codex", "src/index.ts");
-  assert.ok(forCodex.includes("`exec_command`"));
-  assert.ok(forCodex.includes("`apply_patch`"));
+  // Codex & Claude skills in isolated fixture
+  for (let i = 1; i <= 5; i++) {
+    writeSkill(
+      join(userHome, ".codex", "skills", `codex-eng-${i}`),
+      `codex-eng-${i}`,
+      `Codex engineering workflow skill ${i} for React Vite and TypeScript verification`,
+      `Execute surgical TypeScript verification step ${i} using exec_command and apply_patch.`,
+    );
+  }
 
-  const topK = selectTopKSkillsForTurn("Build a React Vite dashboard with Stitch design tokens", skills, {
-    topK: 4,
-    strictFirewall: true,
-    targetDriver: "antigravity",
-  });
-  assert.ok(topK.length > 0 && topK.length <= 4);
-  for (const item of topK) {
-    assert.equal(item.skill.sensitiveDualUse, false);
+  // Suppressed duplicates and repo-locked skills in workspace skills/deepseek fixture
+  writeSkill(
+    join(workspaceRoot, "skills", "deepseek", "dsh-prose-standard"),
+    "dsh-prose-standard",
+    "Duplicate prose skill from deepseek-harness",
+    "Suppressed prose body.",
+  );
+  writeSkill(
+    join(workspaceRoot, "skills", "deepseek", "dsh-trim-cot-leakage"),
+    "dsh-trim-cot-leakage",
+    "Duplicate CoT trimming skill from deepseek-harness",
+    "Suppressed CoT body.",
+  );
+  writeSkill(
+    join(workspaceRoot, "skills", "deepseek", "dsh-client-ui-ux"),
+    "dsh-client-ui-ux",
+    "Duplicate UI/UX skill from deepseek-harness",
+    "Suppressed UI body.",
+  );
+  writeSkill(
+    join(workspaceRoot, "skills", "deepseek", "dsh-archive-agent-notes"),
+    "dsh-archive-agent-notes",
+    "Repo-locked deepseek-harness skill",
+    "Excluded repo-locked body.",
+  );
+
+  // Deterministic .mcp.json in workspace fixture
+  mkdirSync(workspaceRoot, { recursive: true });
+  writeFileSync(
+    join(workspaceRoot, ".mcp.json"),
+    JSON.stringify({
+      mcpServers: {
+        "fixture-mcp": { command: "node", args: ["-e", "process.exit(0)"] },
+      },
+    }),
+    "utf8",
+  );
+
+  return {
+    root,
+    userHome,
+    workspaceRoot,
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
+}
+
+test("Phase 2: Universal Skill & MCP Loader discovers cross-IDE skills and transpiles tool aliases", () => {
+  const fixture = createIsolatedSkillTestFixture("apex-phase2-skills-");
+  try {
+    const skills = discoverAllUniversalSkills({
+      userHome: fixture.userHome,
+      workspaceRoot: fixture.workspaceRoot,
+    });
+    assert.ok(skills.length >= 10, `Expected >= 10 universal skills, got ${skills.length}`);
+
+    const mcpServers = discoverAllUniversalMcpServers({
+      userHome: fixture.userHome,
+      workspaceRoot: fixture.workspaceRoot,
+    });
+    assert.ok(Array.isArray(mcpServers), "MCP server list must be an array");
+    assert.ok(mcpServers.some((s) => s.name === "fixture-mcp"));
+
+    const dummyClaudeSkill = {
+      id: "claude-code:skill:demo",
+      name: "demo-skill",
+      description: "Run Bash and Edit on $ARGUMENTS",
+      ecosystem: "claude-code",
+      kind: "skill",
+      sourcePath: join(fixture.workspaceRoot, "SKILL.md"),
+      sensitiveDualUse: false,
+      sha256: "0".repeat(64),
+      rawBody: "Use `Bash` and `Edit` to inspect $ARGUMENTS.",
+    };
+
+    const forAntigravity = transpileSkillForDriver(dummyClaudeSkill, "antigravity", "src/index.ts");
+    assert.ok(forAntigravity.includes("`run_command`"));
+    assert.ok(forAntigravity.includes("`edit_file`"));
+    assert.ok(forAntigravity.includes("src/index.ts"));
+
+    const forCodex = transpileSkillForDriver(dummyClaudeSkill, "codex", "src/index.ts");
+    assert.ok(forCodex.includes("`exec_command`"));
+    assert.ok(forCodex.includes("`apply_patch`"));
+
+    const topK = selectTopKSkillsForTurn("Build a React Vite dashboard with Stitch design tokens", skills, {
+      topK: 4,
+      strictFirewall: true,
+      targetDriver: "antigravity",
+    });
+    assert.ok(topK.length > 0 && topK.length <= 4);
+    for (const item of topK) {
+      assert.equal(item.skill.sensitiveDualUse, false);
+    }
+  } finally {
+    fixture.cleanup();
   }
 });
 
@@ -203,21 +324,29 @@ test("Phase 5: Elephant-Goldfish Model (EGM v5.1) Boardroom + Standalone Desktop
 });
 
 test("Phase 6: Canonical Skill Deduplication & All 5 Ported DeepSeek-Harness Subsystems (PTC, Spill, Guard, Cordis Extensions, Session-Query)", async () => {
-  // 1. Canonical Skill Cluster Deduplication & Fusion
-  const skills = discoverAllUniversalSkills({ workspaceRoot: APEX_PROJECT_ROOT });
-  const names = new Set(skills.map((s) => s.name.toLowerCase()));
-  assert.ok(names.has("no-ai-slop"), "Canonical anti-slop winner no-ai-slop must be present");
-  assert.ok(!names.has("dsh-prose-standard"), "Duplicate dsh-prose-standard must be fused into no-ai-slop");
-  assert.ok(!names.has("dsh-trim-cot-leakage"), "Duplicate dsh-trim-cot-leakage must be fused into no-ai-slop");
-  assert.ok(!names.has("dsh-archive-agent-notes"), "Repo-locked dsh-archive-agent-notes must be excluded");
+  // 1. Canonical Skill Cluster Deduplication & Fusion using isolated deterministic fixture
+  const fixture = createIsolatedSkillTestFixture("apex-phase6-skills-");
+  try {
+    const skills = discoverAllUniversalSkills({
+      userHome: fixture.userHome,
+      workspaceRoot: fixture.workspaceRoot,
+    });
+    const names = new Set(skills.map((s) => s.name.toLowerCase()));
+    assert.ok(names.has("no-ai-slop"), "Canonical anti-slop winner no-ai-slop must be present");
+    assert.ok(!names.has("dsh-prose-standard"), "Duplicate dsh-prose-standard must be fused into no-ai-slop");
+    assert.ok(!names.has("dsh-trim-cot-leakage"), "Duplicate dsh-trim-cot-leakage must be fused into no-ai-slop");
+    assert.ok(!names.has("dsh-archive-agent-notes"), "Repo-locked dsh-archive-agent-notes must be excluded");
 
-  const noAiSlop = skills.find((s) => s.name.toLowerCase() === "no-ai-slop");
-  assert.equal(noAiSlop?.capabilityCluster, "anti-slop-prose");
-  assert.ok(noAiSlop?.rawBody.includes("Zero Chain-of-Thought Leakage"));
+    const noAiSlop = skills.find((s) => s.name.toLowerCase() === "no-ai-slop");
+    assert.equal(noAiSlop?.capabilityCluster, "anti-slop-prose");
+    assert.ok(noAiSlop?.rawBody.includes("Zero Chain-of-Thought Leakage"));
 
-  const frontendCraft = skills.find((s) => s.name.toLowerCase() === "frontend-craft");
-  assert.equal(frontendCraft?.capabilityCluster, "ui-ux-craft");
-  assert.ok(frontendCraft?.rawBody.includes("Concentric Geometry"));
+    const frontendCraft = skills.find((s) => s.name.toLowerCase() === "frontend-craft");
+    assert.equal(frontendCraft?.capabilityCluster, "ui-ux-craft");
+    assert.ok(frontendCraft?.rawBody.includes("Concentric Geometry"));
+  } finally {
+    fixture.cleanup();
+  }
 
   // 2. Guard Subsystem (RepeatToolReminderGuard + runWithToolTimeout)
   const guard = new RepeatToolReminderGuard({ thresholds: [3, 5] });

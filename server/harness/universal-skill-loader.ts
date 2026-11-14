@@ -412,6 +412,7 @@ export function discoverAllUniversalSkills(options: {
 
   if (workspace) {
     searchRoots.push(
+      { path: join(workspace, "skills", "canonical"), ecosystem: "antigravity", kind: "skill" },
       { path: join(workspace, ".agents", "skills"), ecosystem: "antigravity", kind: "skill" },
       { path: join(workspace, ".claude", "skills"), ecosystem: "claude-code", kind: "skill" },
       { path: join(workspace, ".claude", "commands"), ecosystem: "claude-code", kind: "command" },
@@ -433,40 +434,51 @@ export function discoverAllUniversalSkills(options: {
     }
   }
 
-  const deduplicated = new Map<string, UniversalSkillItem>();
+  const rawItems: UniversalSkillItem[] = [];
+  const presentWinners = new Set<string>();
   for (const root of searchRoots) {
     for (const item of scanSkillFolder(root.path, root.ecosystem, root.kind)) {
       const nameLower = item.name.toLowerCase();
       if (REPO_LOCKED_EXCLUDED_SKILLS.has(nameLower)) {
         continue;
       }
-      if (suppressedToCluster.has(nameLower)) {
-        continue;
+      if (winnerToCluster.has(nameLower)) {
+        presentWinners.add(nameLower);
       }
-      const key = `${item.kind}:${nameLower}`;
-      if (!deduplicated.has(key)) {
-        const winnerCluster = winnerToCluster.get(nameLower);
-        if (winnerCluster) {
-          const fusedBody = `${item.rawBody.trim()}\n${winnerCluster.fusedAddendum}\n`;
-          deduplicated.set(key, {
-            ...item,
-            capabilityCluster: winnerCluster.cluster,
-            mergedFrom: [...winnerCluster.suppressed],
-            assignedRoles: winnerCluster.assignedRoles,
-            rawBody: fusedBody,
-            estimatedTokens: estimateSkillTokens(fusedBody),
-          });
-        } else {
-          const autoCluster = nameLower.startsWith("stitch")
-            ? "stitch-workflow"
-            : nameLower.includes("browser") || nameLower === "obscura"
-              ? "browser-automation"
-              : undefined;
-          deduplicated.set(key, {
-            ...item,
-            capabilityCluster: autoCluster,
-          });
-        }
+      rawItems.push(item);
+    }
+  }
+
+  const deduplicated = new Map<string, UniversalSkillItem>();
+  for (const item of rawItems) {
+    const nameLower = item.name.toLowerCase();
+    const suppressedCluster = suppressedToCluster.get(nameLower);
+    if (suppressedCluster && presentWinners.has(suppressedCluster.winner.toLowerCase())) {
+      continue;
+    }
+    const key = `${item.kind}:${nameLower}`;
+    if (!deduplicated.has(key)) {
+      const winnerCluster = winnerToCluster.get(nameLower);
+      if (winnerCluster) {
+        const fusedBody = `${item.rawBody.trim()}\n${winnerCluster.fusedAddendum}\n`;
+        deduplicated.set(key, {
+          ...item,
+          capabilityCluster: winnerCluster.cluster,
+          mergedFrom: [...winnerCluster.suppressed],
+          assignedRoles: winnerCluster.assignedRoles,
+          rawBody: fusedBody,
+          estimatedTokens: estimateSkillTokens(fusedBody),
+        });
+      } else {
+        const autoCluster = nameLower.startsWith("stitch")
+          ? "stitch-workflow"
+          : nameLower.includes("browser") || nameLower === "obscura"
+            ? "browser-automation"
+            : undefined;
+        deduplicated.set(key, {
+          ...item,
+          capabilityCluster: autoCluster,
+        });
       }
     }
   }
@@ -547,10 +559,24 @@ export function saveSkillManagementConfig(dataDir: string, config: SkillManageme
 }
 
 /**
- * Discovers MCP server definitions across Antigravity, Claude Code, Cursor, and Gemini CLI.
+ * Discovers MCP server definitions across Antigravity, Claude Code, Cursor, Gemini CLI, and project `.mcp.json`.
  */
-export function discoverAllUniversalMcpServers(userHome: string = homedir()): UniversalMcpServerEntry[] {
+export function discoverAllUniversalMcpServers(
+  userHomeOrOptions: string | { userHome?: string; workspaceRoot?: string } = homedir(),
+): UniversalMcpServerEntry[] {
+  const userHome =
+    typeof userHomeOrOptions === "string"
+      ? userHomeOrOptions
+      : (userHomeOrOptions.userHome ?? homedir());
+  const workspaceRoot =
+    typeof userHomeOrOptions === "object" && userHomeOrOptions !== null
+      ? userHomeOrOptions.workspaceRoot
+      : undefined;
+
   const candidates: Array<{ path: string; ecosystem: SkillEcosystem }> = [
+    ...(workspaceRoot
+      ? [{ path: join(resolve(workspaceRoot), ".mcp.json"), ecosystem: "claude-code" as const }]
+      : []),
     { path: join(userHome, ".gemini", "config", "mcp_config.json"), ecosystem: "antigravity" },
     { path: join(userHome, ".gemini", "antigravity-ide", "mcp_config.json"), ecosystem: "antigravity" },
     { path: join(userHome, ".gemini", "antigravity", "mcp_config.json"), ecosystem: "antigravity" },

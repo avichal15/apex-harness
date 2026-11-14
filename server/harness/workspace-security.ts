@@ -92,6 +92,59 @@ function isStrictlyInsideOrEqual(canonicalRoot: string, canonicalCandidate: stri
 }
 
 /**
+ * When an absolute path is supplied on Windows (e.g., `C:\Users\RUNNER~1\AppData\Local\Temp\ws\file.ts`
+ * while `realpathSync.native` expanded `workspaceRoot` to `C:\Users\runneradmin\AppData\Local\Temp\ws`)
+ * or macOS (`/var/folders/...` vs `/private/var/folders/...`), normalizes the non-symlink workspace root
+ * prefix to `canonicalRoot` while keeping relative segments inside the workspace untouched so symlink
+ * traversal checks still inspect every segment below `canonicalRoot`.
+ */
+function normalizeAbsoluteCandidateAgainstWorkspaceRoot(
+  rawWorkspaceRoot: string,
+  canonicalRoot: string,
+  absCandidate: string,
+): string {
+  const resolvedCandidate = resolve(absCandidate);
+  if (isStrictlyInsideOrEqual(canonicalRoot, resolvedCandidate)) {
+    return resolvedCandidate;
+  }
+
+  const resolvedRawRoot = resolve(rawWorkspaceRoot);
+  if (isStrictlyInsideOrEqual(resolvedRawRoot, resolvedCandidate)) {
+    const relFromRaw = relative(resolvedRawRoot, resolvedCandidate);
+    return relFromRaw ? resolve(canonicalRoot, relFromRaw) : canonicalRoot;
+  }
+
+  // Handle cases where workspaceRoot was already canonicalized (e.g. `runneradmin`)
+  // and absCandidate uses a Windows 8.3 short name (`RUNNER~1`) on an ancestor above the workspace.
+  const rootParsed = parse(resolvedCandidate).root;
+  const segments = resolvedCandidate
+    .slice(rootParsed.length)
+    .split(/[/\\]+/)
+    .filter(Boolean);
+  let cursor = rootParsed;
+  for (let i = 0; i < segments.length; i++) {
+    cursor = resolve(cursor, segments[i]);
+    if (!existsSync(cursor)) break;
+    try {
+      const st = lstatSync(cursor);
+      if (st.isSymbolicLink()) {
+        // Stop before any symlink so symlink escape detection handles it explicitly
+        break;
+      }
+      const realPrefix = realpathSync.native ? realpathSync.native(cursor) : realpathSync(cursor);
+      if (normalizeForComparison(realPrefix) === normalizeForComparison(canonicalRoot)) {
+        const remaining = segments.slice(i + 1);
+        return remaining.length > 0 ? resolve(canonicalRoot, ...remaining) : canonicalRoot;
+      }
+    } catch {
+      break;
+    }
+  }
+
+  return resolvedCandidate;
+}
+
+/**
  * Enforces canonical workspace containment for every file/directory operation.
  * Rejects:
  * 1. Null bytes (`\0`)
@@ -126,9 +179,9 @@ export function assertCanonicalWorkspacePath(
   const platformCandidate =
     process.platform === "win32" ? rawCandidatePath.replace(/\//g, "\\") : rawCandidatePath;
 
-  // Compute lexical resolution first
+  // Compute lexical resolution first (normalizing non-symlink 8.3/OS root aliases on workspaceRoot)
   const lexicalTarget = isAbsolute(platformCandidate)
-    ? resolve(platformCandidate)
+    ? normalizeAbsoluteCandidateAgainstWorkspaceRoot(workspaceRoot, canonicalRoot, platformCandidate)
     : resolve(canonicalRoot, platformCandidate);
 
   if (!isStrictlyInsideOrEqual(canonicalRoot, lexicalTarget)) {

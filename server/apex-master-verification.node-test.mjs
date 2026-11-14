@@ -603,7 +603,45 @@ describe("Apex Harness — Master 20-Scenario Engineering & Security Verificatio
 
   // Scenario 16: Context-budget dynamic skill loading & conflict/compatibility validation
   it("Scenario 16: Enforces dynamic token budgets, conflict resolution, and driver compatibility on skills", () => {
-    const allSkills = discoverAllUniversalSkills({ workspaceRoot: workspaceDir });
+    const fixtureHome = join(dataDir, "isolated-skill-home");
+    const writeFixtureSkill = (dirPath, name, description, body) => {
+      mkdirSync(dirPath, { recursive: true });
+      writeFileSync(
+        join(dirPath, "SKILL.md"),
+        `---\nname: ${name}\nversion: 1.0.0\ndescription: ${description}\n---\n\n# ${name}\n\n${body}\n`,
+        "utf8",
+      );
+    };
+
+    writeFixtureSkill(
+      join(fixtureHome, ".gemini", "config", "skills", "frontend-craft"),
+      "frontend-craft",
+      "Build a React dashboard with responsive design tokens and UI checks.",
+      "Design and implement accessible React dashboard components with verified computed styles.",
+    );
+    writeFixtureSkill(
+      join(fixtureHome, ".gemini", "config", "skills", "ag-browser-check"),
+      "ag-browser-check",
+      "Browser verification and computed DOM style validation for web apps.",
+      "Run accessibility snapshots and verify computed styles across desktop and mobile viewports.",
+    );
+    writeFixtureSkill(
+      join(fixtureHome, ".codex", "skills", "security-boundaries"),
+      "security-boundaries",
+      "Design and review authentication, uploads, and untrusted security boundaries.",
+      "Enforce canonical path containment, Origin checks, and input schema validation.",
+    );
+    writeFixtureSkill(
+      join(fixtureHome, ".gemini", "config", "skills", "pentest-wireless-audit"),
+      "pentest-wireless-audit",
+      "Run red-team exploit and aircrack-ng wireless security audits on dashboards.",
+      "Offensive and defensive wireless security auditing workflows.",
+    );
+
+    const allSkills = discoverAllUniversalSkills({
+      userHome: fixtureHome,
+      workspaceRoot: workspaceDir,
+    });
     assert.ok(allSkills.length > 0);
 
     const tightBudget = 550;

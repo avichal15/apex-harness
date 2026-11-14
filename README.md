@@ -9,7 +9,7 @@
 [![UI](https://img.shields.io/badge/UI-Agent%20Office%20%2B%20IDE%20Workbench-3b82f6)](#live-ai-agent-office--orchestration-visualization)
 [![License](https://img.shields.io/badge/License-Apache--2.0-6b7280)](./LICENSE)
 
-[Quick Start](./SETUP.md) &nbsp;&middot;&nbsp; [Architecture](#architecture-overview) &nbsp;&middot;&nbsp; [Agent Office UI](#live-ai-agent-office--orchestration-visualization) &nbsp;&middot;&nbsp; [Full Setup Guide](./SETUP.md)
+[Quick Start](./SETUP.md) &nbsp;&middot;&nbsp; [Architecture](#architecture-overview) &nbsp;&middot;&nbsp; [Agent Office UI](#live-ai-agent-office--orchestration-visualization) &nbsp;&middot;&nbsp; [Acceptance Matrix](docs/verification/acceptance-matrix.md) &nbsp;&middot;&nbsp; [Full Setup Guide](./SETUP.md)
 
 </div>
 
